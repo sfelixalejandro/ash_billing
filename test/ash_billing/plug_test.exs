@@ -44,6 +44,25 @@ defmodule AshBilling.PlugTest do
       assert_received {:webhook_handled, %{"id" => "evt_test_123"}}
     end
 
+    test "deduplicates duplicate webhook event IDs" do
+      payload = ~s({"id":"evt_duplicate_check_99","type":"customer.subscription.created"})
+      opts = BillingPlug.init(webhook_secret: @secret, handler: MockHandler)
+
+      # First delivery
+      conn1 = build_signed_conn(payload)
+      conn1 = BillingPlug.call(conn1, opts)
+      assert conn1.status == 200
+      assert conn1.resp_body == ~s({"status":"received"})
+      assert_received {:webhook_handled, %{"id" => "evt_duplicate_check_99"}}
+
+      # Second delivery (Stripe retry)
+      conn2 = build_signed_conn(payload)
+      conn2 = BillingPlug.call(conn2, opts)
+      assert conn2.status == 200
+      assert conn2.resp_body == ~s({"status":"already_processed"})
+      refute_received {:webhook_handled, %{"id" => "evt_duplicate_check_99"}}
+    end
+
     test "rejects request with invalid signature" do
       timestamp = System.system_time(:second)
 

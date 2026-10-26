@@ -3,7 +3,7 @@ defmodule AshBilling.MixProject do
 
   @version "0.1.0"
   @description "Declarative billing, subscriptions, and payment providers for the Ash Framework."
-  @source_url "https://github.com/Kyushu21/ash_billing"
+  @source_url "https://github.com/sfelixalejandro/ash_billing"
 
   def project do
     [

@@ -1,6 +1,7 @@
 defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
   @moduledoc false
   use Spark.Dsl.Transformer
+  require Ash.Expr
   alias Ash.Resource
   alias Spark.Dsl.Transformer
 
@@ -34,6 +35,13 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
       {:cancel_at_period_end, Ash.Type.Boolean, [default: false, public?: true]}
     ]
 
+    with {:ok, state} <- add_attributes(dsl_state, attributes),
+         {:ok, state} <- maybe_add_active_calculation(state) do
+      {:ok, state}
+    end
+  end
+
+  defp add_attributes(dsl_state, attributes) do
     Enum.reduce(attributes, {:ok, dsl_state}, fn {name, type, opts}, {:ok, state} ->
       if Resource.Info.attribute(state, name) do
         {:ok, state}
@@ -43,5 +51,24 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
         {:ok, Transformer.add_entity(state, [:attributes], attribute)}
       end
     end)
+  end
+
+  defp maybe_add_active_calculation(state) do
+    if Resource.Info.calculation(state, :active?) do
+      {:ok, state}
+    else
+      expr = Ash.Expr.expr(status in [:active, :trialing])
+
+      calculation =
+        Transformer.build_entity!(Resource.Dsl, [:calculations], :calculate,
+          name: :active?,
+          type: Ash.Type.Boolean,
+          calculation: expr,
+          public?: true,
+          filterable?: true
+        )
+
+      {:ok, Transformer.add_entity(state, [:calculations], calculation)}
+    end
   end
 end

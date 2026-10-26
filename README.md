@@ -12,11 +12,11 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` provides a unified, dec
 
 ## Features
 
-- ⚡ **Declarative Spark DSL**: Add billing customer or subscription capabilities to any Ash resource with clean DSL blocks (`billing do ... end`).
-- 💳 **Stripe Provider**: First-class support for Stripe Checkout Sessions, Customer Portal, and Subscriptions.
-- 🔌 **Secure Webhook Plug**: Phoenix/Plug endpoint with constant-time HMAC-SHA256 signature verification and replay attack protection.
-- 🔄 **Modular Provider Architecture**: Built with an extensible `AshBilling.Provider` behaviour, ready for Stripe, Paddle, LemonSqueezy, and more.
-- 🧪 **100% Testable**: Zero external HTTP calls needed during test suites thanks to plug-based stubs.
+- **Declarative Spark DSL**: Add billing customer or subscription capabilities to any Ash resource with clean DSL blocks (`billing do ... end`).
+- **Stripe Provider**: First-class support for Stripe Checkout Sessions, Customer Portal, and Subscriptions.
+- **Secure Webhook Plug**: Phoenix/Plug endpoint with constant-time HMAC-SHA256 signature verification and replay attack protection.
+- **Modular Provider Architecture**: Built with an extensible `AshBilling.Provider` behaviour, ready for Stripe, Paddle, LemonSqueezy, and more.
+- **100% Testable**: Zero external HTTP calls needed during test suites thanks to plug-based stubs.
 
 ---
 

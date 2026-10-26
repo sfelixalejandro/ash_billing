@@ -28,19 +28,31 @@ defmodule AshBilling.Plug do
 
     case provider.verify_webhook(raw_body, signature_header, secret, opts) do
       {:ok, event} ->
-        if Keyword.has_key?(opts, :subscription_resource) or
-             Keyword.has_key?(opts, :customer_resource) do
-          AshBilling.WebhookSync.sync_event(event, opts)
-        end
+        event_id = Map.get(event, "id")
+        deduplicate? = Keyword.get(opts, :deduplicate?, true)
 
-        if is_atom(handler) and function_exported?(handler, :handle_event, 1) do
-          handler.handle_event(event)
-        end
+        if deduplicate? and AshBilling.Deduplication.processed?(event_id) do
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(200, ~s({"status":"already_processed"}))
+          |> halt()
+        else
+          if deduplicate?, do: AshBilling.Deduplication.mark_processed(event_id)
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, ~s({"status":"received"}))
-        |> halt()
+          if Keyword.has_key?(opts, :subscription_resource) or
+               Keyword.has_key?(opts, :customer_resource) do
+            AshBilling.WebhookSync.sync_event(event, opts)
+          end
+
+          if is_atom(handler) and function_exported?(handler, :handle_event, 1) do
+            handler.handle_event(event)
+          end
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(200, ~s({"status":"received"}))
+          |> halt()
+        end
 
       {:error, reason} ->
         conn

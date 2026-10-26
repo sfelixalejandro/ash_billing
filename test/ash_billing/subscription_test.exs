@@ -31,6 +31,14 @@ defmodule AshBilling.SubscriptionTest do
       assert cancel_at_period_end.default == false
     end
 
+    test "injects active? calculation into resource" do
+      calc = Ash.Resource.Info.calculation(Subscription, :active?)
+      assert calc != nil
+      assert calc.type == Ash.Type.Boolean
+      assert calc.filterable? == true
+      assert calc.public? == true
+    end
+
     test "provides correct introspection helpers" do
       assert SubscriptionInfo.provider(Subscription) == AshBilling.Providers.Stripe
       assert SubscriptionInfo.customer_relationship(Subscription) == :user

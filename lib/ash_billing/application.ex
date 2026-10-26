@@ -8,12 +8,9 @@ defmodule AshBilling.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: AshBilling.Worker.start_link(arg)
-      # {AshBilling.Worker, arg}
+      AshBilling.Deduplication
     ]
 
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
     opts = [strategy: :one_for_one, name: AshBilling.Supervisor]
     Supervisor.start_link(children, opts)
   end
