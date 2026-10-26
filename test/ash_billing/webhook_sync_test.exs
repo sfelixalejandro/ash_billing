@@ -129,6 +129,47 @@ defmodule AshBilling.WebhookSyncTest do
       assert canceled_sub.provider_subscription_id == "sub_stripe_300"
       assert canceled_sub.status == :canceled
     end
+
+    test "resolves customer via metadata resource_id and auto-links stripe_customer_id" do
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{email: "new_checkout_user@example.com"},
+          domain: Domain
+        )
+
+      assert user.stripe_customer_id == nil
+
+      # Subscription event arrives with metadata resource_id
+      event = %{
+        "type" => "customer.subscription.created",
+        "data" => %{
+          "object" => %{
+            "id" => "sub_stripe_meta_400",
+            "customer" => "cus_brand_new_stripe_id",
+            "status" => "active",
+            "cancel_at_period_end" => false,
+            "current_period_end" => 1_735_689_600,
+            "metadata" => %{
+              "resource_id" => user.id
+            },
+            "items" => %{
+              "data" => [
+                %{"price" => %{"id" => "price_premium_monthly"}}
+              ]
+            }
+          }
+        }
+      }
+
+      assert {:ok, subscription} = WebhookSync.sync_event(event, @opts)
+      assert subscription.provider_subscription_id == "sub_stripe_meta_400"
+      assert subscription.user_id == user.id
+
+      # Verify the user record was automatically updated with the stripe_customer_id
+      {:ok, updated_user} = Ash.get(User, user.id, domain: Domain)
+      assert updated_user.stripe_customer_id == "cus_brand_new_stripe_id"
+    end
   end
 
   describe "sync_event/2 for checkout.session.completed" do
@@ -156,6 +197,30 @@ defmodule AshBilling.WebhookSyncTest do
 
       assert {:ok, updated_user} = WebhookSync.sync_event(checkout_event, @opts)
       assert updated_user.stripe_customer_id == "cus_from_stripe_session_999"
+    end
+
+    test "links stripe_customer_id via client_reference_id" do
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{email: "client_ref_user@example.com"},
+          domain: Domain
+        )
+
+      assert user.stripe_customer_id == nil
+
+      checkout_event = %{
+        "type" => "checkout.session.completed",
+        "data" => %{
+          "object" => %{
+            "customer" => "cus_from_client_ref_777",
+            "client_reference_id" => user.id
+          }
+        }
+      }
+
+      assert {:ok, updated_user} = WebhookSync.sync_event(checkout_event, @opts)
+      assert updated_user.stripe_customer_id == "cus_from_client_ref_777"
     end
   end
 end

@@ -62,13 +62,13 @@ defmodule AshBilling.WebhookSync do
       current_period_end = parse_unix_timestamp(object["current_period_end"])
       cancel_at_period_end = Map.get(object, "cancel_at_period_end", false)
 
-      customer = find_customer(customer_resource, stripe_cust_id, domain, opts)
+      customer = find_customer(customer_resource, stripe_cust_id, object, domain, opts)
 
       existing =
         subscription_resource
         |> Ash.Query.new()
         |> Ash.Query.filter(provider_subscription_id == ^sub_id)
-        |> Ash.read_one(domain: domain)
+        |> Ash.read_one(domain: domain, authorize?: false)
         |> case do
           {:ok, record} -> record
           _ -> nil
@@ -83,7 +83,7 @@ defmodule AshBilling.WebhookSync do
       }
 
       if existing do
-        Ash.update(existing, attrs, domain: domain)
+        Ash.update(existing, attrs, domain: domain, authorize?: false)
       else
         cust_rel_name = SubscriptionInfo.customer_relationship(subscription_resource)
         rel_attr = find_relationship_source_attribute(subscription_resource, cust_rel_name)
@@ -95,7 +95,7 @@ defmodule AshBilling.WebhookSync do
             attrs
           end
 
-        Ash.create(subscription_resource, attrs, domain: domain)
+        Ash.create(subscription_resource, attrs, domain: domain, authorize?: false)
       end
     end
   end
@@ -105,15 +105,18 @@ defmodule AshBilling.WebhookSync do
       {:ok, :no_customer_resource}
     else
       stripe_customer_id = session["customer"]
-      resource_id = get_in(session, ["metadata", "resource_id"])
+
+      resource_id =
+        get_in(session, ["metadata", "resource_id"]) ||
+          session["client_reference_id"]
 
       if stripe_customer_id && resource_id do
         attr = ResourceInfo.customer_id_attribute(customer_resource)
 
-        case Ash.get(customer_resource, resource_id, domain: domain) do
+        case Ash.get(customer_resource, resource_id, domain: domain, authorize?: false) do
           {:ok, user} ->
             if is_nil(Map.get(user, attr)) do
-              Ash.update(user, %{attr => stripe_customer_id}, domain: domain)
+              Ash.update(user, %{attr => stripe_customer_id}, domain: domain, authorize?: false)
             else
               {:ok, user}
             end
@@ -127,19 +130,49 @@ defmodule AshBilling.WebhookSync do
     end
   end
 
-  defp find_customer(nil, _stripe_cust_id, _domain, _opts), do: nil
-  defp find_customer(_res, nil, _domain, _opts), do: nil
+  defp find_customer(nil, _stripe_cust_id, _object, _domain, _opts), do: nil
 
-  defp find_customer(customer_resource, stripe_cust_id, domain, _opts) do
+  defp find_customer(customer_resource, stripe_cust_id, object, domain, _opts) do
     attr = ResourceInfo.customer_id_attribute(customer_resource)
 
-    customer_resource
-    |> Ash.Query.new()
-    |> Ash.Query.filter(^[{attr, stripe_cust_id}])
-    |> Ash.read_one(domain: domain)
-    |> case do
-      {:ok, cust} -> cust
-      _ -> nil
+    customer_by_stripe_id =
+      if stripe_cust_id do
+        customer_resource
+        |> Ash.Query.new()
+        |> Ash.Query.filter(^[{attr, stripe_cust_id}])
+        |> Ash.read_one(domain: domain, authorize?: false)
+        |> case do
+          {:ok, cust} -> cust
+          _ -> nil
+        end
+      end
+
+    if customer_by_stripe_id do
+      customer_by_stripe_id
+    else
+      resource_id =
+        get_in(object, ["metadata", "resource_id"]) ||
+          object["client_reference_id"]
+
+      if resource_id do
+        case Ash.get(customer_resource, resource_id, domain: domain, authorize?: false) do
+          {:ok, cust} ->
+            if stripe_cust_id && is_nil(Map.get(cust, attr)) do
+              case Ash.update(cust, %{attr => stripe_cust_id},
+                     domain: domain,
+                     authorize?: false
+                   ) do
+                {:ok, updated} -> updated
+                _ -> cust
+              end
+            else
+              cust
+            end
+
+          _ ->
+            nil
+        end
+      end
     end
   end
 

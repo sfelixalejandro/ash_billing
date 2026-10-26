@@ -85,13 +85,45 @@ defmodule AshBilling do
           [%{price: price, quantity: quantity}]
       end
 
-    params = %{
-      customer: cust_id,
-      line_items: line_items,
-      success_url: Keyword.fetch!(opts, :success_url),
-      cancel_url: Keyword.fetch!(opts, :cancel_url),
-      mode: Keyword.get(opts, :mode, "subscription")
-    }
+    resource_id =
+      case record_or_customer_id do
+        %{id: id} when not is_nil(id) -> to_string(id)
+        _ -> nil
+      end
+
+    custom_metadata = Keyword.get(opts, :metadata, %{}) |> Enum.into(%{})
+
+    metadata =
+      if resource_id do
+        Map.put_new(custom_metadata, "resource_id", resource_id)
+      else
+        custom_metadata
+      end
+
+    client_ref_id = Keyword.get(opts, :client_reference_id, resource_id)
+
+    params =
+      %{
+        line_items: line_items,
+        success_url: Keyword.fetch!(opts, :success_url),
+        cancel_url: Keyword.fetch!(opts, :cancel_url),
+        mode: Keyword.get(opts, :mode, "subscription")
+      }
+      |> then(fn p -> if cust_id, do: Map.put(p, :customer, cust_id), else: p end)
+      |> then(fn p ->
+        if client_ref_id, do: Map.put(p, :client_reference_id, client_ref_id), else: p
+      end)
+      |> then(fn p -> if map_size(metadata) > 0, do: Map.put(p, :metadata, metadata), else: p end)
+      |> then(fn p ->
+        if p.mode == "subscription" and map_size(metadata) > 0 do
+          existing_sub_data = Keyword.get(opts, :subscription_data, %{}) |> Enum.into(%{})
+          sub_metadata = Map.get(existing_sub_data, :metadata, %{}) |> Map.merge(metadata)
+          sub_data = Map.put(existing_sub_data, :metadata, sub_metadata)
+          Map.put(p, :subscription_data, sub_data)
+        else
+          p
+        end
+      end)
 
     provider.create_checkout_session(params, opts)
   end

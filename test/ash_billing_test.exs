@@ -44,8 +44,22 @@ defmodule AshBillingTest do
   end
 
   describe "create_checkout_session/2" do
-    test "creates checkout session for a customer record", %{stub_name: stub_name, opts: opts} do
+    test "creates checkout session for a customer record and auto-injects metadata", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      user_id = Ash.UUID.generate()
+      user = %User{id: user_id, stripe_customer_id: "cus_123"}
+
       Req.Test.stub(stub_name, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        params = URI.decode_query(body)
+
+        assert params["client_reference_id"] == user_id
+        assert params["metadata[resource_id]"] == user_id
+        assert params["subscription_data[metadata][resource_id]"] == user_id
+        assert params["metadata[org_tier]"] == "enterprise"
+
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
         |> Plug.Conn.send_resp(
@@ -54,14 +68,13 @@ defmodule AshBillingTest do
         )
       end)
 
-      user = %User{id: Ash.UUID.generate(), stripe_customer_id: "cus_123"}
-
       checkout_opts =
         opts
         |> Keyword.merge(
           price: "price_pro_monthly",
           success_url: "https://example.com/success",
-          cancel_url: "https://example.com/cancel"
+          cancel_url: "https://example.com/cancel",
+          metadata: %{org_tier: "enterprise"}
         )
 
       assert {:ok, %{id: "cs_123", url: "https://checkout.test/cs_123"}} =
