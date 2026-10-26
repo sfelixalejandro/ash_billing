@@ -118,5 +118,33 @@ defmodule AshBilling.PlugTest do
       conn = BillingPlug.call(conn, opts)
       assert conn.status == 200
     end
+
+    test "logs error when webhook sync encounters an error" do
+      import ExUnit.CaptureLog
+
+      # A checkout session with an unknown user UUID returns {:error, %Ash.Error.Query.NotFound{}}
+      non_existent_uuid = "00000000-0000-0000-0000-000000000000"
+
+      payload =
+        ~s({"id":"evt_sync_fail","type":"checkout.session.completed","data":{"object":{"customer":"cus_fail_1","client_reference_id":"#{non_existent_uuid}"}}})
+
+      conn = build_signed_conn(payload)
+
+      opts =
+        BillingPlug.init(
+          webhook_secret: @secret,
+          customer_resource: AshBilling.Test.User,
+          subscription_resource: AshBilling.Test.Subscription,
+          domain: AshBilling.Test.Domain
+        )
+
+      log =
+        capture_log(fn ->
+          conn = BillingPlug.call(conn, opts)
+          assert conn.status == 200
+        end)
+
+      assert log =~ "AshBilling.Plug: Webhook synchronization failed"
+    end
   end
 end

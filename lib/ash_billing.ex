@@ -154,27 +154,35 @@ defmodule AshBilling do
           {:ok, %{url: String.t()}} | {:error, term()}
   def create_portal_session(record_or_customer_id, opts) do
     cust_id = resolve_customer_id(record_or_customer_id)
-    provider = resolve_provider(record_or_customer_id, opts)
 
-    params = %{
-      customer: cust_id,
-      return_url: Keyword.fetch!(opts, :return_url)
-    }
+    if is_nil(cust_id) or cust_id == "" do
+      {:error, :no_customer_id}
+    else
+      provider = resolve_provider(record_or_customer_id, opts)
+      extra_params = Keyword.get(opts, :params, %{})
 
-    start_meta = %{
-      provider: provider,
-      customer: cust_id
-    }
+      params =
+        extra_params
+        |> Map.merge(%{
+          customer: cust_id,
+          return_url: Keyword.fetch!(opts, :return_url)
+        })
 
-    :telemetry.span([:ash_billing, :portal], start_meta, fn ->
-      case provider.create_portal_session(params, opts) do
-        {:ok, %{url: url}} = success ->
-          {success, %{status: :ok, url: url}}
+      start_meta = %{
+        provider: provider,
+        customer: cust_id
+      }
 
-        {:error, reason} = error ->
-          {error, %{status: :error, error: reason}}
-      end
-    end)
+      :telemetry.span([:ash_billing, :portal], start_meta, fn ->
+        case provider.create_portal_session(params, opts) do
+          {:ok, %{url: url}} = success ->
+            {success, %{status: :ok, url: url}}
+
+          {:error, reason} = error ->
+            {error, %{status: :error, error: reason}}
+        end
+      end)
+    end
   end
 
   @doc """
@@ -205,27 +213,39 @@ defmodule AshBilling do
   end
 
   @doc """
+  Returns the active subscription record for a customer, or `nil` if none is active.
+
+  If a `price_id` is passed as the second argument, returns the active subscription matching that price.
+  Expects the `:subscriptions` relationship to be loaded on the record.
+  """
+  @spec subscription(struct(), String.t() | nil) :: struct() | nil
+  def subscription(record, price_id \\ nil)
+
+  def subscription(%{subscriptions: subscriptions}, price_id) when is_list(subscriptions) do
+    Enum.find(subscriptions, fn sub ->
+      active_status?(sub.status) and (is_nil(price_id) or sub.price_id == price_id)
+    end)
+  end
+
+  def subscription(_record, _price_id), do: nil
+
+  @doc """
   Checks if a record has an active subscription.
 
   Checks loaded subscriptions associated with the record for `:active` or `:trialing` status.
   If a `price_id` is passed as the second argument, verifies that the subscription matches the price.
   """
   @spec subscribed?(struct(), String.t() | nil) :: boolean()
-  def subscribed?(record, price_id \\ nil)
-
-  def subscribed?(%{subscriptions: subscriptions}, price_id) when is_list(subscriptions) do
-    Enum.any?(subscriptions, fn sub ->
-      active_status?(sub.status) and (is_nil(price_id) or sub.price_id == price_id)
-    end)
+  def subscribed?(record, price_id \\ nil) do
+    not is_nil(subscription(record, price_id))
   end
-
-  def subscribed?(_record, _price_id), do: false
 
   defp active_status?(status) when status in [:active, "active", :trialing, "trialing"], do: true
   defp active_status?(_), do: false
 
   defp resolve_customer_id(%_resource{} = record), do: customer_id(record)
   defp resolve_customer_id(id) when is_binary(id), do: id
+  defp resolve_customer_id(_), do: nil
 
   defp resolve_subscription_id(%{provider_subscription_id: id}) when is_binary(id), do: id
   defp resolve_subscription_id(%{stripe_subscription_id: id}) when is_binary(id), do: id

@@ -201,6 +201,15 @@ defmodule AshBillingTest do
       assert {:error, %{status: 400, error: "Customer has no portal access"}} =
                AshBilling.create_portal_session("cus_bad", portal_opts)
     end
+
+    test "returns {:error, :no_customer_id} when record has no customer ID", %{opts: opts} do
+      user = %User{id: Ash.UUID.generate(), stripe_customer_id: nil}
+      portal_opts = Keyword.merge(opts, return_url: "https://example.com/billing")
+
+      assert {:error, :no_customer_id} = AshBilling.create_portal_session(user, portal_opts)
+      assert {:error, :no_customer_id} = AshBilling.create_portal_session(nil, portal_opts)
+      assert {:error, :no_customer_id} = AshBilling.create_portal_session("", portal_opts)
+    end
   end
 
   describe "get_subscription/2" do
@@ -256,7 +265,35 @@ defmodule AshBillingTest do
     end
   end
 
-  describe "subscribed?/2" do
+  describe "subscription/2 and subscribed?/2" do
+    test "returns active subscription struct or nil" do
+      sub_active = %{status: :active, price_id: "price_pro"}
+      sub_canceled = %{status: :canceled, price_id: "price_old"}
+      user = %User{subscriptions: [sub_active, sub_canceled]}
+
+      assert AshBilling.subscription(user) == sub_active
+      assert AshBilling.subscription(user, "price_pro") == sub_active
+      assert AshBilling.subscription(user, "price_enterprise") == nil
+
+      assert AshBilling.subscribed?(user) == true
+      assert AshBilling.subscribed?(user, "price_pro") == true
+      assert AshBilling.subscribed?(user, "price_enterprise") == false
+    end
+
+    test "returns nil when no subscriptions are loaded or active" do
+      user_empty = %User{subscriptions: []}
+      user_nil = %User{subscriptions: nil}
+      user_canceled = %User{subscriptions: [%{status: :canceled, price_id: "price_old"}]}
+
+      assert AshBilling.subscription(user_empty) == nil
+      assert AshBilling.subscription(user_nil) == nil
+      assert AshBilling.subscription(user_canceled) == nil
+
+      assert AshBilling.subscribed?(user_empty) == false
+      assert AshBilling.subscribed?(user_nil) == false
+      assert AshBilling.subscribed?(user_canceled) == false
+    end
+
     test "returns true when active subscription exists" do
       user = %User{
         subscriptions: [

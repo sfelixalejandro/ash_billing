@@ -176,22 +176,33 @@ defmodule AshBilling.Providers.Stripe do
       )
 
     api_key =
-      Keyword.get(
-        opts,
+      opts
+      |> Keyword.get(
         :api_key,
         Application.get_env(:ash_billing, :stripe_api_key) ||
           System.get_env("STRIPE_SECRET_KEY")
       )
+      |> resolve_key()
 
     req_opts = Keyword.get(opts, :req_opts, [])
 
     base_opts = [base_url: base_url]
-    base_opts = if api_key, do: [{:auth, {:bearer, api_key}} | base_opts], else: base_opts
+
+    base_opts =
+      if api_key && api_key != "", do: [{:auth, {:bearer, api_key}} | base_opts], else: base_opts
 
     base_opts
     |> Keyword.merge(req_opts)
     |> Req.new()
   end
+
+  defp resolve_key({module, function, args}) when is_atom(module) and is_atom(function) do
+    apply(module, function, args)
+  end
+
+  defp resolve_key(fun) when is_function(fun, 0), do: fun.()
+  defp resolve_key(key) when is_binary(key), do: key
+  defp resolve_key(_), do: nil
 
   defp extract_error(%{"error" => %{"message" => message}}), do: message
   defp extract_error(body), do: body

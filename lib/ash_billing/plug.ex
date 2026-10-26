@@ -46,7 +46,17 @@ defmodule AshBilling.Plug do
 
             if Keyword.has_key?(opts, :subscription_resource) or
                  Keyword.has_key?(opts, :customer_resource) do
-              AshBilling.WebhookSync.sync_event(event, opts)
+              case AshBilling.WebhookSync.sync_event(event, opts) do
+                {:ok, _} ->
+                  :ok
+
+                {:error, reason} ->
+                  require Logger
+
+                  Logger.error(
+                    "AshBilling.Plug: Webhook synchronization failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(reason)}"
+                  )
+              end
             end
 
             if is_atom(handler) and function_exported?(handler, :handle_event, 1) do

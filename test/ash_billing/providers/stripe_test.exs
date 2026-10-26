@@ -62,6 +62,28 @@ defmodule AshBilling.Providers.StripeTest do
                Stripe.create_customer(%{email: "auth@test.com"}, opts_with_key)
     end
 
+    test "resolves api_key from 0-arity function and MFA tuple", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer sk_dynamic_key"]
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(%{"id" => "cus_dynamic_123"}))
+      end)
+
+      # Function resolution
+      opts_fn = Keyword.put(opts, :api_key, fn -> "sk_dynamic_key" end)
+      assert {:ok, "cus_dynamic_123"} = Stripe.create_customer(%{email: "fn@test.com"}, opts_fn)
+
+      # MFA tuple resolution
+      System.put_env("TEST_STRIPE_KEY_ENV", "sk_dynamic_key")
+      opts_mfa = Keyword.put(opts, :api_key, {System, :get_env, ["TEST_STRIPE_KEY_ENV"]})
+      assert {:ok, "cus_dynamic_123"} = Stripe.create_customer(%{email: "mfa@test.com"}, opts_mfa)
+    end
+
     test "handles error from Stripe API", %{stub_name: stub_name, opts: opts} do
       Req.Test.stub(stub_name, fn conn ->
         conn
