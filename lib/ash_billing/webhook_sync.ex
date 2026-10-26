@@ -17,6 +17,9 @@ defmodule AshBilling.WebhookSync do
     * `:customer_resource` - The Ash resource for customers (e.g., `MyApp.Accounts.User`).
     * `:subscription_resource` - The Ash resource for subscriptions (e.g., `MyApp.Billing.Subscription`).
     * `:domain` - The Ash domain module to execute actions with.
+    * `:authorize?` - Whether to perform authorization checks. Defaults to `false` so webhooks run without requiring an active actor.
+    * `:actor` - Optional system actor to run actions on behalf of.
+    * `:tenant` - Optional tenant identifier for multitenant deployments.
   """
   def sync_event(event, opts) do
     event_type = Map.get(event, "type")
@@ -62,13 +65,14 @@ defmodule AshBilling.WebhookSync do
       current_period_end = parse_unix_timestamp(object["current_period_end"])
       cancel_at_period_end = Map.get(object, "cancel_at_period_end", false)
 
-      customer = find_customer(customer_resource, stripe_cust_id, object, domain, opts)
+      ash_opts = ash_options(domain, opts)
+      customer = find_customer(customer_resource, stripe_cust_id, object, ash_opts)
 
       existing =
         subscription_resource
         |> Ash.Query.new()
         |> Ash.Query.filter(provider_subscription_id == ^sub_id)
-        |> Ash.read_one(domain: domain, authorize?: false)
+        |> Ash.read_one(ash_opts)
         |> case do
           {:ok, record} -> record
           _ -> nil
@@ -83,7 +87,7 @@ defmodule AshBilling.WebhookSync do
       }
 
       if existing do
-        Ash.update(existing, attrs, domain: domain, authorize?: false)
+        Ash.update(existing, attrs, ash_opts)
       else
         cust_rel_name = SubscriptionInfo.customer_relationship(subscription_resource)
         rel_attr = find_relationship_source_attribute(subscription_resource, cust_rel_name)
@@ -95,15 +99,16 @@ defmodule AshBilling.WebhookSync do
             attrs
           end
 
-        Ash.create(subscription_resource, attrs, domain: domain, authorize?: false)
+        Ash.create(subscription_resource, attrs, ash_opts)
       end
     end
   end
 
-  defp sync_checkout_session(session, customer_resource, domain, _opts) do
+  defp sync_checkout_session(session, customer_resource, domain, opts) do
     if is_nil(customer_resource) do
       {:ok, :no_customer_resource}
     else
+      ash_opts = ash_options(domain, opts)
       stripe_customer_id = session["customer"]
 
       resource_id =
@@ -113,10 +118,10 @@ defmodule AshBilling.WebhookSync do
       if stripe_customer_id && resource_id do
         attr = ResourceInfo.customer_id_attribute(customer_resource)
 
-        case Ash.get(customer_resource, resource_id, domain: domain, authorize?: false) do
+        case Ash.get(customer_resource, resource_id, ash_opts) do
           {:ok, user} ->
             if is_nil(Map.get(user, attr)) do
-              Ash.update(user, %{attr => stripe_customer_id}, domain: domain, authorize?: false)
+              Ash.update(user, %{attr => stripe_customer_id}, ash_opts)
             else
               {:ok, user}
             end
@@ -130,9 +135,9 @@ defmodule AshBilling.WebhookSync do
     end
   end
 
-  defp find_customer(nil, _stripe_cust_id, _object, _domain, _opts), do: nil
+  defp find_customer(nil, _stripe_cust_id, _object, _ash_opts), do: nil
 
-  defp find_customer(customer_resource, stripe_cust_id, object, domain, _opts) do
+  defp find_customer(customer_resource, stripe_cust_id, object, ash_opts) do
     attr = ResourceInfo.customer_id_attribute(customer_resource)
 
     customer_by_stripe_id =
@@ -140,7 +145,7 @@ defmodule AshBilling.WebhookSync do
         customer_resource
         |> Ash.Query.new()
         |> Ash.Query.filter(^[{attr, stripe_cust_id}])
-        |> Ash.read_one(domain: domain, authorize?: false)
+        |> Ash.read_one(ash_opts)
         |> case do
           {:ok, cust} -> cust
           _ -> nil
@@ -155,13 +160,10 @@ defmodule AshBilling.WebhookSync do
           object["client_reference_id"]
 
       if resource_id do
-        case Ash.get(customer_resource, resource_id, domain: domain, authorize?: false) do
+        case Ash.get(customer_resource, resource_id, ash_opts) do
           {:ok, cust} ->
             if stripe_cust_id && is_nil(Map.get(cust, attr)) do
-              case Ash.update(cust, %{attr => stripe_cust_id},
-                     domain: domain,
-                     authorize?: false
-                   ) do
+              case Ash.update(cust, %{attr => stripe_cust_id}, ash_opts) do
                 {:ok, updated} -> updated
                 _ -> cust
               end
@@ -174,6 +176,18 @@ defmodule AshBilling.WebhookSync do
         end
       end
     end
+  end
+
+  defp ash_options(domain, opts) do
+    base = [domain: domain, authorize?: Keyword.get(opts, :authorize?, false)]
+
+    Enum.reduce([:actor, :tenant], base, fn key, acc ->
+      if Keyword.has_key?(opts, key) do
+        Keyword.put(acc, key, Keyword.get(opts, key))
+      else
+        acc
+      end
+    end)
   end
 
   defp find_relationship_source_attribute(subscription_resource, cust_rel_name) do

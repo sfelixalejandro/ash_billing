@@ -5,6 +5,8 @@ defmodule AshBilling.Test.Domain do
     resource AshBilling.Test.User
     resource AshBilling.Test.CustomUser
     resource AshBilling.Test.Subscription
+    resource AshBilling.Test.PolicyUser
+    resource AshBilling.Test.PolicySubscription
   end
 end
 
@@ -68,6 +70,66 @@ defmodule AshBilling.Test.Subscription do
 
   relationships do
     belongs_to :user, AshBilling.Test.User
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
+  end
+
+  billing_subscription do
+    customer_relationship(:user)
+  end
+end
+
+defmodule AshBilling.Test.PolicyUser do
+  use Ash.Resource,
+    domain: AshBilling.Test.Domain,
+    data_layer: Ash.DataLayer.Ets,
+    authorizers: [Ash.Policy.Authorizer],
+    extensions: [AshBilling.Resource]
+
+  attributes do
+    uuid_primary_key :id
+    attribute :email, :string, public?: true
+  end
+
+  relationships do
+    has_many :subscriptions, AshBilling.Test.PolicySubscription, destination_attribute: :user_id
+  end
+
+  policies do
+    policy always() do
+      authorize_if actor_present()
+    end
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
+  end
+end
+
+defmodule AshBilling.Test.PolicySubscription do
+  use Ash.Resource,
+    domain: AshBilling.Test.Domain,
+    data_layer: Ash.DataLayer.Ets,
+    authorizers: [Ash.Policy.Authorizer],
+    extensions: [AshBilling.Subscription]
+
+  attributes do
+    uuid_primary_key :id
+    attribute :user_id, :uuid, public?: true
+  end
+
+  relationships do
+    belongs_to :user, AshBilling.Test.PolicyUser
+  end
+
+  policies do
+    policy always() do
+      authorize_if actor_present()
+    end
   end
 
   actions do

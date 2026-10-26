@@ -54,6 +54,7 @@ defmodule AshBilling.MixProject do
       {:plug, "~> 1.14"},
       {:igniter, ">= 0.5.0", optional: true},
       # Dev & Test
+      {:simple_sat, ">= 0.0.0", only: [:dev, :test]},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
   end

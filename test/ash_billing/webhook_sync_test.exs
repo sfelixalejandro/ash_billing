@@ -1,7 +1,7 @@
 defmodule AshBilling.WebhookSyncTest do
   use ExUnit.Case, async: true
 
-  alias AshBilling.Test.{Domain, Subscription, User}
+  alias AshBilling.Test.{Domain, PolicySubscription, PolicyUser, Subscription, User}
   alias AshBilling.WebhookSync
 
   @opts [
@@ -221,6 +221,62 @@ defmodule AshBilling.WebhookSyncTest do
 
       assert {:ok, updated_user} = WebhookSync.sync_event(checkout_event, @opts)
       assert updated_user.stripe_customer_id == "cus_from_client_ref_777"
+    end
+  end
+
+  describe "sync_event/2 with Ash.Policy.Authorizer" do
+    test "bypasses policies by default with authorize?: false" do
+      # 1. Verify that PolicyUser strictly forbids unauthorized creation when authorize? is true
+      assert_raise Ash.Error.Forbidden, fn ->
+        Ash.create!(
+          PolicyUser,
+          %{email: "policy_fail@example.com"},
+          domain: Domain,
+          authorize?: true
+        )
+      end
+
+      # 2. Create the policy-protected user with bypass
+      {:ok, user} =
+        Ash.create(
+          PolicyUser,
+          %{
+            email: "policy_user@example.com",
+            stripe_customer_id: "cus_policy_101"
+          },
+          domain: Domain,
+          authorize?: false
+        )
+
+      policy_opts = [
+        customer_resource: PolicyUser,
+        subscription_resource: PolicySubscription,
+        domain: Domain
+      ]
+
+      # 3. Simulate Stripe webhook syncing subscription without an active actor
+      event = %{
+        "type" => "customer.subscription.created",
+        "data" => %{
+          "object" => %{
+            "id" => "sub_stripe_policy_999",
+            "customer" => "cus_policy_101",
+            "status" => "active",
+            "cancel_at_period_end" => false,
+            "current_period_end" => 1_735_689_600,
+            "items" => %{
+              "data" => [
+                %{"price" => %{"id" => "price_enterprise_annual"}}
+              ]
+            }
+          }
+        }
+      }
+
+      assert {:ok, subscription} = WebhookSync.sync_event(event, policy_opts)
+      assert subscription.provider_subscription_id == "sub_stripe_policy_999"
+      assert subscription.user_id == user.id
+      assert subscription.status == :active
     end
   end
 end
