@@ -24,52 +24,64 @@ defmodule AshBilling.Plug do
     handler = Keyword.get(opts, :handler)
 
     :telemetry.span([:ash_billing, :webhook], %{conn: conn, provider: provider}, fn ->
-      {:ok, raw_body, conn} = read_raw_body(conn)
-      signature_header = get_req_header(conn, "stripe-signature") |> List.first()
+      case read_raw_body(conn, opts) do
+        {:ok, raw_body, conn} ->
+          signature_header = get_req_header(conn, "stripe-signature") |> List.first()
 
-      case provider.verify_webhook(raw_body, signature_header, secret, opts) do
-        {:ok, event} ->
-          event_id = Map.get(event, "id")
-          event_type = Map.get(event, "type")
-          deduplicate? = Keyword.get(opts, :deduplicate?, true)
+          case provider.verify_webhook(raw_body, signature_header, secret, opts) do
+            {:ok, event} ->
+              event_id = Map.get(event, "id")
+              event_type = Map.get(event, "type")
+              deduplicate? = Keyword.get(opts, :deduplicate?, true)
 
-          if deduplicate? and AshBilling.Deduplication.processed?(event_id, opts) do
-            resp_conn =
-              conn
-              |> put_resp_content_type("application/json")
-              |> send_resp(200, ~s({"status":"already_processed"}))
-              |> halt()
+              if deduplicate? and AshBilling.Deduplication.processed?(event_id, opts) do
+                resp_conn =
+                  conn
+                  |> put_resp_content_type("application/json")
+                  |> send_resp(200, ~s({"status":"already_processed"}))
+                  |> halt()
 
-            {resp_conn, %{status: :already_processed, event_id: event_id, event_type: event_type}}
-          else
-            if deduplicate?, do: AshBilling.Deduplication.mark_processed(event_id, opts)
+                {resp_conn,
+                 %{status: :already_processed, event_id: event_id, event_type: event_type}}
+              else
+                if deduplicate?, do: AshBilling.Deduplication.mark_processed(event_id, opts)
 
-            if Keyword.has_key?(opts, :subscription_resource) or
-                 Keyword.has_key?(opts, :customer_resource) do
-              case AshBilling.WebhookSync.sync_event(event, opts) do
-                {:ok, _} ->
-                  :ok
+                if Keyword.has_key?(opts, :subscription_resource) or
+                     Keyword.has_key?(opts, :customer_resource) do
+                  case AshBilling.WebhookSync.sync_event(event, opts) do
+                    {:ok, _} ->
+                      :ok
 
-                {:error, reason} ->
-                  require Logger
+                    {:error, reason} ->
+                      require Logger
 
-                  Logger.error(
-                    "AshBilling.Plug: Webhook synchronization failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(reason)}"
-                  )
+                      Logger.error(
+                        "AshBilling.Plug: Webhook synchronization failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(reason)}"
+                      )
+                  end
+                end
+
+                if is_atom(handler) and function_exported?(handler, :handle_event, 1) do
+                  handler.handle_event(event)
+                end
+
+                resp_conn =
+                  conn
+                  |> put_resp_content_type("application/json")
+                  |> send_resp(200, ~s({"status":"received"}))
+                  |> halt()
+
+                {resp_conn, %{status: :received, event_id: event_id, event_type: event_type}}
               end
-            end
 
-            if is_atom(handler) and function_exported?(handler, :handle_event, 1) do
-              handler.handle_event(event)
-            end
+            {:error, reason} ->
+              resp_conn =
+                conn
+                |> put_resp_content_type("application/json")
+                |> send_resp(400, Jason.encode!(%{error: to_string(reason)}))
+                |> halt()
 
-            resp_conn =
-              conn
-              |> put_resp_content_type("application/json")
-              |> send_resp(200, ~s({"status":"received"}))
-              |> halt()
-
-            {resp_conn, %{status: :received, event_id: event_id, event_type: event_type}}
+              {resp_conn, %{status: :error, error: reason}}
           end
 
         {:error, reason} ->
@@ -84,15 +96,17 @@ defmodule AshBilling.Plug do
     end)
   end
 
-  defp read_raw_body(%{assigns: %{raw_body: body}} = conn) when is_binary(body) do
+  defp read_raw_body(%{assigns: %{raw_body: body}} = conn, _opts) when is_binary(body) do
     {:ok, body, conn}
   end
 
-  defp read_raw_body(conn) do
-    case read_body(conn) do
+  defp read_raw_body(conn, opts) do
+    read_opts = Keyword.get(opts, :read_body_opts, [])
+
+    case read_body(conn, read_opts) do
       {:ok, body, conn} -> {:ok, body, conn}
-      {:more, _partial, conn} -> {:error, :body_too_large, conn}
-      {:error, reason} -> {:error, reason, conn}
+      {:more, _partial, _conn} -> {:error, :body_too_large}
+      {:error, reason} -> {:error, reason}
     end
   end
 

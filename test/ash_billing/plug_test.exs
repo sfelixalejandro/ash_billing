@@ -146,5 +146,17 @@ defmodule AshBilling.PlugTest do
 
       assert log =~ "AshBilling.Plug: Webhook synchronization failed"
     end
+
+    test "returns 400 when body exceeds size limit" do
+      conn =
+        conn(:post, "/webhooks/stripe", "a very long body that exceeds length limit")
+        |> put_req_header("content-type", "application/json")
+
+      opts = BillingPlug.init(webhook_secret: @secret, read_body_opts: [length: 4])
+      conn = BillingPlug.call(conn, opts)
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "body_too_large"
+    end
   end
 end

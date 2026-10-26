@@ -65,6 +65,7 @@ defmodule AshBilling.MixProject do
       {:telemetry, "~> 1.0"},
       {:igniter, ">= 0.5.0", optional: true},
       # Dev & Test
+      {:bandit, "~> 1.5", only: [:dev, :test]},
       {:simple_sat, ">= 0.0.0", only: [:dev, :test]},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
