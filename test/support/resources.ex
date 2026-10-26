@@ -24,6 +24,11 @@ defmodule AshBilling.Test.User do
     has_many :subscriptions, AshBilling.Test.Subscription, destination_attribute: :user_id
   end
 
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
+  end
+
   billing do
     # Defaults: customer_id_attribute :stripe_customer_id
   end
@@ -38,6 +43,11 @@ defmodule AshBilling.Test.CustomUser do
   attributes do
     uuid_primary_key :id
     attribute :email, :string, public?: true
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
   end
 
   billing do
@@ -58,6 +68,11 @@ defmodule AshBilling.Test.Subscription do
 
   relationships do
     belongs_to :user, AshBilling.Test.User
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
   end
 
   billing_subscription do

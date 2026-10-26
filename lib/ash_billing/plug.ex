@@ -28,6 +28,11 @@ defmodule AshBilling.Plug do
 
     case provider.verify_webhook(raw_body, signature_header, secret, opts) do
       {:ok, event} ->
+        if Keyword.has_key?(opts, :subscription_resource) or
+             Keyword.has_key?(opts, :customer_resource) do
+          AshBilling.WebhookSync.sync_event(event, opts)
+        end
+
         if is_atom(handler) and function_exported?(handler, :handle_event, 1) do
           handler.handle_event(event)
         end

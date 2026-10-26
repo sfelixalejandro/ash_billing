@@ -89,9 +89,13 @@ scope "/webhooks" do
   forward "/stripe", AshBilling.Plug,
     provider: AshBilling.Providers.Stripe,
     webhook_secret: {System, :get_env, ["STRIPE_WEBHOOK_SECRET"]},
-    handler: MyApp.Billing.WebhookHandler
+    customer_resource: MyApp.Accounts.User,
+    subscription_resource: MyApp.Billing.Subscription,
+    domain: MyApp.Billing
 end
 ```
+
+`AshBilling.Plug` verifies the webhook signature and automatically creates, updates, or cancels records in your `Subscription` and `User` resources. You can also pass an optional `handler: MyApp.Billing.WebhookHandler` if you want to listen to custom Stripe events.
 
 ---
 
