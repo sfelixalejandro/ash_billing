@@ -103,6 +103,25 @@ defmodule AshBilling.Providers.Stripe do
   end
 
   @impl true
+  def resume_subscription(subscription_id, opts \\ []) do
+    req = build_req(opts)
+
+    case Req.post(req,
+           url: "/v1/subscriptions/#{subscription_id}",
+           form: [{"cancel_at_period_end", "false"}]
+         ) do
+      {:ok, %{status: 200, body: body}} ->
+        {:ok, body}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, %{status: status, error: extract_error(body)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl true
   def verify_webhook(payload, signature_header, secret, opts \\ []) do
     tolerance = Keyword.get(opts, :tolerance, @default_tolerance)
 

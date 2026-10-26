@@ -269,6 +269,44 @@ defmodule AshBilling.Providers.StripeTest do
     end
   end
 
+  describe "resume_subscription/2" do
+    test "resumes subscription with cancel_at_period_end false", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        assert conn.method == "POST"
+        assert conn.request_path == "/v1/subscriptions/sub_res_123"
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert body =~ "cancel_at_period_end=false"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{"id" => "sub_res_123", "cancel_at_period_end" => false})
+        )
+      end)
+
+      assert {:ok, %{"id" => "sub_res_123", "cancel_at_period_end" => false}} =
+               Stripe.resume_subscription("sub_res_123", opts)
+    end
+
+    test "handles error from Stripe API on resume", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          400,
+          Jason.encode!(%{"error" => %{"message" => "Subscription cannot be resumed"}})
+        )
+      end)
+
+      assert {:error, %{status: 400, error: "Subscription cannot be resumed"}} =
+               Stripe.resume_subscription("sub_res_bad", opts)
+    end
+  end
+
   describe "verify_webhook/4" do
     @secret "whsec_test_secret_key"
 

@@ -146,6 +146,38 @@ defmodule AshBillingTest do
       assert {:error, %{status: 400, error: "Invalid price"}} =
                AshBilling.create_checkout_session("cus_123", checkout_opts)
     end
+
+    test "auto-injects customer_email when user has no customer_id", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      user = %User{id: Ash.UUID.generate(), email: "prefill@example.com", stripe_customer_id: nil}
+
+      Req.Test.stub(stub_name, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        params = URI.decode_query(body)
+
+        assert params["customer_email"] == "prefill@example.com"
+        refute Map.has_key?(params, "customer")
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{"id" => "cs_email_1", "url" => "https://checkout.test"})
+        )
+      end)
+
+      checkout_opts =
+        Keyword.merge(opts,
+          price: "price_basic",
+          success_url: "https://example.com/ok",
+          cancel_url: "https://example.com/cancel"
+        )
+
+      assert {:ok, %{id: "cs_email_1"}} =
+               AshBilling.create_checkout_session(user, checkout_opts)
+    end
   end
 
   describe "create_portal_session/2" do
@@ -262,6 +294,38 @@ defmodule AshBillingTest do
 
       sub = %{stripe_subscription_id: "sub_cancel_struct"}
       assert {:ok, %{"id" => "sub_cancel_struct"}} = AshBilling.cancel_subscription(sub, opts)
+    end
+  end
+
+  describe "resume_subscription/2" do
+    test "resumes subscription by string ID", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        assert conn.method == "POST"
+        assert conn.request_path == "/v1/subscriptions/sub_res_123"
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert body =~ "cancel_at_period_end=false"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{"id" => "sub_res_123", "cancel_at_period_end" => false})
+        )
+      end)
+
+      assert {:ok, %{"id" => "sub_res_123", "cancel_at_period_end" => false}} =
+               AshBilling.resume_subscription("sub_res_123", opts)
+    end
+
+    test "resumes subscription by struct record", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(%{"id" => "sub_struct_res"}))
+      end)
+
+      sub = %{provider_subscription_id: "sub_struct_res"}
+      assert {:ok, %{"id" => "sub_struct_res"}} = AshBilling.resume_subscription(sub, opts)
     end
   end
 

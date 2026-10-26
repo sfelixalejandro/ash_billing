@@ -40,6 +40,12 @@ defmodule AshBilling.Provider do
               {:ok, map()} | {:error, term()}
 
   @doc """
+  Resumes a subscription that was scheduled to cancel at period end.
+  """
+  @callback resume_subscription(subscription_id(), opts :: opts()) ::
+              {:ok, map()} | {:error, term()}
+
+  @doc """
   Verifies an incoming webhook payload and signature.
   Returns `{:ok, event_map}` if valid, or `{:error, reason}` if invalid.
   """

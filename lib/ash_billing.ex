@@ -91,6 +91,12 @@ defmodule AshBilling do
         _ -> nil
       end
 
+    user_email =
+      case record_or_customer_id do
+        %{email: email} when is_binary(email) -> email
+        _ -> Keyword.get(opts, :customer_email)
+      end
+
     custom_metadata = Keyword.get(opts, :metadata, %{}) |> Enum.into(%{})
 
     metadata =
@@ -110,6 +116,9 @@ defmodule AshBilling do
         mode: Keyword.get(opts, :mode, "subscription")
       }
       |> then(fn p -> if cust_id, do: Map.put(p, :customer, cust_id), else: p end)
+      |> then(fn p ->
+        if is_nil(cust_id) and user_email, do: Map.put(p, :customer_email, user_email), else: p
+      end)
       |> then(fn p ->
         if client_ref_id, do: Map.put(p, :client_reference_id, client_ref_id), else: p
       end)
@@ -210,6 +219,19 @@ defmodule AshBilling do
     sub_id = resolve_subscription_id(subscription_or_id)
     provider = Keyword.get(opts, :provider, Stripe)
     provider.cancel_subscription(sub_id, opts)
+  end
+
+  @doc """
+  Resumes a subscription that was scheduled to cancel at period end.
+
+  Sets `cancel_at_period_end` to `false` in the billing provider.
+  """
+  @spec resume_subscription(struct() | String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def resume_subscription(subscription_or_id, opts \\ []) do
+    sub_id = resolve_subscription_id(subscription_or_id)
+    provider = Keyword.get(opts, :provider, Stripe)
+    provider.resume_subscription(sub_id, opts)
   end
 
   @doc """

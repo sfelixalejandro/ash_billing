@@ -47,6 +47,7 @@ defmodule AshBilling.MixProject do
       name: "ash_billing",
       maintainers: ["Alejandro Felix <SFelixAlejandro@hotmail.com>"],
       licenses: ["MIT"],
+      files: ~w(lib .formatter.exs mix.exs README* LICENSE* documentation),
       links: %{
         "GitHub" => @source_url
       }

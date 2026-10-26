@@ -386,5 +386,45 @@ defmodule AshBilling.WebhookSyncTest do
       assert sub.provider_subscription_id == "sub_unlinked_123"
       assert sub.user_id == nil
     end
+
+    test "handles customer.deleted and clears stripe_customer_id from user" do
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{email: "deleted_customer@example.com", stripe_customer_id: "cus_to_delete_999"},
+          domain: Domain
+        )
+
+      assert user.stripe_customer_id == "cus_to_delete_999"
+
+      event = %{
+        "type" => "customer.deleted",
+        "data" => %{
+          "object" => %{
+            "id" => "cus_to_delete_999"
+          }
+        }
+      }
+
+      assert {:ok, updated_user} = WebhookSync.sync_event(event, @opts)
+      assert updated_user.stripe_customer_id == nil
+
+      # Refresh from DB
+      reloaded_user = Ash.get!(User, user.id, domain: Domain)
+      assert reloaded_user.stripe_customer_id == nil
+    end
+
+    test "handles customer.deleted when customer does not exist in local database" do
+      event = %{
+        "type" => "customer.deleted",
+        "data" => %{
+          "object" => %{
+            "id" => "cus_non_existent"
+          }
+        }
+      }
+
+      assert {:ok, :not_found} = WebhookSync.sync_event(event, @opts)
+    end
   end
 end

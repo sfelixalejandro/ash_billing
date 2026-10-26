@@ -57,6 +57,15 @@ defmodule AshBilling.WebhookSync do
           "checkout.session.completed" ->
             sync_checkout_session(event["data"]["object"], customer_resource, domain, opts)
 
+          "customer.deleted" ->
+            sync_customer_deleted(
+              event["data"]["object"],
+              customer_resource,
+              subscription_resource,
+              domain,
+              opts
+            )
+
           _ ->
             {:ok, :ignored}
         end
@@ -150,6 +159,35 @@ defmodule AshBilling.WebhookSync do
 
           error ->
             error
+        end
+      else
+        {:ok, :ignored}
+      end
+    end
+  end
+
+  defp sync_customer_deleted(nil, _cust_res, _sub_res, _domain, _opts), do: {:ok, :ignored}
+
+  defp sync_customer_deleted(object, customer_resource, _subscription_resource, domain, opts) do
+    if is_nil(customer_resource) do
+      {:ok, :no_customer_resource}
+    else
+      ash_opts = ash_options(domain, opts)
+      stripe_cust_id = object["id"]
+
+      if stripe_cust_id do
+        attr = ResourceInfo.customer_id_attribute(customer_resource)
+
+        customer_resource
+        |> Ash.Query.new()
+        |> Ash.Query.filter(^[{attr, stripe_cust_id}])
+        |> Ash.read_one(ash_opts)
+        |> case do
+          {:ok, cust} when not is_nil(cust) ->
+            Ash.update(cust, %{attr => nil}, ash_opts)
+
+          _ ->
+            {:ok, :not_found}
         end
       else
         {:ok, :ignored}
