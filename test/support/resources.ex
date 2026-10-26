@@ -8,6 +8,7 @@ defmodule AshBilling.Test.Domain do
     resource AshBilling.Test.PolicyUser
     resource AshBilling.Test.PolicySubscription
     resource AshBilling.Test.WebhookEvent
+    resource AshBilling.Test.PremiumFeature
   end
 end
 
@@ -152,5 +153,36 @@ defmodule AshBilling.Test.WebhookEvent do
   actions do
     default_accept :*
     defaults [:read, :create, :update, :destroy]
+  end
+end
+
+defmodule AshBilling.Test.PremiumFeature do
+  use Ash.Resource,
+    domain: AshBilling.Test.Domain,
+    data_layer: Ash.DataLayer.Ets,
+    authorizers: [Ash.Policy.Authorizer]
+
+  attributes do
+    uuid_primary_key :id
+    attribute :title, :string, public?: true
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
+
+    read :pro_only do
+      # specialized read action
+    end
+  end
+
+  policies do
+    policy action_type(:create) do
+      authorize_if AshBilling.Checks.Subscribed
+    end
+
+    policy action(:pro_only) do
+      authorize_if {AshBilling.Checks.HasPrice, price: "price_pro"}
+    end
   end
 end

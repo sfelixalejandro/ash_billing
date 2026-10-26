@@ -307,6 +307,144 @@ defmodule AshBilling.Providers.StripeTest do
     end
   end
 
+  describe "swap_plan/3" do
+    test "swaps plan directly when subscription_item_id is provided", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        assert conn.method == "POST"
+        assert conn.request_path == "/v1/subscriptions/sub_swap_123"
+
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert body =~ "items%5B0%5D%5Bid%5D=si_item_999"
+        assert body =~ "items%5B0%5D%5Bprice%5D=price_enterprise"
+        assert body =~ "proration_behavior=create_prorations"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{"id" => "sub_swap_123", "status" => "active"})
+        )
+      end)
+
+      opts = Keyword.merge(opts, subscription_item_id: "si_item_999")
+
+      assert {:ok, %{"id" => "sub_swap_123", "status" => "active"}} =
+               Stripe.swap_plan("sub_swap_123", "price_enterprise", opts)
+    end
+
+    test "fetches subscription item id if not provided, then swaps plan", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        case conn.method do
+          "GET" ->
+            assert conn.request_path == "/v1/subscriptions/sub_auto_item"
+
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(
+              200,
+              Jason.encode!(%{
+                "id" => "sub_auto_item",
+                "items" => %{"data" => [%{"id" => "si_auto_found"}]}
+              })
+            )
+
+          "POST" ->
+            assert conn.request_path == "/v1/subscriptions/sub_auto_item"
+            {:ok, body, conn} = Plug.Conn.read_body(conn)
+            assert body =~ "items%5B0%5D%5Bid%5D=si_auto_found"
+            assert body =~ "items%5B0%5D%5Bprice%5D=price_new_pro"
+            assert body =~ "proration_behavior=none"
+
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(
+              200,
+              Jason.encode!(%{"id" => "sub_auto_item", "status" => "active"})
+            )
+        end
+      end)
+
+      opts = Keyword.merge(opts, proration_behavior: "none")
+
+      assert {:ok, %{"id" => "sub_auto_item", "status" => "active"}} =
+               Stripe.swap_plan("sub_auto_item", "price_new_pro", opts)
+    end
+
+    test "handles error from Stripe API on swap_plan", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          400,
+          Jason.encode!(%{"error" => %{"message" => "Invalid price ID"}})
+        )
+      end)
+
+      opts = Keyword.merge(opts, subscription_item_id: "si_item_999")
+
+      assert {:error, %{status: 400, error: "Invalid price ID"}} =
+               Stripe.swap_plan("sub_swap_bad", "price_invalid", opts)
+    end
+
+    test "handles proration_date and quantity options", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert body =~ "proration_date=1799000000"
+        assert body =~ "items%5B0%5D%5Bquantity%5D=10"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(%{"id" => "sub_swap_opts"}))
+      end)
+
+      opts =
+        opts
+        |> Keyword.put(:subscription_item_id, "si_item_123")
+        |> Keyword.put(:proration_date, 1_799_000_000)
+        |> Keyword.put(:quantity, 10)
+
+      assert {:ok, %{"id" => "sub_swap_opts"}} =
+               Stripe.swap_plan("sub_swap_opts", "price_opts", opts)
+    end
+
+    test "handles missing items when resolving subscription item", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{"id" => "sub_no_items", "items" => %{"data" => []}})
+        )
+      end)
+
+      assert {:error, {:missing_subscription_item, _}} =
+               Stripe.swap_plan("sub_no_items", "price_any", opts)
+    end
+
+    test "handles error from get_subscription when resolving item id", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(404, Jason.encode!(%{"error" => %{"message" => "Not found"}}))
+      end)
+
+      assert {:error, %{status: 404, error: "Not found"}} =
+               Stripe.swap_plan("sub_missing", "price_any", opts)
+    end
+  end
+
   describe "verify_webhook/4" do
     @secret "whsec_test_secret_key"
 

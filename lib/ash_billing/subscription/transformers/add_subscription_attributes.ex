@@ -32,10 +32,12 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
        ]},
       {:price_id, Ash.Type.String, [allow_nil?: true, public?: true]},
       {:current_period_end, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]},
-      {:cancel_at_period_end, Ash.Type.Boolean, [default: false, public?: true]}
+      {:cancel_at_period_end, Ash.Type.Boolean, [default: false, public?: true]},
+      {:trial_ends_at, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]}
     ]
 
     with {:ok, state} <- add_attributes(dsl_state, attributes),
+         {:ok, state} <- maybe_add_on_trial_calculation(state),
          {:ok, state} <- maybe_add_active_calculation(state) do
       {:ok, state}
     end
@@ -53,11 +55,34 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
     end)
   end
 
+  defp maybe_add_on_trial_calculation(state) do
+    if Resource.Info.calculation(state, :on_trial?) do
+      {:ok, state}
+    else
+      expr = Ash.Expr.expr(not is_nil(trial_ends_at) and trial_ends_at > now())
+
+      calculation =
+        Transformer.build_entity!(Resource.Dsl, [:calculations], :calculate,
+          name: :on_trial?,
+          type: Ash.Type.Boolean,
+          calculation: expr,
+          public?: true,
+          filterable?: true
+        )
+
+      {:ok, Transformer.add_entity(state, [:calculations], calculation)}
+    end
+  end
+
   defp maybe_add_active_calculation(state) do
     if Resource.Info.calculation(state, :active?) do
       {:ok, state}
     else
-      expr = Ash.Expr.expr(status in [:active, :trialing])
+      expr =
+        Ash.Expr.expr(
+          status in [:active, :trialing] or
+            (not is_nil(trial_ends_at) and trial_ends_at > now())
+        )
 
       calculation =
         Transformer.build_entity!(Resource.Dsl, [:calculations], :calculate,

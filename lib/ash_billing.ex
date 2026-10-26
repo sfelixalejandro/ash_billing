@@ -235,6 +235,78 @@ defmodule AshBilling do
   end
 
   @doc """
+  Swaps a subscription to a new price/plan in the billing provider.
+
+  ## Options
+
+    * `:proration_behavior` - `"create_prorations"` (default), `"none"`, or `"always_invoice"`.
+    * `:subscription_item_id` - Explicit Stripe subscription item ID (avoids an extra GET call if known).
+    * `:quantity` - Updated quantity for the new price.
+    * `:proration_date` - Unix timestamp to use for calculating prorations.
+    * `:provider` - The billing provider module.
+  """
+  @spec swap_plan(struct() | String.t(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def swap_plan(subscription_or_id, new_price_id, opts \\ []) do
+    sub_id = resolve_subscription_id(subscription_or_id)
+    provider = Keyword.get(opts, :provider, Stripe)
+
+    :telemetry.span(
+      [:ash_billing, :swap_plan],
+      %{provider: provider, subscription_id: sub_id, new_price_id: new_price_id},
+      fn ->
+        case provider.swap_plan(sub_id, new_price_id, opts) do
+          {:ok, result} ->
+            {{:ok, result}, %{status: :ok}}
+
+          {:error, reason} = error ->
+            {error, %{status: :error, error: reason}}
+        end
+      end
+    )
+  end
+
+  @doc """
+  Updates the quantity of a subscription (e.g. per-seat billing).
+
+  ## Options
+
+    * `:proration_behavior` - `"create_prorations"` (default), `"none"`, or `"always_invoice"`.
+    * `:subscription_item_id` - Explicit Stripe subscription item ID (avoids an extra GET call if known).
+    * `:price_id` - The existing price ID (if known, skips the GET call).
+    * `:provider` - The billing provider module.
+  """
+  @spec update_quantity(struct() | String.t(), pos_integer(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def update_quantity(subscription_or_id, quantity, opts \\ []) do
+    sub_id = resolve_subscription_id(subscription_or_id)
+
+    case Keyword.get(opts, :price_id) do
+      price_id when is_binary(price_id) ->
+        swap_plan(sub_id, price_id, Keyword.put(opts, :quantity, quantity))
+
+      _ ->
+        case get_subscription(sub_id, opts) do
+          {:ok,
+           %{"items" => %{"data" => [%{"id" => item_id, "price" => %{"id" => price_id}} | _]}}} ->
+            swap_plan(
+              sub_id,
+              price_id,
+              opts
+              |> Keyword.put(:subscription_item_id, item_id)
+              |> Keyword.put(:quantity, quantity)
+            )
+
+          {:ok, body} ->
+            {:error, {:missing_subscription_item, body}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  @doc """
   Returns the active subscription record for a customer, or `nil` if none is active.
 
   If a `price_id` is passed as the second argument, returns the active subscription matching that price.
@@ -245,7 +317,8 @@ defmodule AshBilling do
 
   def subscription(%{subscriptions: subscriptions}, price_id) when is_list(subscriptions) do
     Enum.find(subscriptions, fn sub ->
-      active_status?(sub.status) and (is_nil(price_id) or sub.price_id == price_id)
+      (active_status?(sub.status) or on_trial?(sub)) and
+        (is_nil(price_id) or sub.price_id == price_id)
     end)
   end
 
@@ -264,6 +337,12 @@ defmodule AshBilling do
 
   defp active_status?(status) when status in [:active, "active", :trialing, "trialing"], do: true
   defp active_status?(_), do: false
+
+  defp on_trial?(%{trial_ends_at: %DateTime{} = trial_ends_at}) do
+    DateTime.compare(trial_ends_at, DateTime.utc_now()) == :gt
+  end
+
+  defp on_trial?(_), do: false
 
   defp resolve_customer_id(%_resource{} = record), do: customer_id(record)
   defp resolve_customer_id(id) when is_binary(id), do: id

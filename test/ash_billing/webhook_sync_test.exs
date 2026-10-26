@@ -170,6 +170,37 @@ defmodule AshBilling.WebhookSyncTest do
       {:ok, updated_user} = Ash.get(User, user.id, domain: Domain)
       assert updated_user.stripe_customer_id == "cus_brand_new_stripe_id"
     end
+
+    test "syncs trial_end timestamp into trial_ends_at attribute" do
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{email: "trial_sync_user@example.com", stripe_customer_id: "cus_trial_sync_100"},
+          domain: Domain
+        )
+
+      trial_timestamp = 1_793_000_000
+
+      event = %{
+        "type" => "customer.subscription.created",
+        "data" => %{
+          "object" => %{
+            "id" => "sub_stripe_trial_sync",
+            "customer" => user.stripe_customer_id,
+            "status" => "trialing",
+            "cancel_at_period_end" => false,
+            "current_period_end" => 1_795_000_000,
+            "trial_end" => trial_timestamp,
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro_trial"}}]}
+          }
+        }
+      }
+
+      assert {:ok, subscription} = WebhookSync.sync_event(event, @opts)
+      assert subscription.provider_subscription_id == "sub_stripe_trial_sync"
+      assert subscription.status == :trialing
+      assert DateTime.to_unix(subscription.trial_ends_at) == trial_timestamp
+    end
   end
 
   describe "sync_event/2 for checkout.session.completed" do

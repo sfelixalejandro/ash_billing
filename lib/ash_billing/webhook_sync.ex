@@ -94,6 +94,7 @@ defmodule AshBilling.WebhookSync do
       status = normalize_status(object["status"])
       price_id = extract_price_id(object)
       current_period_end = parse_unix_timestamp(object["current_period_end"])
+      trial_ends_at = parse_unix_timestamp(object["trial_end"])
       cancel_at_period_end = Map.get(object, "cancel_at_period_end", false)
 
       ash_opts = ash_options(domain, opts)
@@ -109,13 +110,21 @@ defmodule AshBilling.WebhookSync do
           _ -> nil
         end
 
-      attrs = %{
-        provider_subscription_id: sub_id,
-        status: status,
-        price_id: price_id,
-        current_period_end: current_period_end,
-        cancel_at_period_end: cancel_at_period_end
-      }
+      attrs =
+        %{
+          provider_subscription_id: sub_id,
+          status: status,
+          price_id: price_id,
+          current_period_end: current_period_end,
+          cancel_at_period_end: cancel_at_period_end
+        }
+        |> then(fn a ->
+          if Ash.Resource.Info.attribute(subscription_resource, :trial_ends_at) do
+            Map.put(a, :trial_ends_at, trial_ends_at)
+          else
+            a
+          end
+        end)
 
       if existing do
         Ash.update(existing, attrs, ash_opts)

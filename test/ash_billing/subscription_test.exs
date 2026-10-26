@@ -29,14 +29,60 @@ defmodule AshBilling.SubscriptionTest do
       assert cancel_at_period_end != nil
       assert cancel_at_period_end.type == Ash.Type.Boolean
       assert cancel_at_period_end.default == false
+
+      trial_ends_at = Ash.Resource.Info.attribute(Subscription, :trial_ends_at)
+      assert trial_ends_at != nil
+      assert trial_ends_at.type == Ash.Type.UtcDatetimeUsec
+      assert trial_ends_at.allow_nil? == true
     end
 
-    test "injects active? calculation into resource" do
+    test "injects active? and on_trial? calculations into resource" do
       calc = Ash.Resource.Info.calculation(Subscription, :active?)
       assert calc != nil
       assert calc.type == Ash.Type.Boolean
       assert calc.filterable? == true
       assert calc.public? == true
+
+      trial_calc = Ash.Resource.Info.calculation(Subscription, :on_trial?)
+      assert trial_calc != nil
+      assert trial_calc.type == Ash.Type.Boolean
+      assert trial_calc.filterable? == true
+      assert trial_calc.public? == true
+    end
+
+    test "evaluates on_trial? and active? during trials" do
+      future = DateTime.utc_now() |> DateTime.add(10, :day)
+      past = DateTime.utc_now() |> DateTime.add(-1, :day)
+
+      # Active trial
+      sub_trial = %Subscription{
+        provider_subscription_id: "sub_trial_1",
+        status: :trialing,
+        trial_ends_at: future
+      }
+
+      assert {:ok, true} = Ash.calculate(sub_trial, :on_trial?)
+      assert {:ok, true} = Ash.calculate(sub_trial, :active?)
+
+      # Expired trial with canceled status
+      sub_expired = %Subscription{
+        provider_subscription_id: "sub_trial_2",
+        status: :canceled,
+        trial_ends_at: past
+      }
+
+      assert {:ok, false} = Ash.calculate(sub_expired, :on_trial?)
+      assert {:ok, false} = Ash.calculate(sub_expired, :active?)
+
+      # Past due but trial still ongoing (grace period)
+      sub_grace = %Subscription{
+        provider_subscription_id: "sub_trial_3",
+        status: :past_due,
+        trial_ends_at: future
+      }
+
+      assert {:ok, true} = Ash.calculate(sub_grace, :on_trial?)
+      assert {:ok, true} = Ash.calculate(sub_grace, :active?)
     end
 
     test "provides correct introspection helpers" do

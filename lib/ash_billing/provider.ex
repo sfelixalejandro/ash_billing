@@ -46,6 +46,12 @@ defmodule AshBilling.Provider do
               {:ok, map()} | {:error, term()}
 
   @doc """
+  Swaps an active subscription to a new price/plan, with optional proration behavior.
+  """
+  @callback swap_plan(subscription_id(), new_price_id :: String.t(), opts :: opts()) ::
+              {:ok, map()} | {:error, term()}
+
+  @doc """
   Verifies an incoming webhook payload and signature.
   Returns `{:ok, event_map}` if valid, or `{:error, reason}` if invalid.
   """

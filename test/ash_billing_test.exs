@@ -329,6 +329,118 @@ defmodule AshBillingTest do
     end
   end
 
+  describe "swap_plan/3 and update_quantity/3" do
+    test "swaps plan with telemetry span emission", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        assert conn.method == "POST"
+        assert conn.request_path == "/v1/subscriptions/sub_top_swap"
+
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert body =~ "items%5B0%5D%5Bprice%5D=price_scale"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{"id" => "sub_top_swap", "status" => "active"})
+        )
+      end)
+
+      opts = Keyword.merge(opts, subscription_item_id: "si_direct_123")
+
+      assert {:ok, %{"id" => "sub_top_swap"}} =
+               AshBilling.swap_plan("sub_top_swap", "price_scale", opts)
+    end
+
+    test "updates quantity on existing price", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        assert conn.method == "POST"
+        assert conn.request_path == "/v1/subscriptions/sub_qty_123"
+
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert body =~ "items%5B0%5D%5Bquantity%5D=5"
+        assert body =~ "items%5B0%5D%5Bprice%5D=price_seats"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(%{"id" => "sub_qty_123", "status" => "active"}))
+      end)
+
+      opts =
+        opts
+        |> Keyword.put(:subscription_item_id, "si_seat_item")
+        |> Keyword.put(:price_id, "price_seats")
+
+      assert {:ok, %{"id" => "sub_qty_123"}} =
+               AshBilling.update_quantity("sub_qty_123", 5, opts)
+    end
+
+    test "updates quantity without price_id by auto-resolving from provider", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        case conn.method do
+          "GET" ->
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(
+              200,
+              Jason.encode!(%{
+                "id" => "sub_qty_auto",
+                "items" => %{
+                  "data" => [%{"id" => "si_seat_auto", "price" => %{"id" => "price_auto_plan"}}]
+                }
+              })
+            )
+
+          "POST" ->
+            {:ok, body, conn} = Plug.Conn.read_body(conn)
+            assert body =~ "items%5B0%5D%5Bid%5D=si_seat_auto"
+            assert body =~ "items%5B0%5D%5Bprice%5D=price_auto_plan"
+            assert body =~ "items%5B0%5D%5Bquantity%5D=3"
+
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(
+              200,
+              Jason.encode!(%{"id" => "sub_qty_auto", "status" => "active"})
+            )
+        end
+      end)
+
+      assert {:ok, %{"id" => "sub_qty_auto"}} =
+               AshBilling.update_quantity("sub_qty_auto", 3, opts)
+    end
+
+    test "handles error in update_quantity when subscription fetch fails", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(404, Jason.encode!(%{"error" => %{"message" => "Not found"}}))
+      end)
+
+      assert {:error, %{status: 404, error: "Not found"}} =
+               AshBilling.update_quantity("sub_qty_missing", 2, opts)
+    end
+
+    test "handles error in swap_plan", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(400, Jason.encode!(%{"error" => %{"message" => "Card declined"}}))
+      end)
+
+      opts = Keyword.merge(opts, subscription_item_id: "si_direct_123")
+
+      assert {:error, %{status: 400, error: "Card declined"}} =
+               AshBilling.swap_plan("sub_top_bad", "price_fail", opts)
+    end
+  end
+
   describe "subscription/2 and subscribed?/2" do
     test "returns active subscription struct or nil" do
       sub_active = %{status: :active, price_id: "price_pro"}
@@ -398,6 +510,27 @@ defmodule AshBillingTest do
       }
 
       assert AshBilling.subscribed?(user) == false
+    end
+
+    test "returns true when subscription has active trial_ends_at in the future" do
+      future = DateTime.utc_now() |> DateTime.add(5, :day)
+      past = DateTime.utc_now() |> DateTime.add(-2, :day)
+
+      user_on_trial = %User{
+        subscriptions: [
+          %{status: :incomplete, price_id: "price_trial_plan", trial_ends_at: future}
+        ]
+      }
+
+      user_expired_trial = %User{
+        subscriptions: [
+          %{status: :incomplete, price_id: "price_trial_plan", trial_ends_at: past}
+        ]
+      }
+
+      assert AshBilling.subscribed?(user_on_trial) == true
+      assert AshBilling.subscribed?(user_on_trial, "price_trial_plan") == true
+      assert AshBilling.subscribed?(user_expired_trial) == false
     end
 
     test "returns false when subscriptions relationship is not loaded" do

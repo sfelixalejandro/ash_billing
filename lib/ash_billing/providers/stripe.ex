@@ -122,6 +122,63 @@ defmodule AshBilling.Providers.Stripe do
   end
 
   @impl true
+  def swap_plan(subscription_id, new_price_id, opts \\ []) do
+    req = build_req(opts)
+    proration_behavior = Keyword.get(opts, :proration_behavior, "create_prorations")
+
+    with {:ok, item_id} <- resolve_subscription_item_id(subscription_id, opts) do
+      item_params =
+        %{"id" => item_id, "price" => new_price_id}
+        |> then(fn p ->
+          if qty = Keyword.get(opts, :quantity), do: Map.put(p, "quantity", qty), else: p
+        end)
+
+      params =
+        %{
+          "items" => [item_params],
+          "proration_behavior" => to_string(proration_behavior)
+        }
+        |> then(fn p ->
+          if p_date = Keyword.get(opts, :proration_date),
+            do: Map.put(p, "proration_date", p_date),
+            else: p
+        end)
+
+      form_params = to_form_params(params)
+
+      case Req.post(req, url: "/v1/subscriptions/#{subscription_id}", form: form_params) do
+        {:ok, %{status: 200, body: body}} ->
+          {:ok, body}
+
+        {:ok, %{status: status, body: body}} ->
+          {:error, %{status: status, error: extract_error(body)}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp resolve_subscription_item_id(subscription_id, opts) when is_list(opts) do
+    case Keyword.get(opts, :subscription_item_id) do
+      item_id when is_binary(item_id) and item_id != "" ->
+        {:ok, item_id}
+
+      _ ->
+        case get_subscription(subscription_id, opts) do
+          {:ok, %{"items" => %{"data" => [%{"id" => id} | _]}}} ->
+            {:ok, id}
+
+          {:ok, body} ->
+            {:error, {:missing_subscription_item, body}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  @impl true
   def verify_webhook(payload, signature_header, secret, opts \\ []) do
     tolerance = Keyword.get(opts, :tolerance, @default_tolerance)
 
