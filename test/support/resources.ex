@@ -9,6 +9,7 @@ defmodule AshBilling.Test.Domain do
     resource AshBilling.Test.PolicySubscription
     resource AshBilling.Test.WebhookEvent
     resource AshBilling.Test.PremiumFeature
+    resource AshBilling.Test.IncompleteResource
   end
 end
 
@@ -184,5 +185,20 @@ defmodule AshBilling.Test.PremiumFeature do
     policy action(:pro_only) do
       authorize_if {AshBilling.Checks.HasPrice, price: "price_pro"}
     end
+  end
+end
+
+defmodule AshBilling.Test.IncompleteResource do
+  use Ash.Resource,
+    domain: AshBilling.Test.Domain,
+    data_layer: Ash.DataLayer.Ets
+
+  attributes do
+    uuid_primary_key :id
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
   end
 end

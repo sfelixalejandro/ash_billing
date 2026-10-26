@@ -90,7 +90,7 @@ defmodule AshBilling.WebhookSync do
       {:ok, :no_subscription_resource}
     else
       sub_id = object["id"]
-      stripe_cust_id = object["customer"]
+      stripe_cust_id = extract_customer_id(object)
       status = normalize_status(object["status"])
       price_id = extract_price_id(object)
       current_period_end = parse_unix_timestamp(object["current_period_end"])
@@ -139,7 +139,26 @@ defmodule AshBilling.WebhookSync do
             attrs
           end
 
-        Ash.create(subscription_resource, attrs, ash_opts)
+        case Ash.create(subscription_resource, attrs, ash_opts) do
+          {:ok, created} ->
+            {:ok, created}
+
+          {:error, error} ->
+            # Concurrency race resolution:
+            # If another concurrent process just inserted this provider_subscription_id,
+            # retry as an update to guarantee idempotency across nodes.
+            subscription_resource
+            |> Ash.Query.new()
+            |> Ash.Query.filter(provider_subscription_id == ^sub_id)
+            |> Ash.read_one(ash_opts)
+            |> case do
+              {:ok, newly_created} when not is_nil(newly_created) ->
+                Ash.update(newly_created, attrs, ash_opts)
+
+              _ ->
+                {:error, error}
+            end
+        end
       end
     end
   end
@@ -149,7 +168,7 @@ defmodule AshBilling.WebhookSync do
       {:ok, :no_customer_resource}
     else
       ash_opts = ash_options(domain, opts)
-      stripe_customer_id = session["customer"]
+      stripe_customer_id = extract_customer_id(session)
 
       resource_id =
         get_in(session, ["metadata", "resource_id"]) ||
@@ -182,7 +201,7 @@ defmodule AshBilling.WebhookSync do
       {:ok, :no_customer_resource}
     else
       ash_opts = ash_options(domain, opts)
-      stripe_cust_id = object["id"]
+      stripe_cust_id = extract_customer_id(object)
 
       if stripe_cust_id do
         attr = ResourceInfo.customer_id_attribute(customer_resource)
@@ -266,16 +285,37 @@ defmodule AshBilling.WebhookSync do
     end
   end
 
-  defp extract_price_id(%{
-         "items" => %{"data" => [%{"price" => %{"id" => price_id}} | _]}
-       }),
-       do: price_id
+  defp extract_customer_id(%{"customer" => %{"id" => id}}) when is_binary(id), do: id
+  defp extract_customer_id(%{"customer" => id}) when is_binary(id), do: id
+  defp extract_customer_id(%{"id" => id}) when is_binary(id), do: id
+  defp extract_customer_id(id) when is_binary(id), do: id
+  defp extract_customer_id(_), do: nil
 
-  defp extract_price_id(%{"plan" => %{"id" => plan_id}}), do: plan_id
+  defp extract_price_id(%{"items" => %{"data" => [%{"price" => %{"id" => id}} | _]}})
+       when is_binary(id),
+       do: id
+
+  defp extract_price_id(%{"items" => %{"data" => [%{"plan" => %{"id" => id}} | _]}})
+       when is_binary(id),
+       do: id
+
+  defp extract_price_id(%{"items" => %{"data" => [%{"price" => id} | _]}})
+       when is_binary(id),
+       do: id
+
+  defp extract_price_id(%{"plan" => %{"id" => id}}) when is_binary(id), do: id
+  defp extract_price_id(%{"plan" => id}) when is_binary(id), do: id
+  defp extract_price_id(%{"price" => %{"id" => id}}) when is_binary(id), do: id
+  defp extract_price_id(%{"price" => id}) when is_binary(id), do: id
   defp extract_price_id(_), do: nil
 
-  defp parse_unix_timestamp(nil), do: nil
-  defp parse_unix_timestamp(ts) when is_integer(ts), do: DateTime.from_unix!(ts, :second)
+  defp parse_unix_timestamp(ts) when is_integer(ts) do
+    case DateTime.from_unix(ts, :second) do
+      {:ok, dt} -> dt
+      _ -> nil
+    end
+  end
+
   defp parse_unix_timestamp(_), do: nil
 
   defp normalize_status("active"), do: :active
@@ -285,6 +325,8 @@ defmodule AshBilling.WebhookSync do
   defp normalize_status("unpaid"), do: :unpaid
   defp normalize_status("incomplete"), do: :incomplete
   defp normalize_status("incomplete_expired"), do: :incomplete_expired
+  defp normalize_status("paused"), do: :paused
+  defp normalize_status(:paused), do: :paused
   defp normalize_status(status) when is_atom(status), do: status
   defp normalize_status(_), do: :incomplete
 end

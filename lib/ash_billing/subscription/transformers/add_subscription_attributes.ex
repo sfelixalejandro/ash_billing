@@ -24,7 +24,8 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
              :canceled,
              :unpaid,
              :incomplete,
-             :incomplete_expired
+             :incomplete_expired,
+             :paused
            ]
          ],
          allow_nil?: false,

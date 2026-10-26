@@ -363,4 +363,152 @@ defmodule AshBilling do
     |> Enum.reject(fn {_k, v} -> is_nil(v) end)
     |> Map.new()
   end
+
+  @doc """
+  Performs pre-flight configuration and resource health diagnostics.
+
+  Verifies that billing customer resources, subscription resources, and API credentials
+  are properly configured and compliant with AshBilling requirements.
+
+  Returns `{:ok, %{status: :valid}}` or `{:error, [reasons]}`.
+
+  ## Options
+
+    * `:customer_resource` - The Ash resource representing billing customers.
+    * `:subscription_resource` - The Ash resource representing subscriptions.
+    * `:api_key` - Stripe API key to validate format (defaults to application env).
+    * `:webhook_secret` - Stripe webhook secret to validate format (defaults to application env).
+  """
+  @spec check_configuration(keyword()) :: {:ok, map()} | {:error, [String.t()]}
+  def check_configuration(opts \\ []) do
+    customer_res = Keyword.get(opts, :customer_resource)
+    sub_res = Keyword.get(opts, :subscription_resource)
+
+    errors =
+      []
+      |> check_customer_resource(customer_res)
+      |> check_subscription_resource(sub_res)
+      |> check_api_key(opts)
+      |> check_webhook_secret(opts)
+
+    if errors == [] do
+      {:ok, %{status: :valid}}
+    else
+      {:error, Enum.reverse(errors)}
+    end
+  end
+
+  @doc """
+  Same as `check_configuration/1`, but raises `ArgumentError` if any misconfiguration is found.
+  Ideal for calling in `Application.start/2` or `config/runtime.exs`.
+  """
+  @spec verify_configuration!(keyword()) :: :ok
+  def verify_configuration!(opts \\ []) do
+    case check_configuration(opts) do
+      {:ok, _} ->
+        :ok
+
+      {:error, errors} ->
+        raise ArgumentError,
+              "AshBilling configuration verification failed:\n" <>
+                Enum.map_join(errors, "\n", &"  * #{&1}")
+    end
+  end
+
+  defp check_customer_resource(errors, nil), do: errors
+
+  defp check_customer_resource(errors, res) do
+    attr = ResourceInfo.customer_id_attribute(res)
+
+    errors =
+      if Ash.Resource.Info.attribute(res, attr) do
+        errors
+      else
+        ["Customer resource #{inspect(res)} is missing attribute #{inspect(attr)}" | errors]
+      end
+
+    if Ash.Resource.Info.relationship(res, :subscriptions) do
+      errors
+    else
+      ["Customer resource #{inspect(res)} is missing :subscriptions relationship" | errors]
+    end
+  end
+
+  defp check_subscription_resource(errors, nil), do: errors
+
+  defp check_subscription_resource(errors, res) do
+    required_attrs = [:provider_subscription_id, :status, :price_id]
+
+    missing_attrs =
+      Enum.reject(required_attrs, fn a -> Ash.Resource.Info.attribute(res, a) != nil end)
+
+    errors =
+      if missing_attrs == [] do
+        errors
+      else
+        [
+          "Subscription resource #{inspect(res)} is missing required attributes: #{inspect(missing_attrs)}"
+          | errors
+        ]
+      end
+
+    if Ash.Resource.Info.calculation(res, :active?) do
+      errors
+    else
+      ["Subscription resource #{inspect(res)} is missing :active? calculation" | errors]
+    end
+  end
+
+  defp check_api_key(errors, opts) do
+    key =
+      Keyword.get(
+        opts,
+        :api_key,
+        Application.get_env(:ash_billing, :stripe_api_key) ||
+          System.get_env("STRIPE_SECRET_KEY")
+      )
+
+    case key do
+      nil ->
+        errors
+
+      k when is_binary(k) ->
+        if String.starts_with?(k, "sk_") or String.starts_with?(k, "rk_") do
+          errors
+        else
+          [
+            "Stripe API key #{inspect(k)} does not start with standard prefix 'sk_' or 'rk_'"
+            | errors
+          ]
+        end
+
+      _ ->
+        errors
+    end
+  end
+
+  defp check_webhook_secret(errors, opts) do
+    secret =
+      Keyword.get(
+        opts,
+        :webhook_secret,
+        Application.get_env(:ash_billing, :stripe_webhook_secret) ||
+          System.get_env("STRIPE_WEBHOOK_SECRET")
+      )
+
+    case secret do
+      nil ->
+        errors
+
+      s when is_binary(s) ->
+        if String.starts_with?(s, "whsec_") do
+          errors
+        else
+          ["Stripe webhook secret does not start with standard prefix 'whsec_'" | errors]
+        end
+
+      _ ->
+        errors
+    end
+  end
 end

@@ -132,5 +132,14 @@ defmodule AshBilling.DeduplicationTest do
       assert is_list(AshBilling.WebhookEvent.sections())
       assert is_list(AshBilling.WebhookEvent.transformers())
     end
+
+    test "falls back to memory strategy if resource strategy is set but resource is nil" do
+      opts = [deduplication_strategy: :resource, deduplication_resource: nil]
+      event_id = "evt_fallback_mem_1"
+
+      refute Deduplication.processed?(event_id, opts)
+      assert :ok = Deduplication.mark_processed(event_id, opts)
+      assert Deduplication.processed?(event_id, opts)
+    end
   end
 end

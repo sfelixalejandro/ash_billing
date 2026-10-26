@@ -182,6 +182,12 @@ defmodule AshBilling.ChecksTest do
       assert AshBilling.Checks.Subscribed.match?(nil, %{}, []) == false
       assert AshBilling.Checks.Subscribed.match?("not_a_struct", %{}, []) == false
       assert AshBilling.Checks.Subscribed.match?(%{some: :map}, %{}, []) == false
+
+      # Struct without subscriptions relationship
+      {:ok, custom_user} =
+        Ash.create(AshBilling.Test.CustomUser, %{email: "cust@saas.com"}, domain: Domain)
+
+      assert AshBilling.Checks.Subscribed.match?(custom_user, %{}, []) == false
     end
   end
 end

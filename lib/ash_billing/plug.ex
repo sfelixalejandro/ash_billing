@@ -44,34 +44,59 @@ defmodule AshBilling.Plug do
                 {resp_conn,
                  %{status: :already_processed, event_id: event_id, event_type: event_type}}
               else
-                if deduplicate?, do: AshBilling.Deduplication.mark_processed(event_id, opts)
-
-                if Keyword.has_key?(opts, :subscription_resource) or
-                     Keyword.has_key?(opts, :customer_resource) do
-                  case AshBilling.WebhookSync.sync_event(event, opts) do
-                    {:ok, _} ->
-                      :ok
-
-                    {:error, reason} ->
-                      require Logger
-
-                      Logger.error(
-                        "AshBilling.Plug: Webhook synchronization failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(reason)}"
-                      )
+                sync_result =
+                  if Keyword.has_key?(opts, :subscription_resource) or
+                       Keyword.has_key?(opts, :customer_resource) do
+                    AshBilling.WebhookSync.sync_event(event, opts)
+                  else
+                    {:ok, :not_configured}
                   end
+
+                return_500? = Keyword.get(opts, :return_500_on_sync_error, true)
+
+                case sync_result do
+                  {:error, reason} when return_500? ->
+                    require Logger
+
+                    Logger.error(
+                      "AshBilling.Plug: Webhook synchronization failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(reason)}. Returning HTTP 500 to trigger Stripe retry."
+                    )
+
+                    resp_conn =
+                      conn
+                      |> put_resp_content_type("application/json")
+                      |> send_resp(
+                        500,
+                        Jason.encode!(%{
+                          error: "synchronization_failed",
+                          details: inspect(reason)
+                        })
+                      )
+                      |> halt()
+
+                    {resp_conn,
+                     %{
+                       status: :sync_failed,
+                       event_id: event_id,
+                       event_type: event_type,
+                       error: reason
+                     }}
+
+                  _ ->
+                    if deduplicate?, do: AshBilling.Deduplication.mark_processed(event_id, opts)
+
+                    if is_atom(handler) and function_exported?(handler, :handle_event, 1) do
+                      handler.handle_event(event)
+                    end
+
+                    resp_conn =
+                      conn
+                      |> put_resp_content_type("application/json")
+                      |> send_resp(200, ~s({"status":"received"}))
+                      |> halt()
+
+                    {resp_conn, %{status: :received, event_id: event_id, event_type: event_type}}
                 end
-
-                if is_atom(handler) and function_exported?(handler, :handle_event, 1) do
-                  handler.handle_event(event)
-                end
-
-                resp_conn =
-                  conn
-                  |> put_resp_content_type("application/json")
-                  |> send_resp(200, ~s({"status":"received"}))
-                  |> halt()
-
-                {resp_conn, %{status: :received, event_id: event_id, event_type: event_type}}
               end
 
             {:error, reason} ->

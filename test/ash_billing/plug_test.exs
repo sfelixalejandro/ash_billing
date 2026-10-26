@@ -119,14 +119,13 @@ defmodule AshBilling.PlugTest do
       assert conn.status == 200
     end
 
-    test "logs error when webhook sync encounters an error" do
+    test "returns 500 on database sync error to trigger Stripe retry" do
       import ExUnit.CaptureLog
 
-      # A checkout session with an unknown user UUID returns {:error, %Ash.Error.Query.NotFound{}}
       non_existent_uuid = "00000000-0000-0000-0000-000000000000"
 
       payload =
-        ~s({"id":"evt_sync_fail","type":"checkout.session.completed","data":{"object":{"customer":"cus_fail_1","client_reference_id":"#{non_existent_uuid}"}}})
+        ~s({"id":"evt_sync_fail_500","type":"checkout.session.completed","data":{"object":{"customer":"cus_fail_1","client_reference_id":"#{non_existent_uuid}"}}})
 
       conn = build_signed_conn(payload)
 
@@ -141,10 +140,20 @@ defmodule AshBilling.PlugTest do
       log =
         capture_log(fn ->
           conn = BillingPlug.call(conn, opts)
-          assert conn.status == 200
+          assert conn.status == 500
+          assert conn.resp_body =~ "synchronization_failed"
         end)
 
-      assert log =~ "AshBilling.Plug: Webhook synchronization failed"
+      assert log =~ "Returning HTTP 500 to trigger Stripe retry"
+
+      # Also verify backwards-compatible return_500_on_sync_error: false
+      conn2 = build_signed_conn(payload)
+      opts2 = Keyword.put(opts, :return_500_on_sync_error, false)
+
+      capture_log(fn ->
+        conn2 = BillingPlug.call(conn2, opts2)
+        assert conn2.status == 200
+      end)
     end
 
     test "returns 400 when body exceeds size limit" do
