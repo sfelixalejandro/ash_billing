@@ -143,6 +143,49 @@ AshBilling.subscribed?(user)
 AshBilling.subscribed?(user, "price_pro_monthly")
 ```
 
+#### Swap Subscription Plans (Upgrades / Downgrades)
+```elixir
+# Upgrade to an annual or higher-tier plan with automatic proration
+{:ok, updated_sub} = AshBilling.swap_plan(user_subscription, "price_enterprise_annual",
+  proration_behavior: "create_prorations"
+)
+
+# Update seat quantities (per-seat billing)
+{:ok, updated_sub} = AshBilling.update_quantity(user_subscription, 10)
+```
+
+#### Resume a Canceled Subscription
+```elixir
+# Reactivate a subscription that was scheduled to cancel at period end
+{:ok, resumed_sub} = AshBilling.resume_subscription(user_subscription)
+```
+
+---
+
+## Declarative Ash Policies
+
+Protect any resource action declaratively based on billing status using native Ash policy checks:
+
+```elixir
+defmodule MyApp.AI.Prompt do
+  use Ash.Resource,
+    domain: MyApp.AI,
+    authorizers: [Ash.Policy.Authorizer]
+
+  policies do
+    # Authorize any user with an active subscription or ongoing trial
+    policy action(:generate) do
+      authorize_if AshBilling.Checks.Subscribed
+    end
+
+    # Require a specific plan tier (e.g., Enterprise)
+    policy action(:export_fine_tuned_weights) do
+      authorize_if {AshBilling.Checks.HasPrice, price: "price_enterprise_annual"}
+    end
+  end
+end
+```
+
 ---
 
 ## Webhook Deduplication (Single-Node & Clustered)
