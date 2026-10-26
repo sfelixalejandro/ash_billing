@@ -44,6 +44,24 @@ defmodule AshBilling.Providers.StripeTest do
                Stripe.create_customer(%{email: "test@example.com"}, opts)
     end
 
+    test "attaches bearer authorization header when api_key option is provided", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer sk_test_secret_key"]
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(%{"id" => "cus_auth_123"}))
+      end)
+
+      opts_with_key = Keyword.put(opts, :api_key, "sk_test_secret_key")
+
+      assert {:ok, "cus_auth_123"} =
+               Stripe.create_customer(%{email: "auth@test.com"}, opts_with_key)
+    end
+
     test "handles error from Stripe API", %{stub_name: stub_name, opts: opts} do
       Req.Test.stub(stub_name, fn conn ->
         conn
@@ -56,6 +74,23 @@ defmodule AshBilling.Providers.StripeTest do
 
       assert {:error, %{status: 400, error: "Invalid email"}} =
                Stripe.create_customer(%{email: "bad_email"}, opts)
+    end
+
+    test "handles non-standard error structure from Stripe API", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          500,
+          Jason.encode!(%{"error" => "Gateway Timeout"})
+        )
+      end)
+
+      assert {:error, %{status: 500, error: %{"error" => "Gateway Timeout"}}} =
+               Stripe.create_customer(%{email: "timeout@test.com"}, opts)
     end
   end
 
@@ -108,6 +143,23 @@ defmodule AshBilling.Providers.StripeTest do
                  opts
                )
     end
+
+    test "handles error from Stripe API", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          400,
+          Jason.encode!(%{"error" => %{"message" => "No such customer"}})
+        )
+      end)
+
+      assert {:error, %{status: 400, error: "No such customer"}} =
+               Stripe.create_portal_session(
+                 %{customer: "cus_missing", return_url: "http://app.test"},
+                 opts
+               )
+    end
   end
 
   describe "get_subscription/2" do
@@ -123,6 +175,20 @@ defmodule AshBilling.Providers.StripeTest do
 
       assert {:ok, %{"id" => "sub_123", "status" => "active"}} =
                Stripe.get_subscription("sub_123", opts)
+    end
+
+    test "handles error when subscription not found", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          404,
+          Jason.encode!(%{"error" => %{"message" => "No such subscription"}})
+        )
+      end)
+
+      assert {:error, %{status: 404, error: "No such subscription"}} =
+               Stripe.get_subscription("sub_missing", opts)
     end
   end
 
@@ -165,6 +231,20 @@ defmodule AshBilling.Providers.StripeTest do
       assert {:ok, %{"id" => "sub_123", "status" => "canceled"}} =
                Stripe.cancel_subscription("sub_123", immediate_opts)
     end
+
+    test "handles error from Stripe API on cancel", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          400,
+          Jason.encode!(%{"error" => %{"message" => "Subscription already canceled"}})
+        )
+      end)
+
+      assert {:error, %{status: 400, error: "Subscription already canceled"}} =
+               Stripe.cancel_subscription("sub_123", opts)
+    end
   end
 
   describe "verify_webhook/4" do
@@ -190,12 +270,30 @@ defmodule AshBilling.Providers.StripeTest do
       assert {:error, :missing_signature_header} = Stripe.verify_webhook(payload, nil, @secret)
     end
 
+    test "returns error for invalid signature header format" do
+      payload = ~s({"id":"evt_123"})
+
+      assert {:error, :invalid_signature_header} =
+               Stripe.verify_webhook(payload, "invalid_format", @secret)
+    end
+
+    test "returns error for non-integer timestamp in header" do
+      payload = ~s({"id":"evt_123"})
+
+      assert {:error, :invalid_timestamp_in_header} =
+               Stripe.verify_webhook(payload, "t=abc,v1=signature", @secret)
+    end
+
     test "returns error for invalid signature" do
       payload = ~s({"id":"evt_123"})
       timestamp = System.system_time(:second)
       header = "t=#{timestamp},v1=bad_signature"
 
       assert {:error, :invalid_signature} = Stripe.verify_webhook(payload, header, @secret)
+
+      # Mismatched byte length
+      short_header = "t=#{timestamp},v1=short"
+      assert {:error, :invalid_signature} = Stripe.verify_webhook(payload, short_header, @secret)
     end
 
     test "returns error when timestamp is outside tolerance" do
@@ -212,6 +310,20 @@ defmodule AshBilling.Providers.StripeTest do
 
       assert {:error, :timestamp_outside_tolerance} =
                Stripe.verify_webhook(payload, header, @secret, tolerance: 300)
+    end
+
+    test "returns error when payload is invalid JSON" do
+      payload = "{invalid_json"
+      timestamp = System.system_time(:second)
+      signed_payload = "#{timestamp}.#{payload}"
+
+      sig =
+        :crypto.mac(:hmac, :sha256, @secret, signed_payload)
+        |> Base.encode16(case: :lower)
+
+      header = "t=#{timestamp},v1=#{sig}"
+
+      assert {:error, %Jason.DecodeError{}} = Stripe.verify_webhook(payload, header, @secret)
     end
   end
 end

@@ -16,6 +16,15 @@ defmodule AshBilling.MixProject do
       description: @description,
       source_url: @source_url,
       homepage_url: @source_url,
+      test_coverage: [
+        summary: [threshold: 90],
+        ignore_modules: [
+          ~r/^Inspect\./,
+          ~r/\.Transformers\./,
+          ~r/\.Options$/,
+          ~r/^AshBilling\.Test(\.|$)/
+        ]
+      ],
       deps: deps(),
       docs: &docs/0,
       aliases: aliases()

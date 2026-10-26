@@ -279,4 +279,112 @@ defmodule AshBilling.WebhookSyncTest do
       assert subscription.status == :active
     end
   end
+
+  describe "sync_event/2 defensive handling and edge cases" do
+    test "ignores unknown or unhandled event types cleanly" do
+      event = %{"type" => "invoice.payment_succeeded", "data" => %{"object" => %{}}}
+      assert {:ok, :ignored} = WebhookSync.sync_event(event, @opts)
+    end
+
+    test "handles subscription event when subscription_resource is nil" do
+      event = %{
+        "type" => "customer.subscription.created",
+        "data" => %{"object" => %{"id" => "sub_1", "customer" => "cus_1"}}
+      }
+
+      opts_no_sub = Keyword.delete(@opts, :subscription_resource)
+      assert {:ok, :no_subscription_resource} = WebhookSync.sync_event(event, opts_no_sub)
+    end
+
+    test "handles subscription event when object is nil" do
+      event = %{"type" => "customer.subscription.created", "data" => %{"object" => nil}}
+      assert {:ok, :ignored} = WebhookSync.sync_event(event, @opts)
+    end
+
+    test "handles checkout session when customer_resource is nil" do
+      event = %{
+        "type" => "checkout.session.completed",
+        "data" => %{"object" => %{"customer" => "cus_1", "client_reference_id" => "user_1"}}
+      }
+
+      opts_no_cust = Keyword.delete(@opts, :customer_resource)
+      assert {:ok, :no_customer_resource} = WebhookSync.sync_event(event, opts_no_cust)
+    end
+
+    test "handles checkout session when customer already has customer_id set" do
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{email: "already_set@example.com", stripe_customer_id: "cus_existing_fixed"},
+          domain: Domain
+        )
+
+      event = %{
+        "type" => "checkout.session.completed",
+        "data" => %{
+          "object" => %{
+            "customer" => "cus_new_attempt",
+            "metadata" => %{"resource_id" => user.id}
+          }
+        }
+      }
+
+      assert {:ok, result_user} = WebhookSync.sync_event(event, @opts)
+      assert result_user.stripe_customer_id == "cus_existing_fixed"
+    end
+
+    test "handles checkout session without customer or resource_id" do
+      event = %{
+        "type" => "checkout.session.completed",
+        "data" => %{"object" => %{}}
+      }
+
+      assert {:ok, :ignored} = WebhookSync.sync_event(event, @opts)
+    end
+
+    test "extracts price_id from legacy plan object and normalizes statuses" do
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{email: "plan_test@example.com", stripe_customer_id: "cus_plan_test"},
+          domain: Domain
+        )
+
+      statuses = ["unpaid", "incomplete", "incomplete_expired", "unknown_status"]
+
+      Enum.each(statuses, fn raw_status ->
+        event = %{
+          "type" => "customer.subscription.created",
+          "data" => %{
+            "object" => %{
+              "id" => "sub_plan_#{raw_status}",
+              "customer" => user.stripe_customer_id,
+              "status" => raw_status,
+              "plan" => %{"id" => "plan_legacy_tier"}
+            }
+          }
+        }
+
+        assert {:ok, sub} = WebhookSync.sync_event(event, @opts)
+        assert sub.price_id == "plan_legacy_tier"
+      end)
+    end
+
+    test "handles subscription with non-existent resource_id in metadata" do
+      event = %{
+        "type" => "customer.subscription.created",
+        "data" => %{
+          "object" => %{
+            "id" => "sub_unlinked_123",
+            "status" => "active",
+            "metadata" => %{"resource_id" => Ash.UUID.generate()}
+          }
+        }
+      }
+
+      assert {:ok, sub} = WebhookSync.sync_event(event, @opts)
+      assert sub.provider_subscription_id == "sub_unlinked_123"
+      assert sub.user_id == nil
+    end
+  end
 end

@@ -23,6 +23,41 @@ defmodule AshBilling.DeduplicationTest do
 
       assert :ok = Deduplication.mark_processed(event_id)
       assert Deduplication.processed?(event_id)
+      assert :ok = Deduplication.mark_processed(nil)
+    end
+
+    test "handles :resource strategy when deduplication_resource is not provided" do
+      # Falls back to memory strategy
+      event_id = "evt_res_fallback_1"
+      opts = [deduplication_strategy: :resource]
+
+      refute Deduplication.processed?(event_id, opts)
+      assert :ok = Deduplication.mark_processed(event_id, opts)
+      assert Deduplication.processed?(event_id, opts)
+    end
+
+    test "handles explicit :memory strategy and application environment config" do
+      event_id = "evt_mem_explicit_1"
+      opts = [deduplication_strategy: :memory]
+
+      refute Deduplication.processed?(event_id, opts)
+      assert :ok = Deduplication.mark_processed(event_id, opts)
+      assert Deduplication.processed?(event_id, opts)
+
+      # Test application env config
+      Application.put_env(:ash_billing, :deduplication_strategy, :memory)
+      assert Deduplication.processed?(event_id)
+    end
+
+    test "sweep removes entries older than 24h" do
+      old_time = System.system_time(:second) - 90_000
+      :ets.insert(:ash_billing_processed_events, {"evt_ancient_123", old_time})
+      assert Deduplication.processed?("evt_ancient_123")
+
+      send(Process.whereis(AshBilling.Deduplication), :sweep)
+      :timer.sleep(20)
+
+      refute Deduplication.processed?("evt_ancient_123")
     end
 
     test "clear/0 empties the table" do
@@ -91,6 +126,11 @@ defmodule AshBilling.DeduplicationTest do
 
       assert conn2.status == 200
       assert conn2.resp_body =~ "already_processed"
+    end
+
+    test "AshBilling.WebhookEvent defines sections and transformers" do
+      assert is_list(AshBilling.WebhookEvent.sections())
+      assert is_list(AshBilling.WebhookEvent.transformers())
     end
   end
 end

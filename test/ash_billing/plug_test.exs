@@ -89,5 +89,34 @@ defmodule AshBilling.PlugTest do
       assert conn.status == 400
       assert conn.resp_body =~ "missing_signature_header"
     end
+
+    test "resolves webhook secret from function or mfa tuple" do
+      payload = ~s({"id":"evt_tuple_secret","type":"test"})
+      conn = build_signed_conn(payload)
+
+      # 0-arity function
+      opts_fn = BillingPlug.init(webhook_secret: fn -> @secret end)
+      conn_fn = BillingPlug.call(conn, opts_fn)
+      assert conn_fn.status == 200
+
+      # MFA tuple
+      System.put_env("TEST_WEBHOOK_SECRET_KEY", @secret)
+      conn2 = build_signed_conn(payload)
+      opts_mfa = BillingPlug.init(webhook_secret: {System, :get_env, ["TEST_WEBHOOK_SECRET_KEY"]})
+      conn_mfa = BillingPlug.call(conn2, opts_mfa)
+      assert conn_mfa.status == 200
+    end
+
+    test "uses raw_body from conn.assigns when present" do
+      payload = ~s({"id":"evt_assigns_raw","type":"test"})
+
+      conn =
+        build_signed_conn(payload)
+        |> assign(:raw_body, payload)
+
+      opts = BillingPlug.init(webhook_secret: @secret)
+      conn = BillingPlug.call(conn, opts)
+      assert conn.status == 200
+    end
   end
 end
