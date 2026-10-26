@@ -7,6 +7,7 @@ defmodule AshBilling.Test.Domain do
     resource AshBilling.Test.Subscription
     resource AshBilling.Test.PolicyUser
     resource AshBilling.Test.PolicySubscription
+    resource AshBilling.Test.WebhookEvent
   end
 end
 
@@ -139,5 +140,17 @@ defmodule AshBilling.Test.PolicySubscription do
 
   billing_subscription do
     customer_relationship(:user)
+  end
+end
+
+defmodule AshBilling.Test.WebhookEvent do
+  use Ash.Resource,
+    domain: AshBilling.Test.Domain,
+    data_layer: Ash.DataLayer.Ets,
+    extensions: [AshBilling.WebhookEvent]
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
   end
 end

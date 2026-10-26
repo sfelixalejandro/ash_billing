@@ -52,6 +52,7 @@ defmodule AshBilling.MixProject do
       {:req, "~> 0.5"},
       {:jason, "~> 1.4"},
       {:plug, "~> 1.14"},
+      {:telemetry, "~> 1.0"},
       {:igniter, ">= 0.5.0", optional: true},
       # Dev & Test
       {:simple_sat, ">= 0.0.0", only: [:dev, :test]},
@@ -62,9 +63,9 @@ defmodule AshBilling.MixProject do
   defp aliases do
     [
       "spark.cheat_sheets":
-        "spark.cheat_sheets --extensions AshBilling.Resource,AshBilling.Subscription",
+        "spark.cheat_sheets --extensions AshBilling.Resource,AshBilling.Subscription,AshBilling.WebhookEvent",
       "spark.formatter":
-        "spark.formatter --extensions AshBilling.Resource,AshBilling.Subscription",
+        "spark.formatter --extensions AshBilling.Resource,AshBilling.Subscription,AshBilling.WebhookEvent",
       docs: [
         "spark.cheat_sheets",
         "docs"
@@ -82,6 +83,8 @@ defmodule AshBilling.MixProject do
          search_data: Spark.Docs.search_data_for(AshBilling.Resource)},
         {"documentation/dsls/DSL-AshBilling.Subscription.md",
          search_data: Spark.Docs.search_data_for(AshBilling.Subscription)},
+        {"documentation/dsls/DSL-AshBilling.WebhookEvent.md",
+         search_data: Spark.Docs.search_data_for(AshBilling.WebhookEvent)},
         ".github/CONTRIBUTING.md"
       ],
       groups_for_extras: [
@@ -102,7 +105,8 @@ defmodule AshBilling.MixProject do
           AshBilling.Resource,
           AshBilling.Resource.Info,
           AshBilling.Subscription,
-          AshBilling.Subscription.Info
+          AshBilling.Subscription.Info,
+          AshBilling.WebhookEvent
         ],
         "Mix Tasks": [
           Mix.Tasks.AshBilling.Install

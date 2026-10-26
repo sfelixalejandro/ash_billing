@@ -145,6 +145,37 @@ AshBilling.subscribed?(user, "price_pro_monthly")
 
 ---
 
+## Webhook Deduplication (Single-Node & Clustered)
+
+`ash_billing` provides two deduplication strategies to prevent double-processing on Stripe webhook retries:
+
+### 1. In-Memory ETS (`:memory`, default)
+Zero-configuration in-memory ETS table with automatic 24-hour TTL cleanup. Ideal for single-server deployments and local development.
+
+### 2. Database-Backed Resource (`:resource`)
+Guarantees deduplication across multi-node clusters (e.g., Fly.io, Kubernetes, AWS ECS) using an Ash resource backed by your database (PostgreSQL, SQLite, MySQL).
+
+Define a webhook event resource:
+
+```elixir
+defmodule MyApp.Billing.WebhookEvent do
+  use Ash.Resource,
+    domain: MyApp.Billing,
+    extensions: [AshBilling.WebhookEvent]
+end
+```
+
+Then configure it in your router or application config:
+
+```elixir
+forward "/webhooks/stripe", AshBilling.Plug,
+  resource: MyApp.Accounts.User,
+  subscription_resource: MyApp.Billing.Subscription,
+  deduplication_resource: MyApp.Billing.WebhookEvent
+```
+
+---
+
 ## Configuration
 
 Configure your Stripe API credentials in `config/runtime.exs`:
@@ -153,6 +184,19 @@ Configure your Stripe API credentials in `config/runtime.exs`:
 config :ash_billing,
   stripe_api_key: System.get_env("STRIPE_SECRET_KEY")
 ```
+
+---
+
+## Telemetry
+
+`ash_billing` emits standard `:telemetry` spans across all critical operations, enabling real-time monitoring via Grafana, AppSignal, Datadog, or Prometheus:
+
+| Event Prefix | Description | Measurements | Metadata |
+|---|---|---|---|
+| `[:ash_billing, :webhook, :start \| :stop \| :exception]` | Emitted during webhook receipt and signature verification in `AshBilling.Plug`. | `:system_time` / `:duration` | `:conn`, `:provider`, `:status`, `:event_type`, `:event_id` |
+| `[:ash_billing, :sync, :start \| :stop \| :exception]` | Emitted during database synchronization in `AshBilling.WebhookSync`. | `:system_time` / `:duration` | `:event_type`, `:event_id`, `:customer_resource`, `:subscription_resource`, `:status` |
+| `[:ash_billing, :checkout, :start \| :stop \| :exception]` | Emitted during Checkout session creation in `AshBilling.create_checkout_session/2`. | `:system_time` / `:duration` | `:provider`, `:mode`, `:customer`, `:status`, `:session_id`, `:url` |
+| `[:ash_billing, :portal, :start \| :stop \| :exception]` | Emitted during Billing Portal session creation in `AshBilling.create_portal_session/2`. | `:system_time` / `:duration` | `:provider`, `:customer`, `:status`, `:url` |
 
 ---
 

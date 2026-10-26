@@ -125,7 +125,21 @@ defmodule AshBilling do
         end
       end)
 
-    provider.create_checkout_session(params, opts)
+    start_meta = %{
+      provider: provider,
+      mode: params.mode,
+      customer: cust_id
+    }
+
+    :telemetry.span([:ash_billing, :checkout], start_meta, fn ->
+      case provider.create_checkout_session(params, opts) do
+        {:ok, %{url: url, id: id}} = success ->
+          {success, %{status: :ok, session_id: id, url: url}}
+
+        {:error, reason} = error ->
+          {error, %{status: :error, error: reason}}
+      end
+    end)
   end
 
   @doc """
@@ -147,7 +161,20 @@ defmodule AshBilling do
       return_url: Keyword.fetch!(opts, :return_url)
     }
 
-    provider.create_portal_session(params, opts)
+    start_meta = %{
+      provider: provider,
+      customer: cust_id
+    }
+
+    :telemetry.span([:ash_billing, :portal], start_meta, fn ->
+      case provider.create_portal_session(params, opts) do
+        {:ok, %{url: url}} = success ->
+          {success, %{status: :ok, url: url}}
+
+        {:error, reason} = error ->
+          {error, %{status: :error, error: reason}}
+      end
+    end)
   end
 
   @doc """

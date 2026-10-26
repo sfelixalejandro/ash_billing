@@ -23,33 +23,55 @@ defmodule AshBilling.WebhookSync do
   """
   def sync_event(event, opts) do
     event_type = Map.get(event, "type")
+    event_id = Map.get(event, "id")
     domain = Keyword.get(opts, :domain)
     customer_resource = Keyword.get(opts, :customer_resource)
     subscription_resource = Keyword.get(opts, :subscription_resource)
 
     Logger.debug("AshBilling.WebhookSync: Processing event #{inspect(event_type)}")
 
-    case event_type do
-      type
-      when type in [
-             "customer.subscription.created",
-             "customer.subscription.updated",
-             "customer.subscription.deleted"
-           ] ->
-        sync_subscription(
-          event["data"]["object"],
-          customer_resource,
-          subscription_resource,
-          domain,
-          opts
-        )
+    start_meta = %{
+      event_type: event_type,
+      event_id: event_id,
+      customer_resource: customer_resource,
+      subscription_resource: subscription_resource
+    }
 
-      "checkout.session.completed" ->
-        sync_checkout_session(event["data"]["object"], customer_resource, domain, opts)
+    :telemetry.span([:ash_billing, :sync], start_meta, fn ->
+      result =
+        case event_type do
+          type
+          when type in [
+                 "customer.subscription.created",
+                 "customer.subscription.updated",
+                 "customer.subscription.deleted"
+               ] ->
+            sync_subscription(
+              event["data"]["object"],
+              customer_resource,
+              subscription_resource,
+              domain,
+              opts
+            )
 
-      _ ->
-        {:ok, :ignored}
-    end
+          "checkout.session.completed" ->
+            sync_checkout_session(event["data"]["object"], customer_resource, domain, opts)
+
+          _ ->
+            {:ok, :ignored}
+        end
+
+      case result do
+        {:ok, record} when is_struct(record) ->
+          {result, %{status: :ok, record: record}}
+
+        {:ok, status} ->
+          {result, %{status: status}}
+
+        {:error, reason} ->
+          {result, %{status: :error, error: reason}}
+      end
+    end)
   end
 
   defp sync_subscription(nil, _cust_res, _sub_res, _domain, _opts), do: {:ok, :ignored}
