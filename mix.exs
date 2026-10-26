@@ -102,6 +102,9 @@ defmodule AshBilling.MixProject do
           AshBilling.Resource.Info,
           AshBilling.Subscription,
           AshBilling.Subscription.Info
+        ],
+        "Mix Tasks": [
+          Mix.Tasks.AshBilling.Install
         ]
       ]
     ]

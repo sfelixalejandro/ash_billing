@@ -22,7 +22,15 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` provides a unified, dec
 
 ## Installation
 
-Add `ash_billing` to your `mix.exs` dependencies:
+The recommended way to install `ash_billing` is using Igniter:
+
+```bash
+mix igniter.install ash_billing
+```
+
+Igniter automatically adds the dependency to `mix.exs`, configures your customer and subscription resources, mounts the webhook route in your Phoenix router, and sets up runtime configuration.
+
+Alternatively, you can install it manually by adding `ash_billing` to your `mix.exs`:
 
 ```elixir
 def deps do
