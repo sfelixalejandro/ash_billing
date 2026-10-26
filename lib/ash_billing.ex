@@ -12,7 +12,7 @@ defmodule AshBilling do
   @doc """
   Extracts the customer ID from a record configured with `AshBilling.Resource`.
   """
-  @spec customer_id(Ash.Resource.record()) :: String.t() | nil
+  @spec customer_id(struct()) :: String.t() | nil
   def customer_id(%resource{} = record) do
     attr = ResourceInfo.customer_id_attribute(resource)
     Map.get(record, attr)
@@ -25,7 +25,7 @@ defmodule AshBilling do
 
   If the record already has a customer ID, returns `{:ok, existing_customer_id}` without calling the provider.
   """
-  @spec create_customer(Ash.Resource.record() | map(), keyword()) ::
+  @spec create_customer(struct() | map(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
   def create_customer(%resource{} = record, opts) do
     provider = Keyword.get(opts, :provider, ResourceInfo.provider(resource))
@@ -68,7 +68,7 @@ defmodule AshBilling do
     * `:mode` - `"subscription"` (default) or `"payment"`.
     * `:provider` - The billing provider module.
   """
-  @spec create_checkout_session(Ash.Resource.record() | String.t(), keyword()) ::
+  @spec create_checkout_session(struct() | String.t(), keyword()) ::
           {:ok, %{url: String.t(), id: String.t()}} | {:error, term()}
   def create_checkout_session(record_or_customer_id, opts) do
     cust_id = resolve_customer_id(record_or_customer_id)
@@ -104,7 +104,7 @@ defmodule AshBilling do
     * `:return_url` - The URL to return to after leaving the portal (required).
     * `:provider` - The billing provider module.
   """
-  @spec create_portal_session(Ash.Resource.record() | String.t(), keyword()) ::
+  @spec create_portal_session(struct() | String.t(), keyword()) ::
           {:ok, %{url: String.t()}} | {:error, term()}
   def create_portal_session(record_or_customer_id, opts) do
     cust_id = resolve_customer_id(record_or_customer_id)
@@ -121,7 +121,7 @@ defmodule AshBilling do
   @doc """
   Retrieves a subscription from the billing provider.
   """
-  @spec get_subscription(Ash.Resource.record() | String.t(), keyword()) ::
+  @spec get_subscription(struct() | String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def get_subscription(subscription_or_id, opts \\ []) do
     sub_id = resolve_subscription_id(subscription_or_id)
@@ -137,7 +137,7 @@ defmodule AshBilling do
     * `:at_period_end` - If `true` (default), cancels at the end of the current billing cycle.
     * `:provider` - The billing provider module.
   """
-  @spec cancel_subscription(Ash.Resource.record() | String.t(), keyword()) ::
+  @spec cancel_subscription(struct() | String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def cancel_subscription(subscription_or_id, opts \\ []) do
     sub_id = resolve_subscription_id(subscription_or_id)
@@ -151,7 +151,7 @@ defmodule AshBilling do
   Checks loaded subscriptions associated with the record for `:active` or `:trialing` status.
   If a `price_id` is passed as the second argument, verifies that the subscription matches the price.
   """
-  @spec subscribed?(Ash.Resource.record(), String.t() | nil) :: boolean()
+  @spec subscribed?(struct(), String.t() | nil) :: boolean()
   def subscribed?(record, price_id \\ nil)
 
   def subscribed?(%{subscriptions: subscriptions}, price_id) when is_list(subscriptions) do

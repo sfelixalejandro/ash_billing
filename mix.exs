@@ -17,7 +17,8 @@ defmodule AshBilling.MixProject do
       source_url: @source_url,
       homepage_url: @source_url,
       deps: deps(),
-      docs: docs()
+      docs: &docs/0,
+      aliases: aliases()
     ]
   end
 
@@ -51,8 +52,22 @@ defmodule AshBilling.MixProject do
       {:req, "~> 0.5"},
       {:jason, "~> 1.4"},
       {:plug, "~> 1.14"},
+      {:igniter, ">= 0.5.0", optional: true},
       # Dev & Test
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
+    ]
+  end
+
+  defp aliases do
+    [
+      "spark.cheat_sheets":
+        "spark.cheat_sheets --extensions AshBilling.Resource,AshBilling.Subscription",
+      "spark.formatter":
+        "spark.formatter --extensions AshBilling.Resource,AshBilling.Subscription",
+      docs: [
+        "spark.cheat_sheets",
+        "docs"
+      ]
     ]
   end
 
@@ -60,7 +75,35 @@ defmodule AshBilling.MixProject do
     [
       main: "readme",
       source_ref: "v#{@version}",
-      extras: ["README.md"]
+      extras: [
+        {"README.md", title: "Home"},
+        {"documentation/dsls/DSL-AshBilling.Resource.md",
+         search_data: Spark.Docs.search_data_for(AshBilling.Resource)},
+        {"documentation/dsls/DSL-AshBilling.Subscription.md",
+         search_data: Spark.Docs.search_data_for(AshBilling.Subscription)},
+        ".github/CONTRIBUTING.md"
+      ],
+      groups_for_extras: [
+        DSLs: ~r"documentation/dsls"
+      ],
+      groups_for_modules: [
+        Core: [
+          AshBilling,
+          AshBilling.Provider,
+          AshBilling.Plug,
+          AshBilling.WebhookSync,
+          AshBilling.Deduplication
+        ],
+        Providers: [
+          AshBilling.Providers.Stripe
+        ],
+        "DSL & Extensions": [
+          AshBilling.Resource,
+          AshBilling.Resource.Info,
+          AshBilling.Subscription,
+          AshBilling.Subscription.Info
+        ]
+      ]
     ]
   end
 end
