@@ -1012,7 +1012,9 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
       assert Deduplication.acquire(nil) == {:ok, :acquired}
       assert Deduplication.complete(nil) == :ok
       assert Deduplication.release(nil) == :ok
-      assert Deduplication.release("evt_missing", deduplication_strategy: :resource) == :ok
+
+      assert Deduplication.release("evt_missing", deduplication_strategy: :resource) ==
+               {:error, :deduplication_resource_not_configured}
 
       assert Deduplication.release("evt_missing_db",
                deduplication_strategy: :resource,

@@ -2,6 +2,7 @@ defmodule AshBilling.PlugTest do
   use ExUnit.Case, async: true
   import Plug.Test
   import Plug.Conn
+  import ExUnit.CaptureLog
 
   alias AshBilling.Plug, as: BillingPlug
 
@@ -178,6 +179,28 @@ defmodule AshBilling.PlugTest do
         assert conn2.status == 200
         assert conn2.resp_body =~ "synchronization_failed"
         assert AshBilling.Deduplication.processed?("evt_sync_fail_500", opts2) == false
+      end)
+    end
+
+    test "returns HTTP 500 when :resource deduplication strategy is set but no resource is configured" do
+      payload =
+        ~s({"id":"evt_unconfigured_res_1","type":"customer.subscription.created","data":{"object":{}}})
+
+      conn = build_signed_conn(payload)
+
+      opts =
+        BillingPlug.init(
+          webhook_secret: @secret,
+          deduplicate?: true,
+          deduplication_strategy: :resource,
+          deduplication_resource: nil
+        )
+
+      capture_log(fn ->
+        conn = BillingPlug.call(conn, opts)
+        assert conn.status == 500
+        assert conn.resp_body =~ "deduplication_failed"
+        assert conn.resp_body =~ "deduplication_resource_not_configured"
       end)
     end
 

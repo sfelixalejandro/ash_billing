@@ -34,14 +34,23 @@ defmodule AshBilling.DeduplicationTest do
       assert :ok = Deduplication.mark_processed(nil)
     end
 
-    test "handles :resource strategy when deduplication_resource is not provided" do
-      # Falls back to memory strategy
-      event_id = "evt_res_fallback_1"
+    test "rejects :resource strategy when deduplication_resource is not provided (no silent ETS fallback)" do
+      event_id = "evt_res_not_configured_1"
       opts = [deduplication_strategy: :resource]
 
       refute Deduplication.processed?(event_id, opts)
-      assert :ok = Deduplication.mark_processed(event_id, opts)
-      assert Deduplication.processed?(event_id, opts)
+
+      assert {:error, :deduplication_resource_not_configured} =
+               Deduplication.acquire(event_id, opts)
+
+      assert {:error, :deduplication_resource_not_configured} =
+               Deduplication.mark_processed(event_id, opts)
+
+      assert {:error, :deduplication_resource_not_configured} =
+               Deduplication.complete(event_id, opts)
+
+      assert {:error, :deduplication_resource_not_configured} =
+               Deduplication.release(event_id, opts)
     end
 
     test "handles explicit :memory strategy and application environment config" do
@@ -142,13 +151,23 @@ defmodule AshBilling.DeduplicationTest do
       assert is_list(AshBilling.WebhookEvent.transformers())
     end
 
-    test "falls back to memory strategy if resource strategy is set but resource is nil" do
+    test "rejects when resource strategy is set but resource is nil (no silent ETS fallback)" do
       opts = [deduplication_strategy: :resource, deduplication_resource: nil]
       event_id = "evt_fallback_mem_1"
 
       refute Deduplication.processed?(event_id, opts)
-      assert :ok = Deduplication.mark_processed(event_id, opts)
-      assert Deduplication.processed?(event_id, opts)
+
+      assert {:error, :deduplication_resource_not_configured} =
+               Deduplication.acquire(event_id, opts)
+
+      assert {:error, :deduplication_resource_not_configured} =
+               Deduplication.mark_processed(event_id, opts)
+
+      assert {:error, :deduplication_resource_not_configured} =
+               Deduplication.complete(event_id, opts)
+
+      assert {:error, :deduplication_resource_not_configured} =
+               Deduplication.release(event_id, opts)
     end
 
     test "supports simple resource without status attribute and destroys on release" do
@@ -594,7 +613,7 @@ defmodule AshBilling.DeduplicationTest do
       assert Process.alive?(pid)
     end
 
-    test "reclaims expired lease on resource without :update action via atomic destroy and recreate" do
+    test "reclaiming lease fails on resource without :update action (no blind destroy race)" do
       alias AshBilling.Test.NoUpdateEvent
       event_id = "evt_no_update_reclaim_1"
       opts = [deduplication_resource: NoUpdateEvent, domain: Domain, lease_ttl: 1]
@@ -615,21 +634,13 @@ defmodule AshBilling.DeduplicationTest do
                  authorize?: false
                )
 
-      # Worker acquires and reclaims via atomic destroy + recreate
-      assert {:ok, new_token} = Deduplication.acquire(event_id, opts)
-      assert is_binary(new_token)
-      assert new_token != "old_token"
+      # Reclaim strictly requires an atomic :update action; blind delete-and-recreate is rejected
+      assert {:error, :resource_lacks_update_action} = Deduplication.acquire(event_id, opts)
 
-      # Record in DB has new token
+      # Record in DB was NOT deleted by a blind destroy race
       assert {:ok, record} = Ash.get(NoUpdateEvent, event_id, domain: Domain, authorize?: false)
-      assert record.lease_token == new_token
+      assert record.lease_token == "old_token"
       assert record.status == :processing
-
-      # Release deletes record via atomic_bulk_destroy fallback
-      assert :ok = Deduplication.release(event_id, opts ++ [lease_token: new_token])
-
-      assert {:error, %Ash.Error.Invalid{errors: [%Ash.Error.Query.NotFound{}]}} =
-               Ash.get(NoUpdateEvent, event_id, domain: Domain, authorize?: false)
     end
 
     test "reclaiming lease fails on resource without :update and without :destroy" do

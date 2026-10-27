@@ -57,7 +57,7 @@ defmodule AshBilling.Deduplication do
       :resource ->
         case resolve_resource(opts) do
           nil ->
-            acquire_memory(event_id)
+            {:error, :deduplication_resource_not_configured}
 
           resource ->
             acquire_resource(resource, event_id, opts)
@@ -215,30 +215,7 @@ defmodule AshBilling.Deduplication do
           {:error, reason}
       end
     else
-      if Ash.Resource.Info.action(resource, :destroy) do
-        case atomic_bulk_destroy(resource, event_id, nil, domain, :cannot_reclaim_lease) do
-          :ok ->
-            create_attrs =
-              %{event_id: event_id, status: :processing}
-              |> maybe_put_field(resource, :lease_token, token)
-              |> maybe_put_field(resource, :processed_at, now)
-              |> maybe_put_field(resource, :last_attempt_at, now)
-              |> maybe_put_field(resource, :attempts, 1)
-
-            case Ash.create(resource, create_attrs, domain: domain, authorize?: false) do
-              {:ok, _record} ->
-                {:ok, token}
-
-              {:error, _reason} ->
-                {:error, :already_processing}
-            end
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-      else
-        {:error, :resource_lacks_update_action}
-      end
+      {:error, :resource_lacks_update_action}
     end
   end
 
@@ -268,7 +245,7 @@ defmodule AshBilling.Deduplication do
       :resource ->
         case resolve_resource(opts) do
           nil ->
-            complete_memory(event_id, opts)
+            {:error, :deduplication_resource_not_configured}
 
           resource ->
             complete_resource(resource, event_id, opts)
@@ -377,7 +354,7 @@ defmodule AshBilling.Deduplication do
       :resource ->
         case resolve_resource(opts) do
           nil ->
-            delete_memory(event_id, opts)
+            {:error, :deduplication_resource_not_configured}
 
           resource ->
             release_resource(resource, event_id, opts)
@@ -536,7 +513,13 @@ defmodule AshBilling.Deduplication do
       :resource ->
         case resolve_resource(opts) do
           nil ->
-            check_memory(event_id)
+            require Logger
+
+            Logger.error(
+              "AshBilling.Deduplication: :resource strategy requested but no deduplication_resource is configured. Returning false."
+            )
+
+            false
 
           resource ->
             domain = Keyword.get(opts, :domain)
