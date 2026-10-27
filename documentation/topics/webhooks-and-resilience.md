@@ -144,3 +144,18 @@ For Stripe, `canceled` and `incomplete_expired` are terminal for the same subscr
 A new subscription uses a new ID; resuming a scheduled cancellation before it becomes
 terminal remains supported. Custom providers can transition a terminal state that the
 worker actually read, subject to the same timestamp and atomic concurrency guards.
+
+## Customer identity and recovery
+
+A persisted customer ID is authoritative. Initial association is allowed only when the
+local customer has no provider ID and the event supplies its local ID in trusted
+`metadata.resource_id` or `client_reference_id`. Conflicting references are rejected.
+The initial write is conditional on the provider ID still being empty, so competing
+customers cannot claim the same user. Email alone cannot establish ownership.
+
+Contradictions return `:customer_identity_conflict` or `:subscription_customer_conflict`;
+unresolved owners return `:customer_not_found` or `:customer_identity_unverified`.
+The Plug returns HTTP 500 and releases the event lease by default. These events are
+not permanently discarded: repair the association or configuration and retry the same
+event. Applications must generate local references on the server and must not accept
+arbitrary ownership metadata from clients.

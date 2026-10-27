@@ -361,8 +361,8 @@ defmodule AshBilling.WebhookSyncTest do
         }
       }
 
-      assert {:ok, result_user} = WebhookSync.sync_event(event, @opts)
-      assert result_user.stripe_customer_id == "cus_existing_fixed"
+      assert {:error, :customer_identity_conflict} = WebhookSync.sync_event(event, @opts)
+      assert Ash.get!(User, user.id, domain: Domain).stripe_customer_id == "cus_existing_fixed"
     end
 
     test "handles checkout session without customer or resource_id" do
@@ -408,15 +408,14 @@ defmodule AshBilling.WebhookSyncTest do
         "data" => %{
           "object" => %{
             "id" => "sub_unlinked_123",
+            "customer" => "cus_unknown_metadata",
             "status" => "active",
             "metadata" => %{"resource_id" => Ash.UUID.generate()}
           }
         }
       }
 
-      assert {:ok, sub} = WebhookSync.sync_event(event, @opts)
-      assert sub.provider_subscription_id == "sub_unlinked_123"
-      assert sub.user_id == nil
+      assert {:error, :customer_not_found} = WebhookSync.sync_event(event, @opts)
     end
 
     test "handles customer.deleted and clears stripe_customer_id from user" do
@@ -459,7 +458,7 @@ defmodule AshBilling.WebhookSyncTest do
       assert {:ok, :not_found} = WebhookSync.sync_event(event, @opts)
     end
 
-    test "resolves customer via customer_email when stripe_customer_id and metadata are absent" do
+    test "email alone cannot establish a billing identity" do
       {:ok, user} =
         Ash.create(
           User,
@@ -486,9 +485,8 @@ defmodule AshBilling.WebhookSyncTest do
         }
       }
 
-      assert {:ok, sub} = WebhookSync.sync_event(event, @opts)
-      assert sub.provider_subscription_id == "sub_stripe_email_resolved"
-      assert sub.user_id == user.id
+      assert {:error, :customer_identity_unverified} = WebhookSync.sync_event(event, @opts)
+      refute AshBilling.subscribed?(Ash.load!(user, :subscriptions, domain: Domain))
     end
 
     test "atomic conditional update protects against stale out-of-order writes on the same subscription" do

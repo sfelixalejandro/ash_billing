@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject contradictory customer and subscription ownership, establish initial metadata-based customer associations atomically, and keep identity failures retryable. Email alone no longer establishes a billing identity; missing customers cannot be replaced by subscription or Checkout session IDs.
+
 - Guard subscription writes atomically against concurrent status changes, including same-second terminal commits during provider reconciliation. Stripe terminal notifications take precedence over same-second snapshots; custom providers may explicitly transition an already-read terminal state. Missing or concurrently changed records return controlled retryable errors.
 
 - Terminal subscriptions (`canceled` and `incomplete_expired`) now return `false` from both the `:canceling?` calculation and `AshBilling.canceling?/1`, even when cancellation fields remain set. The helper accepts both atom and string statuses.
