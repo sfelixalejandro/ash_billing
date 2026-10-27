@@ -179,19 +179,21 @@ defmodule AshBilling.WebhookSync do
               existing,
               sub_id,
               attrs,
+              event_dt,
               opts,
               ash_opts
             )
 
           # Same-second conflicting event protection:
-          # If two distinct events arrive with the exact same second timestamp and conflicting statuses,
+          # If two distinct events arrive with the exact same second timestamp and conflicting state,
           # reconcile with provider to establish authoritative ground truth.
-          existing && same_second_conflict?(existing, event_dt, status) ->
+          existing && same_second_conflict?(existing, event_dt, attrs) ->
             reconcile_subscription_with_provider(
               subscription_resource,
               existing,
               sub_id,
               attrs,
+              event_dt,
               opts,
               ash_opts
             )
@@ -329,6 +331,7 @@ defmodule AshBilling.WebhookSync do
          existing,
          sub_id,
          attrs,
+         event_dt,
          opts,
          ash_opts
        ) do
@@ -362,7 +365,13 @@ defmodule AshBilling.WebhookSync do
             end
           end)
 
-        Ash.update(existing, reconciled_attrs, ash_opts)
+        update_subscription_safely(
+          subscription_resource,
+          existing,
+          reconciled_attrs,
+          event_dt,
+          ash_opts
+        )
 
       {:error, reconcile_reason} ->
         require Logger
@@ -596,11 +605,27 @@ defmodule AshBilling.WebhookSync do
       new_status in [:active, "active", :trialing, "trialing"]
   end
 
-  defp same_second_conflict?(existing, incoming_dt, incoming_status) do
+  defp same_second_conflict?(existing, incoming_dt, attrs) do
     case {Map.get(existing, :last_event_created_at), incoming_dt} do
       {%DateTime{} = recorded_dt, %DateTime{} = inc_dt} ->
-        DateTime.compare(recorded_dt, inc_dt) == :eq and
-          to_string(existing.status) != to_string(incoming_status)
+        if DateTime.compare(recorded_dt, inc_dt) == :eq do
+          status_diff? =
+            attrs[:status] != nil and to_string(existing.status) != to_string(attrs[:status])
+
+          price_diff? =
+            attrs[:price_id] != nil and
+              existing.price_id != nil and
+              to_string(existing.price_id) != to_string(attrs[:price_id])
+
+          cancel_diff? =
+            attrs[:cancel_at_period_end] != nil and
+              Map.get(existing, :cancel_at_period_end) != nil and
+              existing.cancel_at_period_end != attrs[:cancel_at_period_end]
+
+          status_diff? or price_diff? or cancel_diff?
+        else
+          false
+        end
 
       _ ->
         false

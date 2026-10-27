@@ -750,5 +750,161 @@ defmodule AshBilling.WebhookSyncTest do
       assert reconciled_sub.status == :past_due
       assert reconciled_sub.price_id == "price_authoritative_live"
     end
+
+    test "same-second events with same status but different prices trigger live provider reconciliation" do
+      stub_name = "same_second_price_reconcile_stub"
+      same_unix = 1_735_689_600
+      same_dt = DateTime.from_unix!(same_unix)
+
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{
+            "id" => "sub_same_sec_price_1",
+            "status" => "active",
+            "cancel_at_period_end" => false,
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro_live"}}]}
+          })
+        )
+      end)
+
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{
+            email: "same_sec_price@example.com",
+            stripe_customer_id: "cus_same_sec_price"
+          },
+          domain: Domain
+        )
+
+      {:ok, _existing} =
+        Ash.create(
+          Subscription,
+          %{
+            provider_subscription_id: "sub_same_sec_price_1",
+            status: :active,
+            user_id: user.id,
+            price_id: "price_basic",
+            last_event_created_at: same_dt
+          },
+          domain: Domain
+        )
+
+      # Incoming event has same second (same_unix) and same status (:active), but price differs ("price_pro")
+      event = %{
+        "id" => "evt_same_second_price",
+        "type" => "customer.subscription.updated",
+        "created" => same_unix,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_same_sec_price_1",
+            "customer" => "cus_same_sec_price",
+            "status" => "active",
+            "cancel_at_period_end" => false,
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+          }
+        }
+      }
+
+      opts = [
+        customer_resource: User,
+        subscription_resource: Subscription,
+        domain: Domain,
+        req_options: [plug: {Req.Test, stub_name}, retry: false]
+      ]
+
+      assert {:ok, reconciled_sub} = WebhookSync.sync_event(event, opts)
+      assert reconciled_sub.status == :active
+      assert reconciled_sub.price_id == "price_pro_live"
+    end
+
+    test "interleaved newer event during live reconciliation does not overwrite newer state" do
+      stub_name = "interleaved_reconcile_stub"
+      t1_unix = 1_700_000_100
+      t2_unix = 1_700_000_200
+      t1_dt = DateTime.from_unix!(t1_unix)
+      t2_dt = DateTime.from_unix!(t2_unix)
+
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{
+            email: "interleaved@example.com",
+            stripe_customer_id: "cus_interleaved"
+          },
+          domain: Domain
+        )
+
+      {:ok, existing} =
+        Ash.create(
+          Subscription,
+          %{
+            provider_subscription_id: "sub_interleaved_1",
+            status: :past_due,
+            user_id: user.id,
+            price_id: "price_v1",
+            last_event_created_at: t1_dt
+          },
+          domain: Domain
+        )
+
+      # Stub Stripe get_subscription: while waiting, simulate Worker B committing a newer event at t2
+      Req.Test.stub(stub_name, fn conn ->
+        # Simulate interleaved write from Worker B
+        Ash.update!(
+          existing,
+          %{
+            status: :active,
+            price_id: "price_worker_b_newer",
+            last_event_created_at: t2_dt
+          },
+          domain: Domain
+        )
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{
+            "id" => "sub_interleaved_1",
+            "status" => "active",
+            "cancel_at_period_end" => false,
+            "items" => %{"data" => [%{"price" => %{"id" => "price_stale_from_worker_a"}}]}
+          })
+        )
+      end)
+
+      # Worker A's event is for t1 (older than t2)
+      event = %{
+        "id" => "evt_worker_a_t1",
+        "type" => "customer.subscription.updated",
+        "created" => t1_unix,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_interleaved_1",
+            "customer" => "cus_interleaved",
+            "status" => "active",
+            "cancel_at_period_end" => false,
+            "items" => %{"data" => [%{"price" => %{"id" => "price_stale_from_worker_a"}}]}
+          }
+        }
+      }
+
+      opts = [
+        customer_resource: User,
+        subscription_resource: Subscription,
+        domain: Domain,
+        req_options: [plug: {Req.Test, stub_name}, retry: false]
+      ]
+
+      assert {:ok, result_sub} = WebhookSync.sync_event(event, opts)
+
+      # The state in DB MUST remain Worker B's newer state, not Worker A's stale reconciled state
+      assert result_sub.price_id == "price_worker_b_newer"
+      assert DateTime.compare(result_sub.last_event_created_at, t2_dt) == :eq
+    end
   end
 end
