@@ -23,19 +23,27 @@ postgres_available? =
         true
 
       {:error, reason} ->
-        IO.puts(
-          "PostgreSQL not available: #{inspect(reason)}. PostgreSQL integration tests will be skipped."
-        )
+        if System.get_env("CI") do
+          raise "PostgreSQL is required in CI environment but failed to start: #{inspect(reason)}"
+        else
+          IO.puts(
+            "PostgreSQL not available: #{inspect(reason)}. PostgreSQL integration tests will be skipped."
+          )
 
-        false
+          false
+        end
     end
   rescue
     e ->
-      IO.puts(
-        "PostgreSQL connection error: #{inspect(e)}. PostgreSQL integration tests will be skipped."
-      )
+      if System.get_env("CI") do
+        reraise e, __STACKTRACE__
+      else
+        IO.puts(
+          "PostgreSQL connection error: #{inspect(e)}. PostgreSQL integration tests will be skipped."
+        )
 
-      false
+        false
+      end
   end
 
 Application.put_env(:ash_billing, :postgres_available, postgres_available?)

@@ -81,7 +81,7 @@ Alternatively, you can install it manually by adding `ash_billing` to your `mix.
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.1.7"}
+    {:ash_billing, "~> 0.1.8"}
   ]
 end
 ```

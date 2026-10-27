@@ -14,7 +14,11 @@ defmodule AshBilling.PostgresDeduplicationTest do
 
   setup do
     unless Application.get_env(:ash_billing, :postgres_available, false) do
-      {:skip, "PostgreSQL not running or available"}
+      if System.get_env("CI") do
+        flunk("PostgreSQL is required in CI but is not available or running")
+      else
+        {:skip, "PostgreSQL not running or available"}
+      end
     else
       # Checkout sandbox or cleanup table
       Ecto.Adapters.SQL.query!(Repo, "TRUNCATE TABLE webhook_events;")

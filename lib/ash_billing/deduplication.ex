@@ -435,48 +435,64 @@ defmodule AshBilling.Deduplication do
             end
 
           %Ash.BulkResult{errors: [err | _]} ->
-            fallback_destroy_if_held(resource, event_id, lease_token, domain, err)
+            atomic_bulk_destroy(resource, event_id, lease_token, domain, err)
 
           {:error, reason} ->
-            fallback_destroy_if_held(resource, event_id, lease_token, domain, reason)
+            atomic_bulk_destroy(resource, event_id, lease_token, domain, reason)
         end
 
       Ash.Resource.Info.action(resource, :destroy) != nil ->
         domain = Keyword.get(opts, :domain)
-
-        case Ash.get(resource, event_id, domain: domain, authorize?: false) do
-          {:ok, record} when not is_nil(record) ->
-            case Ash.destroy(record, domain: domain, authorize?: false) do
-              {:error, err} -> {:error, err}
-              _ -> :ok
-            end
-
-          _ ->
-            :ok
-        end
+        lease_token = Keyword.get(opts, :lease_token)
+        atomic_bulk_destroy(resource, event_id, lease_token, domain, :cannot_release_lease)
 
       true ->
         {:error, :cannot_release_lease}
     end
   end
 
-  defp fallback_destroy_if_held(resource, event_id, lease_token, domain, default_err) do
+  defp atomic_bulk_destroy(resource, event_id, lease_token, domain, default_err) do
     if Ash.Resource.Info.action(resource, :destroy) != nil do
-      case Ash.get(resource, event_id, domain: domain, authorize?: false) do
-        {:ok, record} when not is_nil(record) ->
-          current_token = Map.get(record, :lease_token)
+      require Ash.Query
+      has_status? = Ash.Resource.Info.attribute(resource, :status) != nil
 
-          if lease_token != nil and current_token != nil and current_token != lease_token do
-            {:error, :lease_token_mismatch}
-          else
-            case Ash.destroy(record, domain: domain, authorize?: false) do
-              {:error, destroy_err} -> {:error, destroy_err}
-              _ -> :ok
-            end
+      query =
+        if lease_token && has_status? do
+          resource
+          |> Ash.Query.filter(
+            event_id == ^event_id and status == :processing and lease_token == ^lease_token
+          )
+        else
+          resource
+          |> Ash.Query.filter(event_id == ^event_id)
+        end
+
+      case Ash.bulk_destroy(query, :destroy, %{},
+             domain: domain,
+             authorize?: false,
+             strategy: [:atomic],
+             return_records?: true,
+             return_errors?: true
+           ) do
+        %Ash.BulkResult{status: :success, records: [_destroyed | _]} ->
+          :ok
+
+        %Ash.BulkResult{status: :success, records: []} ->
+          case Ash.get(resource, event_id, domain: domain, authorize?: false) do
+            {:ok, record} when not is_nil(record) ->
+              if lease_token != nil and Map.get(record, :lease_token) != nil and
+                   Map.get(record, :lease_token) != lease_token do
+                {:error, :lease_token_mismatch}
+              else
+                :ok
+              end
+
+            _ ->
+              :ok
           end
 
         _ ->
-          :ok
+          {:error, default_err}
       end
     else
       {:error, default_err}

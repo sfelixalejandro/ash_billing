@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.1.8] - 2026-10-27
+
+### Fixed
+
+- **Atomic Conditional Fallback Destruction**:
+  - Replaced non-atomic read-then-destroy sequences in `AshBilling.Deduplication.release/2` with strictly conditional `Ash.bulk_destroy/4` (`strategy: [:atomic]`).
+  - Destruction queries enforce simultaneous matching of `event_id`, `status == :processing`, and `lease_token` at the SQL level, preventing race conditions where another worker reclaiming an event could have its record deleted by an earlier worker.
+- **Strict PostgreSQL CI Enforcement**:
+  - `test/test_helper.exs` and `test/ash_billing/postgres_deduplication_test.exs` fail loudly (`raise` / `flunk`) if PostgreSQL is unavailable when `CI=true`.
+  - Ensures continuous integration pipelines never silently skip distributed database tests.
+
+---
+
 ## [v0.1.7] - 2026-10-27
 
 ### Added

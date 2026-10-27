@@ -269,6 +269,19 @@ defmodule AshBilling.DeduplicationTest do
       assert :ok =
                Deduplication.release("evt_failing_upd_1", [lease_token: tok_fail] ++ opts_failing)
 
+      # FailingUpdateEvent with mismatching token during fallback destroy
+      assert {:ok, _tok_fail3} = Deduplication.acquire("evt_failing_upd_3", opts_failing)
+
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.release(
+                 "evt_failing_upd_3",
+                 [lease_token: "wrong_tok"] ++ opts_failing
+               )
+
+      # SimpleEvent without status or update action release
+      assert {:ok, _} = Deduplication.acquire("evt_simple_reclaim_2", opts_simple)
+      assert :ok = Deduplication.release("evt_simple_reclaim_2", opts_simple)
+
       # FailingUpdateEvent bulk_update error branch during reclaim
       assert {:ok, _} = Deduplication.acquire("evt_failing_upd_2", opts_failing)
       assert {:error, _} = Deduplication.acquire("evt_failing_upd_2", opts_failing)
