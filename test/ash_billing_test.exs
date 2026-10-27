@@ -714,6 +714,21 @@ defmodule AshBillingTest do
                AshBilling.get_subscription(%{id: "sub_map_1"}, opts)
     end
 
+    test "canceling?/1 rejects terminal atom and string statuses with retained cancellation fields" do
+      future = DateTime.add(DateTime.utc_now(), 5, :day)
+      past = DateTime.add(DateTime.utc_now(), -5, :day)
+
+      for status <- [:canceled, :incomplete_expired, "canceled", "incomplete_expired"],
+          period_end <- [false, true],
+          cancel_at <- [nil, past, future] do
+        refute AshBilling.canceling?(%{
+                 status: status,
+                 cancel_at_period_end: period_end,
+                 cancel_at: cancel_at
+               })
+      end
+    end
+
     test "canceling?/1 identifies period-end and future scheduled cancellations" do
       future = DateTime.utc_now() |> DateTime.add(5, :day)
       past = DateTime.utc_now() |> DateTime.add(-5, :day)
@@ -729,6 +744,12 @@ defmodule AshBillingTest do
       refute AshBilling.canceling?(%{
                status: :active,
                cancel_at_period_end: false,
+               cancel_at: past
+             })
+
+      assert AshBilling.canceling?(%{
+               status: :active,
+               cancel_at_period_end: true,
                cancel_at: past
              })
 

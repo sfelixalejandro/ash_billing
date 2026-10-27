@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Terminal subscriptions (`canceled` and `incomplete_expired`) now return `false` from both the `:canceling?` calculation and `AshBilling.canceling?/1`, even when cancellation fields remain set. The helper accepts both atom and string statuses.
+
+---
+
 ## [v0.2.1] - 2026-10-27
 
 ### Added

@@ -374,9 +374,19 @@ defmodule AshBilling do
   @doc """
   Checks if a subscription is scheduled for cancellation (either via `cancel_at_period_end: true`
   or an unexpired future `cancel_at` timestamp).
+
+  Terminal subscriptions (`:canceled` or `:incomplete_expired`, including string statuses)
+  always return `false`, even if cancellation fields are still set.
+  For non-terminal subscriptions, `cancel_at_period_end: true` takes precedence over
+  a past `cancel_at`; this helper uses the supplied state and does not fetch provider updates.
   """
   @spec canceling?(struct() | map() | nil) :: boolean()
   def canceling?(nil), do: false
+
+  def canceling?(%{status: status})
+      when status in [:canceled, :incomplete_expired, "canceled", "incomplete_expired"],
+      do: false
+
   def canceling?(%{cancel_at_period_end: true}), do: true
 
   def canceling?(%{cancel_at: %DateTime{} = cancel_at}) do

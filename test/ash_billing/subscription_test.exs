@@ -135,6 +135,40 @@ defmodule AshBilling.SubscriptionTest do
       }
 
       assert {:ok, false} = Ash.calculate(sub_past_cancel, :canceling?)
+
+      assert {:ok, true} =
+               Ash.calculate(%{sub_past_cancel | cancel_at_period_end: true}, :canceling?)
+    end
+
+    test "generated status attribute normalizes terminal strings to atoms" do
+      attribute = Ash.Resource.Info.attribute(Subscription, :status)
+      assert attribute.type == Ash.Type.Atom
+      refute attribute.allow_nil?
+
+      for {input, expected} <- [
+            {"canceled", :canceled},
+            {"incomplete_expired", :incomplete_expired}
+          ] do
+        assert {:ok, ^expected} =
+                 Ash.Type.cast_input(attribute.type, input, attribute.constraints)
+      end
+    end
+
+    test "terminal subscriptions are never canceling despite retained cancellation fields" do
+      future = DateTime.add(DateTime.utc_now(), 10, :day)
+      past = DateTime.add(DateTime.utc_now(), -1, :day)
+
+      for status <- [:canceled, :incomplete_expired],
+          period_end <- [false, true],
+          cancel_at <- [nil, past, future] do
+        sub = %Subscription{
+          status: status,
+          cancel_at_period_end: period_end,
+          cancel_at: cancel_at
+        }
+
+        assert {:ok, false} = Ash.calculate(sub, :canceling?)
+      end
     end
 
     test "provides correct introspection helpers" do

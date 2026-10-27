@@ -94,8 +94,9 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
     else
       expr =
         Ash.Expr.expr(
-          cancel_at_period_end == true or
-            (not is_nil(cancel_at) and cancel_at > now())
+          status not in [:canceled, :incomplete_expired] and
+            (cancel_at_period_end == true or
+               (not is_nil(cancel_at) and cancel_at > now()))
         )
 
       calculation =
