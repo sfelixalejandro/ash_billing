@@ -58,7 +58,7 @@ defmodule AshBilling.Plug do
                     if deduplicate? do
                       AshBilling.Deduplication.acquire(event_id, opts)
                     else
-                      {:ok, :acquired}
+                      {:ok, nil}
                     end
 
                   case dedup_status do
@@ -98,7 +98,7 @@ defmodule AshBilling.Plug do
                          error: dedup_reason
                        }}
 
-                    {:ok, :acquired} ->
+                    {:ok, lease_token} ->
                       sync_result =
                         if Keyword.has_key?(opts, :subscription_resource) or
                              Keyword.has_key?(opts, :customer_resource) or
@@ -117,7 +117,10 @@ defmodule AshBilling.Plug do
                           )
 
                           if deduplicate? do
-                            AshBilling.Deduplication.release(event_id, [error: reason] ++ opts)
+                            AshBilling.Deduplication.release(
+                              event_id,
+                              [lease_token: lease_token, error: reason] ++ opts
+                            )
                           end
 
                           resp_conn =
@@ -165,7 +168,7 @@ defmodule AshBilling.Plug do
                               if deduplicate? do
                                 AshBilling.Deduplication.release(
                                   event_id,
-                                  [error: handler_reason] ++ opts
+                                  [lease_token: lease_token, error: handler_reason] ++ opts
                                 )
                               end
 
@@ -190,17 +193,58 @@ defmodule AshBilling.Plug do
                                }}
 
                             _ ->
-                              if deduplicate?,
-                                do: AshBilling.Deduplication.complete(event_id, opts)
+                              complete_result =
+                                if deduplicate? do
+                                  AshBilling.Deduplication.complete(
+                                    event_id,
+                                    [lease_token: lease_token] ++ opts
+                                  )
+                                else
+                                  :ok
+                                end
 
-                              resp_conn =
-                                conn
-                                |> put_resp_content_type("application/json")
-                                |> send_resp(200, ~s({"status":"received"}))
-                                |> halt()
+                              case complete_result do
+                                :ok ->
+                                  resp_conn =
+                                    conn
+                                    |> put_resp_content_type("application/json")
+                                    |> send_resp(200, ~s({"status":"received"}))
+                                    |> halt()
 
-                              {resp_conn,
-                               %{status: :received, event_id: event_id, event_type: event_type}}
+                                  {resp_conn,
+                                   %{
+                                     status: :received,
+                                     event_id: event_id,
+                                     event_type: event_type
+                                   }}
+
+                                {:error, complete_reason} when return_500? ->
+                                  require Logger
+
+                                  Logger.error(
+                                    "AshBilling.Plug: Failed to complete deduplication lease for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(complete_reason)}. Returning HTTP 500 to trigger retry."
+                                  )
+
+                                  resp_conn =
+                                    conn
+                                    |> put_resp_content_type("application/json")
+                                    |> send_resp(
+                                      500,
+                                      Jason.encode!(%{
+                                        error: "completion_failed",
+                                        details: inspect(complete_reason)
+                                      })
+                                    )
+                                    |> halt()
+
+                                  {resp_conn,
+                                   %{
+                                     status: :completion_failed,
+                                     event_id: event_id,
+                                     event_type: event_type,
+                                     error: complete_reason
+                                   }}
+                              end
                           end
                       end
                   end

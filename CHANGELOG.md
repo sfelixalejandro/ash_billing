@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.1.6] - 2026-10-27
+
+### Fixed
+
+- **Atomic Conditional Lease Reclamation**:
+  - `AshBilling.Deduplication` implements atomic conditional updates during lease reclamation via `Ash.bulk_update` with an atomic filter ensuring the target record is strictly in `:failed` status or expired `:processing` status during the write operation.
+  - Node-level and clustered atomic locking prevents concurrent processes from racing during lease acquisition or reclamation.
+- **Unique Acquisition Lease Tokens & Zombie Worker Protection**:
+  - Each acquired lease generates a cryptographically secure unique `lease_token`.
+  - Reclaiming workers overwrite the `lease_token`. Workers completing (`Deduplication.complete/2`) or releasing (`Deduplication.release/2`) after their lease has expired or been reclaimed receive `{:error, :lease_token_mismatch}`, preventing expired workers from corrupting active processing states or overwriting active leases.
+- **Fail-Closed Plug Completion Verification**:
+  - `Deduplication.complete/2` contract updated to `@spec complete(String.t() | nil, keyword()) :: :ok | {:error, term()}`.
+  - Persistence errors during event completion are no longer silently masked. `AshBilling.Plug` verifies completion success and halts with HTTP 500 (`completion_failed`) if marking `:processed` fails, ensuring Stripe and payment providers retry unconfirmed events.
+- **Real Multi-Process Concurrency Test Coverage**:
+  - Added parallel concurrency test suites verifying that exactly 1 worker succeeds in winning initial acquisition or reclaiming expired/failed leases across concurrent `Task.async` processes.
+  - Added zombie worker rejection tests and persistence failure simulations verifying Plug HTTP 500 fail-closed semantics.
+
+---
+
 ## [v0.1.5] - 2026-10-27
 
 ### Fixed

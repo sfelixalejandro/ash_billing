@@ -28,7 +28,8 @@ defmodule AshBilling.WebhookEvent.Transformers.AddWebhookEventAttributes do
       {:processed_at, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]},
       {:last_attempt_at, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]},
       {:attempts, Ash.Type.Integer, [default: 1, allow_nil?: false, public?: true]},
-      {:error, Ash.Type.String, [allow_nil?: true, public?: true]}
+      {:error, Ash.Type.String, [allow_nil?: true, public?: true]},
+      {:lease_token, Ash.Type.String, [allow_nil?: true, public?: true]}
     ]
 
     add_attributes(dsl_state, attributes)

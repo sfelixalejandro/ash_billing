@@ -10,6 +10,7 @@ defmodule AshBilling.Test.Domain do
     resource AshBilling.Test.WebhookEvent
     resource AshBilling.Test.SimpleEvent
     resource AshBilling.Test.ReadOnlyEvent
+    resource AshBilling.Test.FailingUpdateEvent
     resource AshBilling.Test.PremiumFeature
     resource AshBilling.Test.IncompleteResource
   end
@@ -186,6 +187,27 @@ defmodule AshBilling.Test.ReadOnlyEvent do
   actions do
     default_accept :*
     defaults [:read, :create]
+  end
+end
+
+defmodule AshBilling.Test.FailingUpdateEvent do
+  use Ash.Resource,
+    domain: AshBilling.Test.Domain,
+    data_layer: Ash.DataLayer.Ets,
+    extensions: [AshBilling.WebhookEvent]
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :destroy]
+
+    update :update do
+      primary? true
+      require_atomic? false
+
+      validate fn _changeset, _context ->
+        {:error, field: :status, message: "simulated_persistence_failure"}
+      end
+    end
   end
 end
 

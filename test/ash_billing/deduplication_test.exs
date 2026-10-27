@@ -163,7 +163,8 @@ defmodule AshBilling.DeduplicationTest do
       event_id = "evt_simple_res_99"
 
       refute Deduplication.processed?(event_id, opts)
-      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      assert {:ok, token} = Deduplication.acquire(event_id, opts)
+      assert is_binary(token)
       assert {:error, :already_processed} = Deduplication.acquire(event_id, opts)
       assert Deduplication.processed?(event_id, opts) == true
 
@@ -176,26 +177,33 @@ defmodule AshBilling.DeduplicationTest do
       event_id = "evt_mem_lifecycle_#{System.unique_integer([:positive])}"
       opts = [deduplication_strategy: :memory]
 
-      # 1. Acquire puts event in :processing
-      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      # 1. Acquire puts event in :processing and returns token
+      assert {:ok, token1} = Deduplication.acquire(event_id, opts)
+      assert is_binary(token1)
       refute Deduplication.processed?(event_id, opts)
       assert {:error, :already_processing} = Deduplication.acquire(event_id, opts)
 
       # 2. Release marks event as :failed
-      assert :ok = Deduplication.release(event_id, opts)
+      assert :ok = Deduplication.release(event_id, [lease_token: token1] ++ opts)
       refute Deduplication.processed?(event_id, opts)
 
       # 3. Re-acquire succeeds from :failed
-      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      assert {:ok, token2} = Deduplication.acquire(event_id, opts)
+      assert is_binary(token2)
 
       # 4. Expired lease (> 60s) is reclaimed
       table = :ash_billing_processed_events
       now = System.system_time(:second)
-      :ets.insert(table, {event_id, :processing, now - 100})
-      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      :ets.insert(table, {event_id, :processing, now - 100, token2})
+      assert {:ok, token3} = Deduplication.acquire(event_id, opts)
+      assert is_binary(token3)
 
-      # 5. Complete marks event as :processed
-      assert :ok = Deduplication.complete(event_id, opts)
+      # Zombie worker attempting complete with old token is rejected
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.complete(event_id, [lease_token: token1] ++ opts)
+
+      # 5. Active worker completes successfully
+      assert :ok = Deduplication.complete(event_id, [lease_token: token3] ++ opts)
       assert Deduplication.processed?(event_id, opts) == true
       assert {:error, :already_processed} = Deduplication.acquire(event_id, opts)
     end
@@ -209,8 +217,8 @@ defmodule AshBilling.DeduplicationTest do
         domain: Domain
       ]
 
-      # Complete and release for non-existent record in resource strategy return :ok safely
-      assert :ok = Deduplication.complete("evt_not_in_db_123", opts_webhook)
+      # Complete for non-existent record returns error; release returns :ok safely
+      assert {:error, _} = Deduplication.complete("evt_not_in_db_123", opts_webhook)
       assert :ok = Deduplication.release("evt_not_in_db_123", opts_webhook)
 
       # Complete on SimpleEvent (resource without status)
@@ -220,7 +228,8 @@ defmodule AshBilling.DeduplicationTest do
         domain: Domain
       ]
 
-      assert {:ok, :acquired} = Deduplication.acquire("evt_simple_comp_1", opts_simple)
+      assert {:ok, token_simple} = Deduplication.acquire("evt_simple_comp_1", opts_simple)
+      assert is_binary(token_simple)
       assert :ok = Deduplication.complete("evt_simple_comp_1", opts_simple)
 
       # Release on ReadOnlyEvent (lacks both update and destroy actions)
@@ -230,8 +239,227 @@ defmodule AshBilling.DeduplicationTest do
         domain: Domain
       ]
 
-      assert {:ok, :acquired} = Deduplication.acquire("evt_readonly_1", opts_ro)
+      assert {:ok, token_ro} = Deduplication.acquire("evt_readonly_1", opts_ro)
+      assert is_binary(token_ro)
       assert {:error, :cannot_release_lease} = Deduplication.release("evt_readonly_1", opts_ro)
+
+      # SimpleEvent without status rejects duplicate acquisition as already processed
+      assert {:ok, _} = Deduplication.acquire("evt_simple_reclaim_1", opts_simple)
+
+      assert {:error, :already_processed} =
+               Deduplication.acquire("evt_simple_reclaim_1", opts_simple)
+
+      assert :ok = Deduplication.release("evt_simple_reclaim_1", opts_simple)
+
+      # Complete and release on FailingUpdateEvent (triggers update failure and fallback)
+      opts_failing = [
+        deduplication_strategy: :resource,
+        deduplication_resource: AshBilling.Test.FailingUpdateEvent,
+        domain: Domain
+      ]
+
+      assert {:ok, tok_fail} = Deduplication.acquire("evt_failing_upd_1", opts_failing)
+
+      assert {:error, _} =
+               Deduplication.complete(
+                 "evt_failing_upd_1",
+                 [lease_token: tok_fail] ++ opts_failing
+               )
+
+      assert :ok =
+               Deduplication.release("evt_failing_upd_1", [lease_token: tok_fail] ++ opts_failing)
+
+      # FailingUpdateEvent bulk_update error branch during reclaim
+      assert {:ok, _} = Deduplication.acquire("evt_failing_upd_2", opts_failing)
+      assert {:error, _} = Deduplication.acquire("evt_failing_upd_2", opts_failing)
+
+      # Exception rescues on invalid configuration
+      opts_invalid = [
+        deduplication_strategy: :resource,
+        deduplication_resource: :invalid_not_a_resource
+      ]
+
+      assert {:error, _} = Deduplication.acquire("evt_invalid_cfg", opts_invalid)
+      assert {:error, _} = Deduplication.complete("evt_invalid_cfg", opts_invalid)
+      assert {:error, _} = Deduplication.release("evt_invalid_cfg", opts_invalid)
+      assert false == Deduplication.processed?("evt_invalid_cfg", opts_invalid)
+    end
+
+    test "memory strategy legacy tuple formats and fallback branches" do
+      # Legacy 3-tuple :processed in memory
+      :ets.insert(:ash_billing_processed_events, {"evt_mem_legacy_proc", :processed, 12345})
+
+      assert {:error, :already_processed} =
+               Deduplication.acquire("evt_mem_legacy_proc", deduplication_strategy: :memory)
+
+      # Legacy 3-tuple :processing in memory
+      :ets.insert(:ash_billing_processed_events, {"evt_mem_legacy_proc2", :processing, 12345})
+      assert :ok = Deduplication.complete("evt_mem_legacy_proc2", deduplication_strategy: :memory)
+
+      # Legacy 3-tuple :failed in memory
+      :ets.insert(:ash_billing_processed_events, {"evt_mem_legacy_fail", :failed, 12345})
+
+      assert {:error, :lease_failed} =
+               Deduplication.complete("evt_mem_legacy_fail", deduplication_strategy: :memory)
+
+      # Complete on already processed event in memory
+      assert {:ok, _} =
+               Deduplication.acquire("evt_mem_already_proc", deduplication_strategy: :memory)
+
+      assert :ok = Deduplication.complete("evt_mem_already_proc", deduplication_strategy: :memory)
+      assert :ok = Deduplication.complete("evt_mem_already_proc", deduplication_strategy: :memory)
+
+      # Complete on a failed 4-tuple event in memory
+      assert {:ok, _} =
+               Deduplication.acquire("evt_mem_failed_comp", deduplication_strategy: :memory)
+
+      assert :ok = Deduplication.release("evt_mem_failed_comp", deduplication_strategy: :memory)
+
+      assert {:error, :lease_failed} =
+               Deduplication.complete("evt_mem_failed_comp", deduplication_strategy: :memory)
+
+      # Complete on an unseen event in memory
+      assert :ok = Deduplication.complete("evt_mem_unseen_1", deduplication_strategy: :memory)
+
+      # Legacy 3-tuples in processed?
+      :ets.insert(:ash_billing_processed_events, {"evt_legacy_p_true", :processed, 12345})
+
+      assert Deduplication.processed?("evt_legacy_p_true", deduplication_strategy: :memory) ==
+               true
+
+      :ets.insert(:ash_billing_processed_events, {"evt_legacy_p_false", :processing, 12345})
+
+      assert Deduplication.processed?("evt_legacy_p_false", deduplication_strategy: :memory) ==
+               false
+
+      :ets.insert(:ash_billing_processed_events, {"evt_legacy_p_fail", :failed, 12345})
+
+      assert Deduplication.processed?("evt_legacy_p_fail", deduplication_strategy: :memory) ==
+               false
+
+      :ets.insert(:ash_billing_processed_events, {"evt_legacy_other", :unknown, 12345})
+
+      assert Deduplication.processed?("evt_legacy_other", deduplication_strategy: :memory) ==
+               false
+
+      # Legacy 3-tuple release
+      :ets.insert(:ash_billing_processed_events, {"evt_legacy_rel_proc", :processing, 12345})
+      assert :ok = Deduplication.release("evt_legacy_rel_proc", deduplication_strategy: :memory)
+    end
+
+    test "real concurrency: exactly one process wins the acquisition race across multiple parallel tasks" do
+      event_id = "evt_parallel_race_#{System.unique_integer([:positive])}"
+
+      opts = [
+        deduplication_strategy: :resource,
+        deduplication_resource: WebhookEvent,
+        domain: Domain
+      ]
+
+      # 10 concurrent processes race to acquire the same event simultaneously
+      results =
+        1..10
+        |> Enum.map(fn _ ->
+          Task.async(fn ->
+            Deduplication.acquire(event_id, opts)
+          end)
+        end)
+        |> Enum.map(&Task.await(&1, 5000))
+
+      acquired_results = Enum.filter(results, fn res -> match?({:ok, _token}, res) end)
+
+      busy_results =
+        Enum.filter(results, fn res -> match?({:error, :already_processing}, res) end)
+
+      # Exactly one process MUST succeed
+      assert length(acquired_results) == 1
+      assert length(busy_results) == 9
+
+      [{:ok, winning_token}] = acquired_results
+      assert is_binary(winning_token)
+
+      # Complete the winning lease
+      assert :ok = Deduplication.complete(event_id, [lease_token: winning_token] ++ opts)
+      assert Deduplication.processed?(event_id, opts) == true
+    end
+
+    test "real concurrency: exactly one process reclaims an expired or failed lease among concurrent tasks" do
+      event_id = "evt_parallel_reclaim_#{System.unique_integer([:positive])}"
+
+      opts = [
+        deduplication_strategy: :resource,
+        deduplication_resource: WebhookEvent,
+        domain: Domain
+      ]
+
+      # Initial acquisition and failure
+      assert {:ok, token1} = Deduplication.acquire(event_id, opts)
+
+      assert :ok =
+               Deduplication.release(
+                 event_id,
+                 [lease_token: token1, error: :test_failure] ++ opts
+               )
+
+      # 10 concurrent processes race to reclaim the failed event simultaneously
+      results =
+        1..10
+        |> Enum.map(fn _ ->
+          Task.async(fn ->
+            Deduplication.acquire(event_id, opts)
+          end)
+        end)
+        |> Enum.map(&Task.await(&1, 5000))
+
+      acquired_results = Enum.filter(results, fn res -> match?({:ok, _token}, res) end)
+
+      busy_results =
+        Enum.filter(results, fn res -> match?({:error, :already_processing}, res) end)
+
+      # Exactly one process MUST succeed in reclaiming the lease
+      assert length(acquired_results) == 1
+      assert length(busy_results) == 9
+
+      [{:ok, reclaim_token}] = acquired_results
+      assert is_binary(reclaim_token)
+      assert reclaim_token != token1
+    end
+
+    test "zombie worker protection: expired worker cannot complete or release lease after reclamation" do
+      event_id = "evt_zombie_#{System.unique_integer([:positive])}"
+
+      opts = [
+        deduplication_strategy: :resource,
+        deduplication_resource: WebhookEvent,
+        domain: Domain
+      ]
+
+      # Worker 1 acquires lease
+      assert {:ok, token_worker1} = Deduplication.acquire(event_id, opts)
+
+      # Worker 1 takes too long (> 60s lease_ttl). Manually set last_attempt_at in the past
+      past_dt = DateTime.utc_now() |> DateTime.add(-75, :second)
+
+      {:ok, record} = Ash.get(WebhookEvent, event_id, domain: Domain, authorize?: false)
+
+      {:ok, _} =
+        Ash.update(record, %{last_attempt_at: past_dt}, domain: Domain, authorize?: false)
+
+      # Worker 2 detects expired lease and reclaims it
+      assert {:ok, token_worker2} = Deduplication.acquire(event_id, opts)
+      assert token_worker2 != token_worker1
+
+      # Zombie Worker 1 wakes up and attempts to complete its old lease -> MUST BE REJECTED
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.complete(event_id, [lease_token: token_worker1] ++ opts)
+
+      # Zombie Worker 1 attempts to release its old lease -> MUST BE REJECTED
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.release(event_id, [lease_token: token_worker1] ++ opts)
+
+      # Worker 2 successfully completes its active lease
+      assert :ok = Deduplication.complete(event_id, [lease_token: token_worker2] ++ opts)
+      assert Deduplication.processed?(event_id, opts) == true
     end
 
     test "handles nil event_id gracefully across all operations" do

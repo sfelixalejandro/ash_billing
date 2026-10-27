@@ -303,6 +303,52 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
       assert conn.status == 500
       assert Jason.decode!(conn.resp_body)["error"] == "deduplication_failed"
     end
+
+    test "Plug returns 500 Internal Server Error when Deduplication.complete fails" do
+      stub_name = "plug_complete_fail_stub"
+
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(%{"id" => "sub_test"}))
+      end)
+
+      secret = "whsec_test_secret_123"
+
+      payload =
+        Jason.encode!(%{
+          "id" => "evt_complete_plug_fail",
+          "type" => "customer.subscription.created",
+          "data" => %{"object" => %{"id" => "sub_comp_1", "status" => "active"}}
+        })
+
+      timestamp = System.system_time(:second)
+
+      signature =
+        :crypto.mac(:hmac, :sha256, secret, "#{timestamp}.#{payload}")
+        |> Base.encode16(case: :lower)
+
+      sig_header = "t=#{timestamp},v1=#{signature}"
+
+      opts =
+        BillingPlug.init(
+          provider: AshBilling.Providers.Stripe,
+          webhook_secret: secret,
+          deduplication_resource: AshBilling.Test.FailingUpdateEvent,
+          customer_resource: User,
+          subscription_resource: Subscription,
+          domain: Domain,
+          req_opts: [plug: {Req.Test, stub_name}]
+        )
+
+      conn =
+        Plug.Test.conn(:post, "/webhooks/stripe", payload)
+        |> Plug.Conn.put_req_header("stripe-signature", sig_header)
+        |> BillingPlug.call(opts)
+
+      assert conn.status == 500
+      assert Jason.decode!(conn.resp_body)["error"] == "completion_failed"
+    end
   end
 
   describe "create_customer/2 with Explicit Persistence & Idempotency" do
@@ -690,20 +736,27 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
     test "acquire locks the lease and prevents concurrent duplicate execution in memory" do
       event_id = "evt_atomic_mem_#{System.unique_integer([:positive])}"
 
-      assert {:ok, :acquired} = Deduplication.acquire(event_id, deduplication_strategy: :memory)
+      assert {:ok, token1} = Deduplication.acquire(event_id, deduplication_strategy: :memory)
+      assert is_binary(token1)
 
       # Second concurrent acquire fails
       assert {:error, status} = Deduplication.acquire(event_id, deduplication_strategy: :memory)
       assert status in [:already_processing, :already_processed]
 
       # Complete marks processed
-      assert :ok = Deduplication.complete(event_id, deduplication_strategy: :memory)
+      assert :ok =
+               Deduplication.complete(event_id,
+                 lease_token: token1,
+                 deduplication_strategy: :memory
+               )
+
       assert Deduplication.processed?(event_id, deduplication_strategy: :memory) == true
 
       # Release deletes lease so retry is possible
       assert :ok = Deduplication.release(event_id, deduplication_strategy: :memory)
       assert Deduplication.processed?(event_id, deduplication_strategy: :memory) == false
-      assert {:ok, :acquired} = Deduplication.acquire(event_id, deduplication_strategy: :memory)
+      assert {:ok, token2} = Deduplication.acquire(event_id, deduplication_strategy: :memory)
+      assert is_binary(token2)
     end
 
     test "acquire locks the lease and enforces uniqueness across database resource" do
@@ -715,20 +768,22 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
         domain: Domain
       ]
 
-      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      assert {:ok, token1} = Deduplication.acquire(event_id, opts)
+      assert is_binary(token1)
 
       # Second acquire fails because event is actively being processed
       assert {:error, status} = Deduplication.acquire(event_id, opts)
       assert status in [:already_processing, :already_processed]
 
       # Complete marks processed
-      assert :ok = Deduplication.complete(event_id, opts)
+      assert :ok = Deduplication.complete(event_id, [lease_token: token1] ++ opts)
       assert {:error, :already_processed} = Deduplication.acquire(event_id, opts)
 
       # Release transitions lease so retry is possible
       assert :ok = Deduplication.release(event_id, opts)
       assert Deduplication.processed?(event_id, opts) == false
-      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      assert {:ok, token2} = Deduplication.acquire(event_id, opts)
+      assert is_binary(token2)
     end
   end
 
@@ -971,8 +1026,10 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
         {"evt_stale_lease", :processing, System.system_time(:second) - 70}
       )
 
-      assert {:ok, :acquired} =
+      assert {:ok, stale_tok} =
                Deduplication.acquire("evt_stale_lease", deduplication_strategy: :memory)
+
+      assert is_binary(stale_tok)
 
       # Legacy 2-tuple handling
       :ets.insert(
@@ -1064,16 +1121,22 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
       opts = [deduplication_resource: WebhookEvent, domain: Domain]
 
       # Step 1: Initial acquisition sets :processing
-      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      assert {:ok, token1} = Deduplication.acquire(event_id, opts)
+      assert is_binary(token1)
       assert {:ok, record} = Ash.get(WebhookEvent, event_id, domain: Domain, authorize?: false)
       assert record.status == :processing
       assert record.attempts == 1
+      assert record.lease_token == token1
 
       # Concurrent worker attempting to acquire gets :already_processing
       assert {:error, :already_processing} = Deduplication.acquire(event_id, opts)
 
       # Step 2: Processing fails, release with error transitions to :failed
-      assert :ok = Deduplication.release(event_id, [error: :external_timeout] ++ opts)
+      assert :ok =
+               Deduplication.release(
+                 event_id,
+                 [lease_token: token1, error: :external_timeout] ++ opts
+               )
 
       assert {:ok, failed_record} =
                Ash.get(WebhookEvent, event_id, domain: Domain, authorize?: false)
@@ -1082,13 +1145,16 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
       assert failed_record.error =~ "external_timeout"
 
       # Step 3: Provider retry re-acquires successfully, increments attempts
-      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      assert {:ok, token2} = Deduplication.acquire(event_id, opts)
+      assert is_binary(token2)
+      assert token2 != token1
 
       assert {:ok, retried_record} =
                Ash.get(WebhookEvent, event_id, domain: Domain, authorize?: false)
 
       assert retried_record.status == :processing
       assert retried_record.attempts == 2
+      assert retried_record.lease_token == token2
 
       # Step 4: Stale lease reclamation (> 60s)
       stale_dt = DateTime.utc_now() |> DateTime.add(-75, :second)
@@ -1101,10 +1167,12 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
 
       assert stale_record.status == :processing
 
-      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      assert {:ok, token3} = Deduplication.acquire(event_id, opts)
+      assert is_binary(token3)
+      assert token3 != token2
 
       # Step 5: Successful completion marks :processed
-      assert :ok = Deduplication.complete(event_id, opts)
+      assert :ok = Deduplication.complete(event_id, [lease_token: token3] ++ opts)
 
       assert {:ok, completed_record} =
                Ash.get(WebhookEvent, event_id, domain: Domain, authorize?: false)

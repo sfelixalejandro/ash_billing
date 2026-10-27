@@ -39,13 +39,13 @@ defmodule AshBilling.Deduplication do
   Atomically acquires an exclusive processing lease for an event ID.
 
   Returns:
-  * `{:ok, :acquired}` - Lease secured; this process is the exclusive worker for the event.
+  * `{:ok, lease_token}` - Lease secured; this process is the exclusive worker for the event.
   * `{:error, :already_processed}` - The event was already processed.
   * `{:error, :already_processing}` - The event is currently being processed by another worker.
   * `{:error, reason}` - Persistence error during acquisition.
   """
   @spec acquire(String.t() | nil, keyword()) ::
-          {:ok, :acquired}
+          {:ok, String.t()}
           | {:error, :already_processed}
           | {:error, :already_processing}
           | {:error, term()}
@@ -79,78 +79,146 @@ defmodule AshBilling.Deduplication do
   end
 
   defp create_resource_lease(resource, event_id, domain, now, lease_ttl) do
+    token = generate_lease_token()
+
     attrs =
       %{event_id: event_id}
       |> maybe_put_field(resource, :status, :processing)
       |> maybe_put_field(resource, :last_attempt_at, now)
       |> maybe_put_field(resource, :processed_at, now)
       |> maybe_put_field(resource, :attempts, 1)
+      |> maybe_put_field(resource, :lease_token, token)
 
     case Ash.create(resource, attrs, domain: domain, authorize?: false) do
       {:ok, _record} ->
-        {:ok, :acquired}
+        {:ok, token}
 
       {:error, reason} ->
         if duplicate_key_error?(reason) do
-          case Ash.get(resource, event_id, domain: domain, authorize?: false) do
-            {:ok, record} when not is_nil(record) ->
-              handle_existing_resource_lease(record, resource, domain, now, lease_ttl)
-
-            _ ->
-              {:error, :already_processing}
-          end
+          reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token)
         else
           {:error, reason}
         end
     end
   end
 
-  defp handle_existing_resource_lease(record, resource, domain, now, lease_ttl) do
+  defp reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token) do
+    lock_key = {:reclaim_lock, event_id}
+
+    if try_acquire_lock(lock_key) do
+      try do
+        do_reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token)
+      after
+        release_lock(lock_key)
+      end
+    else
+      {:error, :already_processing}
+    end
+  end
+
+  defp try_acquire_lock(lock_key) do
+    :ets.insert_new(@table, {lock_key, self()})
+  rescue
+    _ -> true
+  end
+
+  defp release_lock(lock_key) do
+    :ets.delete(@table, lock_key)
+  rescue
+    _ -> :ok
+  end
+
+  defp do_reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token) do
     has_status? = Ash.Resource.Info.attribute(resource, :status) != nil
 
     if has_status? do
-      status = Map.get(record, :status)
+      case Ash.get(resource, event_id, domain: domain, authorize?: false) do
+        {:ok, record} when not is_nil(record) ->
+          case Map.get(record, :status) do
+            :processed ->
+              {:error, :already_processed}
 
-      case status do
-        :processed ->
-          {:error, :already_processed}
+            :processing ->
+              attempt_dt = Map.get(record, :last_attempt_at) || Map.get(record, :processed_at)
 
-        :failed ->
-          reclaim_resource_lease(record, resource, domain, now)
+              if attempt_dt && DateTime.diff(now, attempt_dt, :second) <= lease_ttl do
+                {:error, :already_processing}
+              else
+                perform_atomic_reclaim(
+                  resource,
+                  event_id,
+                  domain,
+                  now,
+                  lease_ttl,
+                  token,
+                  record
+                )
+              end
 
-        :processing ->
-          attempt_dt = Map.get(record, :last_attempt_at) || Map.get(record, :processed_at)
-
-          if attempt_dt && DateTime.diff(now, attempt_dt, :second) > lease_ttl do
-            reclaim_resource_lease(record, resource, domain, now)
-          else
-            {:error, :already_processing}
+            _failed ->
+              perform_atomic_reclaim(resource, event_id, domain, now, lease_ttl, token, record)
           end
 
         _ ->
-          {:error, :already_processed}
+          {:error, :already_processing}
       end
     else
       {:error, :already_processed}
     end
   end
 
-  defp reclaim_resource_lease(record, resource, domain, now) do
+  defp perform_atomic_reclaim(resource, event_id, domain, now, lease_ttl, token, record) do
     if Ash.Resource.Info.action(resource, :update) do
+      cutoff = DateTime.add(now, -lease_ttl, :second)
+      require Ash.Query
+
+      # Atomic conditional filter: ensure record is still :failed or expired :processing during the write
+      query =
+        resource
+        |> Ash.Query.filter(
+          event_id == ^event_id and
+            (status == :failed or
+               (status == :processing and
+                  ((not is_nil(last_attempt_at) and last_attempt_at < ^cutoff) or
+                     (is_nil(last_attempt_at) and not is_nil(processed_at) and
+                        processed_at < ^cutoff))))
+        )
+
+      current_attempts = Map.get(record, :attempts) || 1
+
       update_attrs =
         %{status: :processing, last_attempt_at: now, error: nil}
-        |> maybe_increment_attempts(record, resource)
+        |> maybe_put_field(resource, :lease_token, token)
+        |> maybe_put_field(resource, :attempts, current_attempts + 1)
 
-      case Ash.update(record, update_attrs, domain: domain, authorize?: false) do
-        {:ok, _} -> {:ok, :acquired}
-        {:error, reason} -> {:error, reason}
+      case Ash.bulk_update(query, :update, update_attrs,
+             domain: domain,
+             authorize?: false,
+             return_records?: true,
+             return_errors?: true
+           ) do
+        %Ash.BulkResult{status: :success, records: [_updated | _]} ->
+          {:ok, token}
+
+        %Ash.BulkResult{status: :success, records: []} ->
+          # Another concurrent worker acquired it first or marked it processed
+          case Ash.get(resource, event_id, domain: domain, authorize?: false) do
+            {:ok, %{status: :processed}} -> {:error, :already_processed}
+            _ -> {:error, :already_processing}
+          end
+
+        %Ash.BulkResult{errors: [err | _]} ->
+          {:error, err}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     else
       if Ash.Resource.Info.action(resource, :destroy) do
         _ = Ash.destroy(record, domain: domain, authorize?: false)
       end
 
-      {:ok, :acquired}
+      {:ok, token}
     end
   end
 
@@ -162,19 +230,16 @@ defmodule AshBilling.Deduplication do
     end
   end
 
-  defp maybe_increment_attempts(attrs, record, resource) do
-    if Ash.Resource.Info.attribute(resource, :attempts) != nil do
-      current = Map.get(record, :attempts) || 1
-      Map.put(attrs, :attempts, current + 1)
-    else
-      attrs
-    end
+  defp generate_lease_token do
+    "lt_" <> Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
   end
 
   @doc """
   Completes processing for an acquired event lease.
+
+  Returns `:ok` if successfully marked as `:processed`, or `{:error, reason}` on failure.
   """
-  @spec complete(String.t() | nil, keyword()) :: :ok
+  @spec complete(String.t() | nil, keyword()) :: :ok | {:error, term()}
   def complete(event_id, opts \\ [])
   def complete(nil, _opts), do: :ok
 
@@ -183,47 +248,59 @@ defmodule AshBilling.Deduplication do
       :resource ->
         case resolve_resource(opts) do
           nil ->
-            insert_memory(event_id)
+            complete_memory(event_id, opts)
 
           resource ->
             domain = Keyword.get(opts, :domain)
             now = DateTime.utc_now()
+            lease_token = Keyword.get(opts, :lease_token)
 
             case Ash.get(resource, event_id, domain: domain, authorize?: false) do
               {:ok, record} when not is_nil(record) ->
-                if Ash.Resource.Info.attribute(resource, :status) != nil and
-                     Ash.Resource.Info.action(resource, :update) != nil do
-                  update_attrs =
-                    %{status: :processed, error: nil}
-                    |> maybe_put_field(resource, :processed_at, now)
+                current_token = Map.get(record, :lease_token)
 
-                  case Ash.update(record, update_attrs, domain: domain, authorize?: false) do
-                    {:ok, _} ->
-                      :ok
+                cond do
+                  # Zombie worker protection: reject completion if lease was reclaimed by another worker
+                  lease_token != nil and current_token != nil and current_token != lease_token ->
+                    {:error, :lease_token_mismatch}
 
-                    {:error, reason} ->
-                      require Logger
+                  Ash.Resource.Info.attribute(resource, :status) != nil and
+                      Ash.Resource.Info.action(resource, :update) != nil ->
+                    update_attrs =
+                      %{status: :processed, error: nil}
+                      |> maybe_put_field(resource, :processed_at, now)
 
-                      Logger.warning(
-                        "AshBilling.Deduplication: Failed to mark event #{inspect(event_id)} as :processed: #{inspect(reason)}"
-                      )
+                    case Ash.update(record, update_attrs, domain: domain, authorize?: false) do
+                      {:ok, _} ->
+                        :ok
 
-                      :ok
-                  end
-                else
-                  :ok
+                      {:error, reason} ->
+                        require Logger
+
+                        Logger.error(
+                          "AshBilling.Deduplication: Failed to mark event #{inspect(event_id)} as :processed: #{inspect(reason)}"
+                        )
+
+                        {:error, reason}
+                    end
+
+                  true ->
+                    :ok
                 end
 
+              {:error, reason} ->
+                {:error, reason}
+
               _ ->
-                :ok
+                {:error, :not_found}
             end
         end
 
       :memory ->
-        insert_memory(event_id)
+        complete_memory(event_id, opts)
     end
   rescue
-    _ -> :ok
+    e -> {:error, e}
   end
 
   @doc """
@@ -238,15 +315,22 @@ defmodule AshBilling.Deduplication do
       :resource ->
         case resolve_resource(opts) do
           nil ->
-            delete_memory(event_id)
+            delete_memory(event_id, opts)
 
           resource ->
             domain = Keyword.get(opts, :domain)
             err_msg = Keyword.get(opts, :error)
+            lease_token = Keyword.get(opts, :lease_token)
 
             case Ash.get(resource, event_id, domain: domain, authorize?: false) do
               {:ok, record} when not is_nil(record) ->
+                current_token = Map.get(record, :lease_token)
+
                 cond do
+                  # Zombie worker protection: do not mark as failed if lease belongs to another worker
+                  lease_token != nil and current_token != nil and current_token != lease_token ->
+                    {:error, :lease_token_mismatch}
+
                   Ash.Resource.Info.attribute(resource, :status) != nil and
                       Ash.Resource.Info.action(resource, :update) != nil ->
                     update_attrs = %{
@@ -306,7 +390,7 @@ defmodule AshBilling.Deduplication do
         end
 
       :memory ->
-        delete_memory(event_id)
+        delete_memory(event_id, opts)
     end
   rescue
     e -> {:error, e}
@@ -362,9 +446,8 @@ defmodule AshBilling.Deduplication do
 
   def mark_processed(event_id, opts) when is_binary(event_id) do
     case acquire(event_id, opts) do
-      {:ok, :acquired} ->
-        complete(event_id, opts)
-        :ok
+      {:ok, lease_token} ->
+        complete(event_id, [lease_token: lease_token] ++ opts)
 
       {:error, already} when already in [:already_processed, :already_processing] ->
         :ok
@@ -416,29 +499,33 @@ defmodule AshBilling.Deduplication do
       Application.get_env(:ash_billing, :deduplication_resource)
   end
 
-  defp acquire_memory(event_id) do
+  defp acquire_memory(event_id, token \\ nil) do
+    token = token || generate_lease_token()
     now = System.system_time(:second)
 
-    if :ets.insert_new(@table, {event_id, :processing, now}) do
-      {:ok, :acquired}
+    if :ets.insert_new(@table, {event_id, :processing, now, token}) do
+      {:ok, token}
     else
       case :ets.lookup(@table, event_id) do
+        [{^event_id, :processed, _, _}] ->
+          {:error, :already_processed}
+
         [{^event_id, :processed, _}] ->
           {:error, :already_processed}
 
-        [{^event_id, :processing, inserted_at}] ->
+        [{^event_id, :processing, inserted_at, _current_token}] ->
           # If a lease is held longer than 60s without completing, allow atomic reclamation
           if now - inserted_at > 60 do
             ms = [
               {
-                {event_id, :processing, :"$1"},
+                {event_id, :processing, :"$1", :_},
                 [{:>, {:-, now, :"$1"}, 60}],
-                [{:const, {event_id, :processing, now}}]
+                [{:const, {event_id, :processing, now, token}}]
               }
             ]
 
             if :ets.select_replace(@table, ms) == 1 do
-              {:ok, :acquired}
+              {:ok, token}
             else
               {:error, :already_processing}
             end
@@ -446,59 +533,145 @@ defmodule AshBilling.Deduplication do
             {:error, :already_processing}
           end
 
-        [{^event_id, :failed, _}] ->
+        [{^event_id, :processing, inserted_at}] ->
+          if now - inserted_at > 60 do
+            ms = [
+              {
+                {event_id, :processing, :"$1"},
+                [{:>, {:-, now, :"$1"}, 60}],
+                [{:const, {event_id, :processing, now, token}}]
+              }
+            ]
+
+            if :ets.select_replace(@table, ms) == 1 do
+              {:ok, token}
+            else
+              {:error, :already_processing}
+            end
+          else
+            {:error, :already_processing}
+          end
+
+        [{^event_id, :failed, _, _}] ->
           # Previous attempt failed; atomically reclaim for retry
           ms = [
             {
-              {event_id, :failed, :_},
+              {event_id, :failed, :_, :_},
               [],
-              [{:const, {event_id, :processing, now}}]
+              [{:const, {event_id, :processing, now, token}}]
             }
           ]
 
           if :ets.select_replace(@table, ms) == 1 do
-            {:ok, :acquired}
+            {:ok, token}
           else
-            acquire_memory(event_id)
+            acquire_memory(event_id, token)
+          end
+
+        [{^event_id, :failed, _}] ->
+          ms = [
+            {
+              {event_id, :failed, :_},
+              [],
+              [{:const, {event_id, :processing, now, token}}]
+            }
+          ]
+
+          if :ets.select_replace(@table, ms) == 1 do
+            {:ok, token}
+          else
+            acquire_memory(event_id, token)
           end
 
         [{^event_id, _}] ->
           {:error, :already_processed}
 
         [] ->
-          acquire_memory(event_id)
+          acquire_memory(event_id, token)
       end
     end
   rescue
     e -> {:error, {:ets_error, e}}
   end
 
-  defp delete_memory(event_id) do
+  defp complete_memory(event_id, opts) do
+    lease_token = Keyword.get(opts, :lease_token)
     now = System.system_time(:second)
-    :ets.insert(@table, {event_id, :failed, now})
-    :ok
+
+    case :ets.lookup(@table, event_id) do
+      [{^event_id, :processing, _, current_token}] ->
+        if lease_token != nil and current_token != nil and current_token != lease_token do
+          {:error, :lease_token_mismatch}
+        else
+          :ets.insert(@table, {event_id, :processed, now, current_token})
+          :ok
+        end
+
+      [{^event_id, :processing, _}] ->
+        :ets.insert(@table, {event_id, :processed, now, lease_token})
+        :ok
+
+      [{^event_id, :processed, _, _}] ->
+        :ok
+
+      [{^event_id, :processed, _}] ->
+        :ok
+
+      [{^event_id, :failed, _, _}] ->
+        {:error, :lease_failed}
+
+      [{^event_id, :failed, _}] ->
+        {:error, :lease_failed}
+
+      [] ->
+        :ets.insert(@table, {event_id, :processed, now, lease_token})
+        :ok
+
+      _ ->
+        :ok
+    end
   rescue
-    _ -> :ok
+    e -> {:error, {:ets_error, e}}
+  end
+
+  defp delete_memory(event_id, opts) do
+    lease_token = Keyword.get(opts, :lease_token)
+    now = System.system_time(:second)
+
+    case :ets.lookup(@table, event_id) do
+      [{^event_id, :processing, _, current_token}] ->
+        if lease_token != nil and current_token != nil and current_token != lease_token do
+          {:error, :lease_token_mismatch}
+        else
+          :ets.insert(@table, {event_id, :failed, now, lease_token})
+          :ok
+        end
+
+      [{^event_id, :processing, _}] ->
+        :ets.insert(@table, {event_id, :failed, now, lease_token})
+        :ok
+
+      _ ->
+        :ets.insert(@table, {event_id, :failed, now, lease_token})
+        :ok
+    end
+  rescue
+    e -> {:error, {:ets_error, e}}
   end
 
   defp check_memory(event_id) do
     case :ets.lookup(@table, event_id) do
+      [{^event_id, :processed, _, _}] -> true
       [{^event_id, :processed, _}] -> true
+      [{^event_id, :processing, _, _}] -> false
       [{^event_id, :processing, _}] -> false
+      [{^event_id, :failed, _, _}] -> false
       [{^event_id, :failed, _}] -> false
       [{^event_id, _timestamp}] -> true
       [] -> false
     end
   rescue
     _ -> false
-  end
-
-  defp insert_memory(event_id) do
-    now = System.system_time(:second)
-    :ets.insert(@table, {event_id, :processed, now})
-    :ok
-  rescue
-    _ -> :ok
   end
 
   # Server Callbacks for ETS sweep
@@ -529,6 +702,7 @@ defmodule AshBilling.Deduplication do
     cutoff = System.system_time(:second) - @retention_seconds
 
     match_spec = [
+      {{:"$1", :"$2", :"$3", :"$4"}, [{:<, :"$3", cutoff}], [true]},
       {{:"$1", :"$2", :"$3"}, [{:<, :"$3", cutoff}], [true]},
       {{:"$1", :"$2"}, [{:<, :"$2", cutoff}], [true]}
     ]
