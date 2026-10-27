@@ -81,7 +81,7 @@ Alternatively, you can install it manually by adding `ash_billing` to your `mix.
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.2.0"}
+    {:ash_billing, "~> 0.2.1"}
   ]
 end
 ```
@@ -135,7 +135,7 @@ defmodule MyApp.Billing.Subscription do
 end
 ```
 
-The extension automatically manages attributes such as `:provider_subscription_id`, `:status`, `:price_id`, `:current_period_end`, and `:cancel_at_period_end`, and generates `:active?` and `:on_trial?` calculations.
+The extension automatically manages attributes such as `:provider_subscription_id`, `:status`, `:price_id`, `:current_period_end`, `:cancel_at_period_end`, and `:cancel_at`, and generates `:active?`, `:on_trial?`, and `:canceling?` calculations.
 
 ---
 

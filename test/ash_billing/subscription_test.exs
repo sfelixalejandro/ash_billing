@@ -30,13 +30,18 @@ defmodule AshBilling.SubscriptionTest do
       assert cancel_at_period_end.type == Ash.Type.Boolean
       assert cancel_at_period_end.default == false
 
+      cancel_at = Ash.Resource.Info.attribute(Subscription, :cancel_at)
+      assert cancel_at != nil
+      assert cancel_at.type == Ash.Type.UtcDatetimeUsec
+      assert cancel_at.allow_nil? == true
+
       trial_ends_at = Ash.Resource.Info.attribute(Subscription, :trial_ends_at)
       assert trial_ends_at != nil
       assert trial_ends_at.type == Ash.Type.UtcDatetimeUsec
       assert trial_ends_at.allow_nil? == true
     end
 
-    test "injects active? and on_trial? calculations into resource" do
+    test "injects active?, on_trial?, and canceling? calculations into resource" do
       calc = Ash.Resource.Info.calculation(Subscription, :active?)
       assert calc != nil
       assert calc.type == Ash.Type.Boolean
@@ -48,6 +53,12 @@ defmodule AshBilling.SubscriptionTest do
       assert trial_calc.type == Ash.Type.Boolean
       assert trial_calc.filterable? == true
       assert trial_calc.public? == true
+
+      canceling_calc = Ash.Resource.Info.calculation(Subscription, :canceling?)
+      assert canceling_calc != nil
+      assert canceling_calc.type == Ash.Type.Boolean
+      assert canceling_calc.filterable? == true
+      assert canceling_calc.public? == true
     end
 
     test "evaluates on_trial? and active? during trials" do
@@ -83,6 +94,47 @@ defmodule AshBilling.SubscriptionTest do
 
       assert {:ok, true} = Ash.calculate(sub_grace, :on_trial?)
       assert {:ok, true} = Ash.calculate(sub_grace, :active?)
+    end
+
+    test "evaluates canceling? calculation" do
+      future = DateTime.utc_now() |> DateTime.add(10, :day)
+      past = DateTime.utc_now() |> DateTime.add(-1, :day)
+
+      sub_normal = %Subscription{
+        provider_subscription_id: "sub_c_1",
+        status: :active,
+        cancel_at_period_end: false,
+        cancel_at: nil
+      }
+
+      assert {:ok, false} = Ash.calculate(sub_normal, :canceling?)
+
+      sub_period_end = %Subscription{
+        provider_subscription_id: "sub_c_2",
+        status: :active,
+        cancel_at_period_end: true,
+        cancel_at: nil
+      }
+
+      assert {:ok, true} = Ash.calculate(sub_period_end, :canceling?)
+
+      sub_future_cancel = %Subscription{
+        provider_subscription_id: "sub_c_3",
+        status: :active,
+        cancel_at_period_end: false,
+        cancel_at: future
+      }
+
+      assert {:ok, true} = Ash.calculate(sub_future_cancel, :canceling?)
+
+      sub_past_cancel = %Subscription{
+        provider_subscription_id: "sub_c_4",
+        status: :active,
+        cancel_at_period_end: false,
+        cancel_at: past
+      }
+
+      assert {:ok, false} = Ash.calculate(sub_past_cancel, :canceling?)
     end
 
     test "provides correct introspection helpers" do

@@ -102,6 +102,7 @@ defmodule AshBilling.WebhookSync do
       current_period_end = extract_current_period_end(object)
       trial_ends_at = extract_trial_ends_at(object)
       cancel_at_period_end = Map.get(object, "cancel_at_period_end", false)
+      cancel_at = extract_cancel_at(object)
       event_created = Keyword.get(opts, :event_created)
 
       event_dt =
@@ -131,6 +132,13 @@ defmodule AshBilling.WebhookSync do
             current_period_end: current_period_end,
             cancel_at_period_end: cancel_at_period_end
           }
+          |> then(fn a ->
+            if Ash.Resource.Info.attribute(subscription_resource, :cancel_at) != nil do
+              Map.put(a, :cancel_at, cancel_at)
+            else
+              a
+            end
+          end)
           |> then(fn a ->
             if Ash.Resource.Info.attribute(subscription_resource, :trial_ends_at) != nil do
               Map.put(a, :trial_ends_at, trial_ends_at)
@@ -344,6 +352,7 @@ defmodule AshBilling.WebhookSync do
         live_current_period_end = extract_current_period_end(live_sub)
         live_trial_ends_at = extract_trial_ends_at(live_sub)
         live_cancel_at_period_end = Map.get(live_sub, "cancel_at_period_end", false)
+        live_cancel_at = extract_cancel_at(live_sub)
 
         require Logger
 
@@ -357,6 +366,13 @@ defmodule AshBilling.WebhookSync do
           |> Map.put(:price_id, live_price_id)
           |> Map.put(:current_period_end, live_current_period_end)
           |> Map.put(:cancel_at_period_end, live_cancel_at_period_end)
+          |> then(fn a ->
+            if Ash.Resource.Info.attribute(subscription_resource, :cancel_at) != nil do
+              Map.put(a, :cancel_at, live_cancel_at)
+            else
+              a
+            end
+          end)
           |> then(fn a ->
             if Ash.Resource.Info.attribute(subscription_resource, :trial_ends_at) != nil do
               Map.put(a, :trial_ends_at, live_trial_ends_at)
@@ -584,6 +600,10 @@ defmodule AshBilling.WebhookSync do
     parse_unix_timestamp(ts)
   end
 
+  defp extract_cancel_at(object) do
+    parse_unix_timestamp(object["cancel_at"])
+  end
+
   defp terminal_status?(status)
        when status in [:canceled, "canceled", :incomplete_expired, "incomplete_expired"],
        do: true
@@ -622,7 +642,15 @@ defmodule AshBilling.WebhookSync do
               Map.get(existing, :cancel_at_period_end) != nil and
               existing.cancel_at_period_end != attrs[:cancel_at_period_end]
 
-          status_diff? or price_diff? or cancel_diff?
+          cancel_at_diff? =
+            case {Map.get(existing, :cancel_at), attrs[:cancel_at]} do
+              {%DateTime{} = d1, %DateTime{} = d2} -> DateTime.compare(d1, d2) != :eq
+              {nil, %DateTime{}} -> true
+              {%DateTime{}, nil} -> true
+              _ -> false
+            end
+
+          status_diff? or price_diff? or cancel_diff? or cancel_at_diff?
         else
           false
         end

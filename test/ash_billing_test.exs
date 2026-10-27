@@ -713,5 +713,29 @@ defmodule AshBillingTest do
       assert {:ok, %{"id" => "sub_map_1"}} =
                AshBilling.get_subscription(%{id: "sub_map_1"}, opts)
     end
+
+    test "canceling?/1 identifies period-end and future scheduled cancellations" do
+      future = DateTime.utc_now() |> DateTime.add(5, :day)
+      past = DateTime.utc_now() |> DateTime.add(-5, :day)
+
+      refute AshBilling.canceling?(nil)
+
+      refute AshBilling.canceling?(%{
+               status: :active,
+               cancel_at_period_end: false,
+               cancel_at: nil
+             })
+
+      refute AshBilling.canceling?(%{
+               status: :active,
+               cancel_at_period_end: false,
+               cancel_at: past
+             })
+
+      refute AshBilling.canceling?(%{other: :value})
+
+      assert AshBilling.canceling?(%{cancel_at_period_end: true})
+      assert AshBilling.canceling?(%{cancel_at_period_end: false, cancel_at: future})
+    end
   end
 end

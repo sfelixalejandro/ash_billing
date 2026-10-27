@@ -906,5 +906,109 @@ defmodule AshBilling.WebhookSyncTest do
       assert result_sub.price_id == "price_worker_b_newer"
       assert DateTime.compare(result_sub.last_event_created_at, t2_dt) == :eq
     end
+
+    test "synchronizes custom scheduled cancel_at timestamp from webhook" do
+      {:ok, _user} =
+        Ash.create(
+          User,
+          %{
+            email: "portal_cancel@example.com",
+            stripe_customer_id: "cus_portal_cancel"
+          },
+          domain: Domain
+        )
+
+      cancel_timestamp = 1_795_784_969
+      {:ok, expected_dt} = DateTime.from_unix(cancel_timestamp, :second)
+
+      event = %{
+        "id" => "evt_cancel_at_scheduled",
+        "type" => "customer.subscription.updated",
+        "created" => 1_700_000_000,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_portal_cancel_1",
+            "customer" => "cus_portal_cancel",
+            "status" => "active",
+            "cancel_at_period_end" => false,
+            "cancel_at" => cancel_timestamp,
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+          }
+        }
+      }
+
+      assert {:ok, sub} = WebhookSync.sync_event(event, @opts)
+      assert sub.status == :active
+      assert sub.cancel_at_period_end == false
+      assert sub.cancel_at != nil
+      assert DateTime.compare(sub.cancel_at, expected_dt) == :eq
+      assert AshBilling.canceling?(sub) == true
+    end
+
+    test "reconciliation extracts and updates cancel_at timestamp from live provider" do
+      stub_name = "cancel_at_reconcile_stub"
+      opts = Keyword.put(@opts, :req_options, plug: {Req.Test, stub_name}, retry: false)
+      t_unix = 1_735_689_600
+      {:ok, t_dt} = DateTime.from_unix(t_unix, :second)
+      cancel_ts = 1_795_784_969
+      {:ok, cancel_dt} = DateTime.from_unix(cancel_ts, :second)
+
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{
+            email: "reconcile_cancel_at@example.com",
+            stripe_customer_id: "cus_reconcile_cancel_at"
+          },
+          domain: Domain
+        )
+
+      {:ok, _existing} =
+        Ash.create(
+          Subscription,
+          %{
+            provider_subscription_id: "sub_same_sec_cancel_at",
+            status: :active,
+            user_id: user.id,
+            price_id: "price_pro",
+            cancel_at_period_end: false,
+            cancel_at: nil,
+            last_event_created_at: t_dt
+          },
+          domain: Domain
+        )
+
+      Req.Test.stub(stub_name, fn conn ->
+        Req.Test.json(conn, %{
+          "id" => "sub_same_sec_cancel_at",
+          "status" => "active",
+          "cancel_at_period_end" => false,
+          "cancel_at" => cancel_ts,
+          "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+        })
+      end)
+
+      # Incoming event arriving in the same second has divergent cancel_at -> triggers live reconciliation
+      event = %{
+        "id" => "evt_same_sec_cancel_at",
+        "type" => "customer.subscription.updated",
+        "created" => t_unix,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_same_sec_cancel_at",
+            "customer" => "cus_reconcile_cancel_at",
+            "status" => "active",
+            "cancel_at_period_end" => false,
+            "cancel_at" => cancel_ts,
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+          }
+        }
+      }
+
+      assert {:ok, reconciled_sub} = WebhookSync.sync_event(event, opts)
+      assert reconciled_sub.cancel_at != nil
+      assert DateTime.compare(reconciled_sub.cancel_at, cancel_dt) == :eq
+      assert AshBilling.canceling?(reconciled_sub) == true
+    end
   end
 end

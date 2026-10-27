@@ -25,7 +25,7 @@ Add `ash_billing` to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.2.0"}
+    {:ash_billing, "~> 0.2.1"}
   ]
 end
 ```
@@ -97,8 +97,8 @@ end
 ```
 
 `AshBilling.Subscription` automatically manages:
-- **Attributes**: `:provider_subscription_id`, `:status`, `:price_id`, `:current_period_end`, `:trial_ends_at`, `:cancel_at_period_end`.
-- **Calculations**: `:active?` (boolean, true if status is active, trialing, or past_due with remaining period) and `:on_trial?`.
+- **Attributes**: `:provider_subscription_id`, `:status`, `:price_id`, `:current_period_end`, `:trial_ends_at`, `:cancel_at_period_end`, `:cancel_at`.
+- **Calculations**: `:active?` (boolean, true if status is active, trialing, or past_due with remaining period), `:on_trial?`, and `:canceling?` (boolean, true if scheduled to cancel at period end or at a future timestamp).
 
 ---
 

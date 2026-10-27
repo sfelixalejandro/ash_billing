@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.2.1] - 2026-10-27
+
+### Added
+
+- **Scheduled Cancellation Tracking (`:cancel_at` & `:canceling?`)**:
+  - Injected `cancel_at: :utc_datetime_usec` attribute into `AshBilling.Subscription` extension, allowing applications to preserve and display exact future cancellation dates (such as cancellations scheduled from the modern Stripe Customer Portal).
+  - Injected `:canceling?` calculation into `AshBilling.Subscription` evaluating whether `cancel_at_period_end == true` or `cancel_at` is scheduled for a future timestamp (`cancel_at > now()`).
+  - Added public helper function `AshBilling.canceling?/1` supporting both loaded structs and raw maps.
+  - Extended `AshBilling.WebhookSync` to extract `cancel_at` from subscription payloads and authoritative live provider reconciliations.
+  - Added `cancel_at` conflict detection to `same_second_conflict?/3` to ensure divergent cancellation timestamps arriving in the same second trigger authoritative live provider reconciliation.
+
+---
+
 ## [v0.2.0] - 2026-10-27
 
 Production-grade hardening release delivering distributed multi-node deduplication, atomic conditional webhook synchronization, live provider conflict reconciliation, and distributed PostgreSQL contention testing.

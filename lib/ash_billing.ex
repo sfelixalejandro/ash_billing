@@ -371,6 +371,20 @@ defmodule AshBilling do
     not is_nil(subscription(record, price_id))
   end
 
+  @doc """
+  Checks if a subscription is scheduled for cancellation (either via `cancel_at_period_end: true`
+  or an unexpired future `cancel_at` timestamp).
+  """
+  @spec canceling?(struct() | map() | nil) :: boolean()
+  def canceling?(nil), do: false
+  def canceling?(%{cancel_at_period_end: true}), do: true
+
+  def canceling?(%{cancel_at: %DateTime{} = cancel_at}) do
+    DateTime.compare(cancel_at, DateTime.utc_now()) == :gt
+  end
+
+  def canceling?(_), do: false
+
   defp active_subscription?(%{status: status}) when status in [:active, "active"], do: true
 
   defp active_subscription?(%{status: status} = sub) when status in [:trialing, "trialing"] do
