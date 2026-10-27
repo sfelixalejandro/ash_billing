@@ -34,5 +34,6 @@ defmodule AshBilling.Subscription do
 
   use Spark.Dsl.Extension,
     sections: [@billing_subscription],
-    transformers: [AshBilling.Subscription.Transformers.AddSubscriptionAttributes]
+    transformers: [AshBilling.Subscription.Transformers.AddSubscriptionAttributes],
+    verifiers: [AshBilling.Subscription.Verifiers.VerifyCustomerRelationship]
 end

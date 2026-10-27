@@ -27,5 +27,13 @@ defmodule AshBilling.ResourceTest do
     test "provides correct provider introspection" do
       assert ResourceInfo.provider(User) == AshBilling.Providers.Stripe
     end
+
+    test "Spark DSL extension defines sections, transformers, and verifiers" do
+      assert is_list(AshBilling.Resource.sections())
+      assert is_list(AshBilling.Resource.transformers())
+      assert is_list(AshBilling.Resource.verifiers())
+
+      assert AshBilling.Resource.Verifiers.VerifyCustomerIdAttribute in AshBilling.Resource.verifiers()
+    end
   end
 end

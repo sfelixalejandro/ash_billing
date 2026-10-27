@@ -90,9 +90,12 @@ defmodule AshBilling.SubscriptionTest do
       assert SubscriptionInfo.customer_relationship(Subscription) == :user
     end
 
-    test "Spark DSL extension defines sections and transformers" do
+    test "Spark DSL extension defines sections, transformers, and verifiers" do
       assert is_list(AshBilling.Subscription.sections())
       assert is_list(AshBilling.Subscription.transformers())
+      assert is_list(AshBilling.Subscription.verifiers())
+
+      assert AshBilling.Subscription.Verifiers.VerifyCustomerRelationship in AshBilling.Subscription.verifiers()
     end
   end
 end

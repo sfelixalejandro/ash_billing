@@ -35,5 +35,6 @@ defmodule AshBilling.Resource do
 
   use Spark.Dsl.Extension,
     sections: [@billing],
-    transformers: [AshBilling.Resource.Transformers.AddCustomerIdAttribute]
+    transformers: [AshBilling.Resource.Transformers.AddCustomerIdAttribute],
+    verifiers: [AshBilling.Resource.Verifiers.VerifyCustomerIdAttribute]
 end
