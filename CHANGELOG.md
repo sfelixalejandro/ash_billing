@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.1.1] - 2026-10-27
+
+### Added
+
+- **Spark DSL Compile-Time Verifiers**:
+  - `AshBilling.Subscription.Verifiers.VerifyCustomerRelationship`: Validates at compile time that the relationship configured via `customer_relationship` actually exists on the resource.
+  - `AshBilling.Resource.Verifiers.VerifyCustomerIdAttribute`: Validates at compile time that custom `customer_id_attribute` types are string-compatible (`:string` or `:ci_string`).
+
+### Fixed
+
+- **Router and Igniter Option Consistency**:
+  - Standardized `customer_resource` option across `AshBilling.Plug`, `AshBilling.WebhookSync`, `Mix.Tasks.AshBilling.Install`, and all documentation.
+  - Added transparent backwards-compatible normalization for `:resource` in `AshBilling.Plug.init/1` and `AshBilling.WebhookSync.sync_event/2`.
+- **Test Resources and Multi-Version CI Stability**:
+  - Pruned unsupported actions on `AshBilling.Test.WebhookEvent` to ensure clean compile-time validation under `Ash.DataLayer.Ets` across Elixir 1.17 and 1.18.
+  - Refactored live Stripe integration test suites to provision dynamic test customers on Stripe instead of relying on static accounts.
+
+---
+
 ## [v0.1.0] - 2026-10-26
 
 Initial release of `ash_billing`: Declarative billing, subscription, and payment extensions for the Ash Framework.
