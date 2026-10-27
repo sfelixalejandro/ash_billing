@@ -60,7 +60,13 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
     if Resource.Info.calculation(state, :on_trial?) do
       {:ok, state}
     else
-      expr = Ash.Expr.expr(not is_nil(trial_ends_at) and trial_ends_at > now())
+      expr =
+        Ash.Expr.expr(
+          (status == :trialing and
+             (is_nil(trial_ends_at) or trial_ends_at > now())) or
+            (status == :past_due and
+               not is_nil(trial_ends_at) and trial_ends_at > now())
+        )
 
       calculation =
         Transformer.build_entity!(Resource.Dsl, [:calculations], :calculate,
@@ -81,8 +87,11 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
     else
       expr =
         Ash.Expr.expr(
-          status in [:active, :trialing] or
-            (not is_nil(trial_ends_at) and trial_ends_at > now())
+          status == :active or
+            (status == :trialing and
+               (is_nil(trial_ends_at) or trial_ends_at > now())) or
+            (status == :past_due and
+               not is_nil(trial_ends_at) and trial_ends_at > now())
         )
 
       calculation =

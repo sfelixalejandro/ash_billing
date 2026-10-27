@@ -68,8 +68,10 @@ defmodule AshBilling.Deduplication do
 
   @doc """
   Marks an event ID as processed.
+
+  Returns `:ok` on success or when already recorded, or `{:error, reason}` if persistence fails.
   """
-  @spec mark_processed(String.t() | nil, keyword()) :: :ok
+  @spec mark_processed(String.t() | nil, keyword()) :: :ok | {:error, term()}
   def mark_processed(event_id, opts \\ [])
   def mark_processed(nil, _opts), do: :ok
 
@@ -79,6 +81,7 @@ defmodule AshBilling.Deduplication do
         case resolve_resource(opts) do
           nil ->
             insert_memory(event_id)
+            :ok
 
           resource ->
             domain = Keyword.get(opts, :domain)
@@ -88,16 +91,37 @@ defmodule AshBilling.Deduplication do
               processed_at: DateTime.utc_now()
             }
 
-            Ash.create(resource, attrs, domain: domain, authorize?: false)
-            :ok
+            case Ash.create(resource, attrs, domain: domain, authorize?: false) do
+              {:ok, _record} ->
+                :ok
+
+              {:error, reason} ->
+                if duplicate_key_error?(reason) do
+                  :ok
+                else
+                  {:error, reason}
+                end
+            end
         end
 
       :memory ->
         insert_memory(event_id)
+        :ok
     end
   rescue
-    _ -> :ok
+    e -> {:error, e}
   end
+
+  defp duplicate_key_error?(%Ash.Error.Invalid{} = error) do
+    error_str = inspect(error)
+
+    String.contains?(error_str, "unique") or
+      String.contains?(error_str, "already exists") or
+      String.contains?(error_str, "already been taken") or
+      String.contains?(error_str, "duplicate")
+  end
+
+  defp duplicate_key_error?(_), do: false
 
   @doc """
   Clears all tracked events in memory (useful in tests).

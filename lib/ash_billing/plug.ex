@@ -90,19 +90,55 @@ defmodule AshBilling.Plug do
                      }}
 
                   _ ->
-                    if deduplicate?, do: AshBilling.Deduplication.mark_processed(event_id, opts)
+                    dedup_result =
+                      if deduplicate? do
+                        AshBilling.Deduplication.mark_processed(event_id, opts)
+                      else
+                        :ok
+                      end
 
-                    if is_atom(handler) and function_exported?(handler, :handle_event, 1) do
-                      handler.handle_event(event)
+                    case dedup_result do
+                      {:error, dedup_reason} when return_500? ->
+                        require Logger
+
+                        Logger.error(
+                          "AshBilling.Plug: Failed to record deduplication event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(dedup_reason)}. Returning HTTP 500."
+                        )
+
+                        resp_conn =
+                          conn
+                          |> put_resp_content_type("application/json")
+                          |> send_resp(
+                            500,
+                            Jason.encode!(%{
+                              error: "deduplication_failed",
+                              details: inspect(dedup_reason)
+                            })
+                          )
+                          |> halt()
+
+                        {resp_conn,
+                         %{
+                           status: :dedup_failed,
+                           event_id: event_id,
+                           event_type: event_type,
+                           error: dedup_reason
+                         }}
+
+                      _ ->
+                        if is_atom(handler) and function_exported?(handler, :handle_event, 1) do
+                          handler.handle_event(event)
+                        end
+
+                        resp_conn =
+                          conn
+                          |> put_resp_content_type("application/json")
+                          |> send_resp(200, ~s({"status":"received"}))
+                          |> halt()
+
+                        {resp_conn,
+                         %{status: :received, event_id: event_id, event_type: event_type}}
                     end
-
-                    resp_conn =
-                      conn
-                      |> put_resp_content_type("application/json")
-                      |> send_resp(200, ~s({"status":"received"}))
-                      |> halt()
-
-                    {resp_conn, %{status: :received, event_id: event_id, event_type: event_type}}
                 end
               end
 

@@ -50,5 +50,5 @@ jobs:
       - name: Compile with warnings as errors
         run: mix compile --warnings-as-errors
 
-      - name: Run test suite
-        run: mix test
+      - name: Run test suite with coverage
+        run: mix test --cover

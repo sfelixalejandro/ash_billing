@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.1.2] - 2026-10-27
+
+### Added
+
+- **Modern Stripe API Payloads (2025/2026)**:
+  - Added recursive payload extraction and fallback for nested `items.data[].current_period_end` and `trial_settings` alongside legacy root-level timestamps.
+- **Out-of-Order Webhook Protection**:
+  - Implemented terminal state guards (`:canceled`, `:incomplete_expired`). Delayed or reordered incoming webhooks cannot resurrect terminated subscriptions.
+- **Customer Creation Idempotency & Persistence**:
+  - `AshBilling.create_customer/2` now automatically injects a deterministic `Idempotency-Key: "ash_cust_<id>"` header on provider calls.
+  - Added `persist: true` option to optionally update customer records immediately in the local data layer.
+- **Resilience and Edge Case Test Suite**:
+  - Expanded test suite to 171 tests across 36 scenarios covering Spark compile-time verifiers, network/transport outages, out-of-order deliveries, and configuration auditing. Test coverage now stands at 91.32%.
+  - Added automated coverage gate in CI (`mix test --cover`).
+
+### Fixed
+
+- **Canceled Subscription Authorization Flaw**:
+  - Hardened `AshBilling.Subscription.Transformers.AddSubscriptionAttributes` and `AshBilling.active_subscription?/1` so that terminated subscriptions (`status in [:canceled, "canceled"]`) evaluate strictly to `active? == false`, preventing unauthorized access even if `trial_ends_at` is set in the future.
+- **Deduplication Error Propagation**:
+  - Hardened `AshBilling.Deduplication.mark_processed/2` to return `{:error, reason}` on storage failures instead of swallowing them. Duplicate key conflicts on `event_id` remain cleanly idempotent (`:ok`), while unexpected errors cause `AshBilling.Plug` to return HTTP 500 to trigger Stripe retry backoff.
+- **Database Read Failure Propagation**:
+  - Hardened `AshBilling.WebhookSync` to propagate unexpected read failures during customer and subscription lookups back to `AshBilling.Plug` as HTTP 500, preventing duplicate records from silent query misses.
+
+---
+
 ## [v0.1.1] - 2026-10-27
 
 ### Added

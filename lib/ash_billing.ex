@@ -46,7 +46,32 @@ defmodule AshBilling do
         })
         |> remove_nil_values()
 
-      provider.create_customer(params, opts)
+      opts =
+        if Map.get(record, :id) && !Keyword.has_key?(opts, :idempotency_key) do
+          Keyword.put(opts, :idempotency_key, "ash_cust_#{record.id}")
+        else
+          opts
+        end
+
+      with {:ok, customer_id} <- provider.create_customer(params, opts) do
+        persist? = Keyword.get(opts, :persist, Keyword.get(opts, :persist?, false))
+
+        if persist? and Ash.Resource.Info.resource?(resource) and has_update_action?(resource) do
+          attr = ResourceInfo.customer_id_attribute(resource)
+          domain = Keyword.get(opts, :domain, Ash.Resource.Info.domain(resource))
+          ash_opts = [domain: domain, authorize?: Keyword.get(opts, :authorize?, false)]
+
+          case Ash.update(record, %{attr => customer_id}, ash_opts) do
+            {:ok, _updated} ->
+              {:ok, customer_id}
+
+            {:error, reason} ->
+              {:error, {:persistence_failed, customer_id, reason}}
+          end
+        else
+          {:ok, customer_id}
+        end
+      end
     end
   end
 
@@ -317,7 +342,7 @@ defmodule AshBilling do
 
   def subscription(%{subscriptions: subscriptions}, price_id) when is_list(subscriptions) do
     Enum.find(subscriptions, fn sub ->
-      (active_status?(sub.status) or on_trial?(sub)) and
+      active_subscription?(sub) and
         (is_nil(price_id) or sub.price_id == price_id)
     end)
   end
@@ -327,7 +352,7 @@ defmodule AshBilling do
   @doc """
   Checks if a record has an active subscription.
 
-  Checks loaded subscriptions associated with the record for `:active` or `:trialing` status.
+  Checks loaded subscriptions associated with the record for `:active` or valid `:trialing` status.
   If a `price_id` is passed as the second argument, verifies that the subscription matches the price.
   """
   @spec subscribed?(struct(), String.t() | nil) :: boolean()
@@ -335,13 +360,24 @@ defmodule AshBilling do
     not is_nil(subscription(record, price_id))
   end
 
-  defp active_status?(status) when status in [:active, "active", :trialing, "trialing"], do: true
-  defp active_status?(_), do: false
+  defp active_subscription?(%{status: status}) when status in [:active, "active"], do: true
 
-  defp on_trial?(%{trial_ends_at: %DateTime{} = trial_ends_at}) do
+  defp active_subscription?(%{status: status} = sub) when status in [:trialing, "trialing"] do
+    on_trial?(sub)
+  end
+
+  defp active_subscription?(%{status: status} = sub) when status not in [:canceled, "canceled"] do
+    on_trial?(sub)
+  end
+
+  defp active_subscription?(_), do: false
+
+  defp on_trial?(%{status: status, trial_ends_at: %DateTime{} = trial_ends_at})
+       when status not in [:canceled, "canceled"] do
     DateTime.compare(trial_ends_at, DateTime.utc_now()) == :gt
   end
 
+  defp on_trial?(%{status: status}) when status in [:trialing, "trialing"], do: true
   defp on_trial?(_), do: false
 
   defp resolve_customer_id(%_resource{} = record), do: customer_id(record)
@@ -510,5 +546,12 @@ defmodule AshBilling do
       _ ->
         errors
     end
+  end
+
+  defp has_update_action?(resource) do
+    Ash.Resource.Info.primary_action(resource, :update) != nil or
+      Ash.Resource.Info.action(resource, :update) != nil
+  rescue
+    _ -> false
   end
 end

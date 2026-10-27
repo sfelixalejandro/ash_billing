@@ -262,7 +262,13 @@ defmodule AshBilling.Providers.Stripe do
 
     req_opts = Keyword.get(opts, :req_opts, [])
 
-    base_opts = [base_url: base_url]
+    idemp_header =
+      case Keyword.get(opts, :idempotency_key) do
+        nil -> []
+        key when is_binary(key) -> [{"idempotency-key", key}]
+      end
+
+    base_opts = [base_url: base_url, headers: idemp_header]
 
     base_opts =
       if api_key && api_key != "", do: [{:auth, {:bearer, api_key}} | base_opts], else: base_opts
