@@ -37,6 +37,12 @@ defmodule AshBilling.WebhookSync do
       subscription_resource: subscription_resource
     }
 
+    event_opts =
+      opts
+      |> Keyword.put(:event, event)
+      |> Keyword.put(:event_created, Map.get(event, "created"))
+      |> Keyword.put(:event_type, event_type)
+
     :telemetry.span([:ash_billing, :sync], start_meta, fn ->
       result =
         case event_type do
@@ -51,11 +57,11 @@ defmodule AshBilling.WebhookSync do
               customer_resource,
               subscription_resource,
               domain,
-              opts
+              event_opts
             )
 
           "checkout.session.completed" ->
-            sync_checkout_session(event["data"]["object"], customer_resource, domain, opts)
+            sync_checkout_session(event["data"]["object"], customer_resource, domain, event_opts)
 
           "customer.deleted" ->
             sync_customer_deleted(
@@ -63,7 +69,7 @@ defmodule AshBilling.WebhookSync do
               customer_resource,
               subscription_resource,
               domain,
-              opts
+              event_opts
             )
 
           _ ->
@@ -96,6 +102,22 @@ defmodule AshBilling.WebhookSync do
       current_period_end = extract_current_period_end(object)
       trial_ends_at = extract_trial_ends_at(object)
       cancel_at_period_end = Map.get(object, "cancel_at_period_end", false)
+      event_created = Keyword.get(opts, :event_created)
+
+      event_dt =
+        case event_created do
+          ts when is_integer(ts) ->
+            case DateTime.from_unix(ts) do
+              {:ok, dt} -> dt
+              _ -> nil
+            end
+
+          %DateTime{} = dt ->
+            dt
+
+          _ ->
+            nil
+        end
 
       ash_opts = ash_options(domain, opts)
 
@@ -110,8 +132,16 @@ defmodule AshBilling.WebhookSync do
             cancel_at_period_end: cancel_at_period_end
           }
           |> then(fn a ->
-            if Ash.Resource.Info.attribute(subscription_resource, :trial_ends_at) do
+            if Ash.Resource.Info.attribute(subscription_resource, :trial_ends_at) != nil do
               Map.put(a, :trial_ends_at, trial_ends_at)
+            else
+              a
+            end
+          end)
+          |> then(fn a ->
+            if Ash.Resource.Info.attribute(subscription_resource, :last_event_created_at) != nil and
+                 not is_nil(event_dt) do
+              Map.put(a, :last_event_created_at, event_dt)
             else
               a
             end
@@ -129,6 +159,39 @@ defmodule AshBilling.WebhookSync do
             )
 
             {:ok, existing}
+
+          # Out-of-order timestamp check:
+          # If recorded subscription has a newer event timestamp than the incoming event, ignore it.
+          existing && existing_event_newer?(existing, event_dt) ->
+            require Logger
+
+            Logger.warning(
+              "AshBilling.WebhookSync: Ignored older out-of-order event for subscription #{inspect(sub_id)}. Recorded event timestamp (#{inspect(existing.last_event_created_at)}) is newer than incoming event (#{inspect(event_dt)})."
+            )
+
+            {:ok, existing}
+
+          # Conflicting status transition protection:
+          # If transitioning backwards from :past_due / :unpaid to :active, reconcile with provider.
+          existing && conflicting_status_transition?(existing.status, status) ->
+            provider = Keyword.get(opts, :provider, AshBilling.Providers.Stripe)
+
+            case provider.get_subscription(sub_id, opts) do
+              {:ok, live_sub} when is_map(live_sub) ->
+                live_status = normalize_status(live_sub["status"])
+
+                require Logger
+
+                Logger.info(
+                  "AshBilling.WebhookSync: Reconciled conflicting status transition for subscription #{inspect(sub_id)} with provider. Authoritative live status: #{inspect(live_status)}"
+                )
+
+                attrs = Map.put(attrs, :status, live_status)
+                Ash.update(existing, attrs, ash_opts)
+
+              _ ->
+                Ash.update(existing, attrs, ash_opts)
+            end
 
           existing ->
             Ash.update(existing, attrs, ash_opts)
@@ -365,6 +428,21 @@ defmodule AshBilling.WebhookSync do
        do: true
 
   defp terminal_status?(_), do: false
+
+  defp existing_event_newer?(existing, incoming_dt) do
+    case {Map.get(existing, :last_event_created_at), incoming_dt} do
+      {%DateTime{} = existing_dt, %DateTime{} = in_dt} ->
+        DateTime.compare(in_dt, existing_dt) == :lt
+
+      _ ->
+        false
+    end
+  end
+
+  defp conflicting_status_transition?(current_status, new_status) do
+    current_status in [:past_due, "past_due", :unpaid, "unpaid"] and
+      new_status in [:active, "active", :trialing, "trialing"]
+  end
 
   defp ash_options(domain, opts) do
     base = [domain: domain, authorize?: Keyword.get(opts, :authorize?, false)]

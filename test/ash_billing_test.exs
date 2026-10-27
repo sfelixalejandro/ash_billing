@@ -518,13 +518,13 @@ defmodule AshBillingTest do
 
       user_on_trial = %User{
         subscriptions: [
-          %{status: :incomplete, price_id: "price_trial_plan", trial_ends_at: future}
+          %{status: :trialing, price_id: "price_trial_plan", trial_ends_at: future}
         ]
       }
 
       user_expired_trial = %User{
         subscriptions: [
-          %{status: :incomplete, price_id: "price_trial_plan", trial_ends_at: past}
+          %{status: :trialing, price_id: "price_trial_plan", trial_ends_at: past}
         ]
       }
 

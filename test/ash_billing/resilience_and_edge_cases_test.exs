@@ -645,4 +645,345 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
       assert {:error, _} = AshBilling.Providers.Stripe.swap_plan("sub_1", "price_new", opts)
     end
   end
+
+  describe "Stripe Multiple v1 Signatures & Secret Rotation" do
+    test "verifies webhook when multiple v1 signatures are present during secret rotation" do
+      secret = "whsec_primary_secret_key"
+      old_secret = "whsec_deprecated_secret_key"
+      timestamp = System.system_time(:second)
+      payload = ~s({"id":"evt_sig_rot_1","type":"customer.subscription.updated"})
+
+      signed_payload = "#{timestamp}.#{payload}"
+
+      old_sig =
+        :crypto.mac(:hmac, :sha256, old_secret, signed_payload)
+        |> Base.encode16(case: :lower)
+
+      new_sig =
+        :crypto.mac(:hmac, :sha256, secret, signed_payload)
+        |> Base.encode16(case: :lower)
+
+      # Header with multiple v1 signatures (both old and new)
+      sig_header = "t=#{timestamp},v1=#{old_sig},v1=#{new_sig}"
+
+      assert {:ok, %{"id" => "evt_sig_rot_1"}} =
+               AshBilling.Providers.Stripe.verify_webhook(payload, sig_header, secret)
+
+      # Fails if none of the signatures match
+      bad_header = "t=#{timestamp},v1=invalid_one,v1=invalid_two"
+
+      assert {:error, :invalid_signature} =
+               AshBilling.Providers.Stripe.verify_webhook(payload, bad_header, secret)
+    end
+  end
+
+  describe "Atomic Deduplication Lease (acquire, complete, release)" do
+    test "acquire locks the lease and prevents concurrent duplicate execution in memory" do
+      event_id = "evt_atomic_mem_#{System.unique_integer([:positive])}"
+
+      assert {:ok, :acquired} = Deduplication.acquire(event_id, deduplication_strategy: :memory)
+
+      # Second concurrent acquire fails
+      assert {:error, status} = Deduplication.acquire(event_id, deduplication_strategy: :memory)
+      assert status in [:already_processing, :already_processed]
+
+      # Complete marks processed
+      assert :ok = Deduplication.complete(event_id, deduplication_strategy: :memory)
+      assert Deduplication.processed?(event_id, deduplication_strategy: :memory) == true
+
+      # Release deletes lease so retry is possible
+      assert :ok = Deduplication.release(event_id, deduplication_strategy: :memory)
+      assert Deduplication.processed?(event_id, deduplication_strategy: :memory) == false
+      assert {:ok, :acquired} = Deduplication.acquire(event_id, deduplication_strategy: :memory)
+    end
+
+    test "acquire locks the lease and enforces uniqueness across database resource" do
+      event_id = "evt_atomic_res_#{System.unique_integer([:positive])}"
+
+      opts = [
+        deduplication_strategy: :resource,
+        deduplication_resource: WebhookEvent,
+        domain: Domain
+      ]
+
+      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+
+      # Second acquire fails due to primary key conflict
+      assert {:error, :already_processed} = Deduplication.acquire(event_id, opts)
+
+      # Release deletes record on failure
+      assert :ok = Deduplication.release(event_id, opts)
+      assert Deduplication.processed?(event_id, opts) == false
+      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+    end
+  end
+
+  describe "Custom Handler Error Propagation & Re-tryability" do
+    defmodule FailingHandler do
+      def handle_event(%{"id" => "evt_fail_then_succeed"}) do
+        {:error, :external_service_down}
+      end
+
+      def handle_event(%{"id" => "evt_raise_then_succeed"}) do
+        raise "unexpected crash in handler"
+      end
+
+      def handle_event(_), do: :ok
+    end
+
+    defmodule RecoveredHandler do
+      def handle_event(_), do: :ok
+    end
+
+    test "returns HTTP 500 and releases deduplication lease when custom handler returns error or raises" do
+      secret = "whsec_handler_test"
+      timestamp = System.system_time(:second)
+      payload = ~s({"id":"evt_fail_then_succeed","type":"customer.subscription.created"})
+
+      sig =
+        :crypto.mac(:hmac, :sha256, secret, "#{timestamp}.#{payload}")
+        |> Base.encode16(case: :lower)
+
+      plug_opts =
+        BillingPlug.init(
+          webhook_secret: secret,
+          handler: FailingHandler,
+          customer_resource: User,
+          subscription_resource: Subscription,
+          domain: Domain
+        )
+
+      conn =
+        Plug.Test.conn(:post, "/webhooks/stripe", payload)
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+        |> Plug.Conn.put_req_header("stripe-signature", "t=#{timestamp},v1=#{sig}")
+        |> BillingPlug.call(plug_opts)
+
+      assert conn.status == 500
+      assert conn.resp_body =~ "handler_failed"
+
+      # Verify lease was released: next retry with working handler succeeds
+      plug_opts_recovered =
+        BillingPlug.init(
+          webhook_secret: secret,
+          handler: RecoveredHandler,
+          customer_resource: User,
+          subscription_resource: Subscription,
+          domain: Domain
+        )
+
+      conn_retry =
+        Plug.Test.conn(:post, "/webhooks/stripe", payload)
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+        |> Plug.Conn.put_req_header("stripe-signature", "t=#{timestamp},v1=#{sig}")
+        |> BillingPlug.call(plug_opts_recovered)
+
+      assert conn_retry.status == 200
+      assert conn_retry.resp_body =~ "received"
+    end
+  end
+
+  describe "Advanced Out-of-Order Webhook Protection and Timestamp Ordering" do
+    test "ignores older webhook event when subscription has recorded newer event timestamp" do
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{
+          email: "older_event_user@example.com",
+          stripe_customer_id: "cus_older_order_1"
+        })
+        |> Ash.create!(domain: Domain)
+
+      newer_dt = DateTime.utc_now()
+      older_unix = DateTime.to_unix(newer_dt) - 3600
+
+      _sub =
+        Subscription
+        |> Ash.Changeset.for_create(:create, %{
+          provider_subscription_id: "sub_timestamp_test_1",
+          status: :active,
+          price_id: "price_pro",
+          user_id: user.id,
+          last_event_created_at: newer_dt
+        })
+        |> Ash.create!(domain: Domain)
+
+      # Incoming older event created 1 hour prior with past_due status
+      older_event = %{
+        "id" => "evt_older_order_1",
+        "created" => older_unix,
+        "type" => "customer.subscription.updated",
+        "data" => %{
+          "object" => %{
+            "id" => "sub_timestamp_test_1",
+            "customer" => "cus_older_order_1",
+            "status" => "past_due",
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+          }
+        }
+      }
+
+      assert {:ok, %Subscription{} = result_sub} = WebhookSync.sync_event(older_event, @opts)
+      # Status remains :active because incoming event is older
+      assert result_sub.status == :active
+    end
+
+    test "reconciles conflicting status transition with provider" do
+      stub_name = "reconcile_conflict_stub"
+
+      Req.Test.stub(stub_name, fn conn ->
+        Req.Test.json(conn, %{
+          "id" => "sub_conflict_recon_1",
+          "status" => "past_due",
+          "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+        })
+      end)
+
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{
+          email: "conflict_user@example.com",
+          stripe_customer_id: "cus_conflict_recon_1"
+        })
+        |> Ash.create!(domain: Domain)
+
+      Subscription
+      |> Ash.Changeset.for_create(:create, %{
+        provider_subscription_id: "sub_conflict_recon_1",
+        status: :past_due,
+        price_id: "price_pro",
+        user_id: user.id
+      })
+      |> Ash.create!(domain: Domain)
+
+      # Incoming webhook falsely claiming status is active
+      conflicting_event = %{
+        "id" => "evt_conflict_1",
+        "type" => "customer.subscription.updated",
+        "data" => %{
+          "object" => %{
+            "id" => "sub_conflict_recon_1",
+            "customer" => "cus_conflict_recon_1",
+            "status" => "active",
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+          }
+        }
+      }
+
+      opts = [
+        customer_resource: User,
+        subscription_resource: Subscription,
+        domain: Domain,
+        api_key: "sk_test_1",
+        req_opts: [plug: {Req.Test, stub_name}]
+      ]
+
+      assert {:ok, sub} = WebhookSync.sync_event(conflicting_event, opts)
+      # Preserves :past_due because provider authoritative live status was :past_due
+      assert sub.status == :past_due
+    end
+  end
+
+  describe "DSL and API Parity (Unpaid, Incomplete, Canceled with Future Trial Dates)" do
+    test "verifies :unpaid, :incomplete, and :canceled are not active even with future trial dates" do
+      future = DateTime.utc_now() |> DateTime.add(7, :day)
+
+      for bad_status <- [:canceled, :unpaid, :incomplete, :incomplete_expired, :paused] do
+        user = %User{
+          subscriptions: [
+            %{status: bad_status, price_id: "p1", trial_ends_at: future}
+          ]
+        }
+
+        assert AshBilling.subscribed?(user) == false
+        assert AshBilling.subscription(user) == nil
+      end
+    end
+
+    test "create_customer defaults to persisting persisted user records" do
+      stub_name = "persist_default_stub"
+
+      Req.Test.stub(stub_name, fn conn ->
+        Req.Test.json(conn, %{"id" => "cus_default_persisted_999"})
+      end)
+
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{
+          email: "auto_persist@example.com",
+          name: "Auto Persist User"
+        })
+        |> Ash.create!(domain: Domain)
+
+      opts = [
+        req_opts: [plug: {Req.Test, stub_name}],
+        api_key: "sk_test_123",
+        domain: Domain
+      ]
+
+      assert {:ok, "cus_default_persisted_999"} = AshBilling.create_customer(user, opts)
+
+      # Verify the user in the database was updated automatically
+      reloaded = Ash.get!(User, user.id, domain: Domain)
+      assert reloaded.stripe_customer_id == "cus_default_persisted_999"
+
+      # Also test with persist: false
+      assert {:ok, "cus_default_persisted_999"} =
+               AshBilling.create_customer(user, [persist: false] ++ opts)
+    end
+
+    test "handles trial and edge-case subscription helpers" do
+      user_nil_trial = %User{subscriptions: [%{status: :trialing, trial_ends_at: nil}]}
+      assert AshBilling.subscribed?(user_nil_trial) == true
+
+      future = DateTime.utc_now() |> DateTime.add(2, :day)
+      user_past_due_trial = %User{subscriptions: [%{status: :past_due, trial_ends_at: future}]}
+      assert AshBilling.subscribed?(user_past_due_trial) == true
+
+      # Deduplication nil & fallback branches
+      assert Deduplication.acquire(nil) == {:ok, :acquired}
+      assert Deduplication.complete(nil) == :ok
+      assert Deduplication.release(nil) == :ok
+      assert Deduplication.release("evt_missing", deduplication_strategy: :resource) == :ok
+
+      assert Deduplication.release("evt_missing_db",
+               deduplication_strategy: :resource,
+               deduplication_resource: WebhookEvent,
+               domain: Domain
+             ) == :ok
+
+      # Reclaim stale lease in memory (> 60s)
+      :ets.insert(
+        :ash_billing_processed_events,
+        {"evt_stale_lease", :processing, System.system_time(:second) - 70}
+      )
+
+      assert {:ok, :acquired} =
+               Deduplication.acquire("evt_stale_lease", deduplication_strategy: :memory)
+
+      # Legacy 2-tuple handling
+      :ets.insert(
+        :ash_billing_processed_events,
+        {"evt_legacy_2tuple", System.system_time(:second)}
+      )
+
+      assert {:error, :already_processed} =
+               Deduplication.acquire("evt_legacy_2tuple", deduplication_strategy: :memory)
+
+      # WebhookSync direct customer string and atom status
+      dt_event = %{
+        "id" => "evt_dt_test",
+        "created" => DateTime.utc_now(),
+        "type" => "customer.subscription.created",
+        "data" => %{
+          "object" => %{
+            "id" => "sub_dt_test_1",
+            "customer" => "cus_direct_str_id",
+            "status" => :paused
+          }
+        }
+      }
+
+      assert {:ok, _} = WebhookSync.sync_event(dt_event, @opts)
+    end
+  end
 end

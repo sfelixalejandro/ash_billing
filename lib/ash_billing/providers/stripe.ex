@@ -183,9 +183,9 @@ defmodule AshBilling.Providers.Stripe do
     tolerance = Keyword.get(opts, :tolerance, @default_tolerance)
 
     with {:ok, header} when is_binary(header) <- extract_signature_header(signature_header),
-         {:ok, timestamp, signature} <- parse_header(header),
+         {:ok, timestamp, signatures} <- parse_header(header),
          :ok <- verify_timestamp(timestamp, tolerance),
-         :ok <- verify_signature(payload, timestamp, signature, secret),
+         :ok <- verify_signature(payload, timestamp, signatures, secret),
          {:ok, event} <- Jason.decode(payload) do
       {:ok, event}
     else
@@ -199,17 +199,26 @@ defmodule AshBilling.Providers.Stripe do
   defp extract_signature_header(header) when is_binary(header), do: {:ok, header}
 
   defp parse_header(header) do
-    parts =
+    parsed =
       header
       |> String.split(",")
       |> Enum.map(&String.split(&1, "=", parts: 2))
       |> Enum.filter(fn parts -> length(parts) == 2 end)
-      |> Map.new(fn [k, v] -> {String.trim(k), String.trim(v)} end)
+      |> Enum.map(fn [k, v] -> {String.trim(k), String.trim(v)} end)
 
-    case {Map.get(parts, "t"), Map.get(parts, "v1")} do
-      {t, v1} when is_binary(t) and is_binary(v1) ->
+    timestamp_str =
+      Enum.find_value(parsed, fn
+        {"t", v} -> v
+        _ -> nil
+      end)
+
+    v1_signatures =
+      for {"v1", sig} <- parsed, do: sig
+
+    case {timestamp_str, v1_signatures} do
+      {t, [_ | _] = sigs} when is_binary(t) ->
         case Integer.parse(t) do
-          {timestamp, ""} -> {:ok, timestamp, v1}
+          {timestamp, ""} -> {:ok, timestamp, sigs}
           _ -> {:error, :invalid_timestamp_in_header}
         end
 
@@ -228,19 +237,28 @@ defmodule AshBilling.Providers.Stripe do
     end
   end
 
-  defp verify_signature(payload, timestamp, signature, secret) do
+  defp verify_signature(payload, timestamp, signatures, secret) when is_list(signatures) do
     signed_payload = "#{timestamp}.#{payload}"
 
     expected_signature =
       :crypto.mac(:hmac, :sha256, secret, signed_payload)
       |> Base.encode16(case: :lower)
 
-    if byte_size(expected_signature) == byte_size(signature) and
-         :crypto.hash_equals(expected_signature, signature) do
+    matched? =
+      Enum.any?(signatures, fn signature ->
+        byte_size(expected_signature) == byte_size(signature) and
+          :crypto.hash_equals(expected_signature, signature)
+      end)
+
+    if matched? do
       :ok
     else
       {:error, :invalid_signature}
     end
+  end
+
+  defp verify_signature(payload, timestamp, signature, secret) when is_binary(signature) do
+    verify_signature(payload, timestamp, [signature], secret)
   end
 
   defp build_req(opts) do

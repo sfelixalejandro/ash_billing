@@ -54,9 +54,18 @@ defmodule AshBilling do
         end
 
       with {:ok, customer_id} <- provider.create_customer(params, opts) do
-        persist? = Keyword.get(opts, :persist, Keyword.get(opts, :persist?, false))
+        persist_opt = Keyword.get(opts, :persist, Keyword.get(opts, :persist?))
 
-        if persist? and Ash.Resource.Info.resource?(resource) and has_update_action?(resource) do
+        should_persist? =
+          cond do
+            persist_opt == false -> false
+            persist_opt == true -> true
+            persisted_record?(record) -> true
+            true -> false
+          end
+
+        if should_persist? and Ash.Resource.Info.resource?(resource) and
+             has_update_action?(resource) do
           attr = ResourceInfo.customer_id_attribute(resource)
           domain = Keyword.get(opts, :domain, Ash.Resource.Info.domain(resource))
           ash_opts = [domain: domain, authorize?: Keyword.get(opts, :authorize?, false)]
@@ -366,19 +375,29 @@ defmodule AshBilling do
     on_trial?(sub)
   end
 
-  defp active_subscription?(%{status: status} = sub) when status not in [:canceled, "canceled"] do
+  defp active_subscription?(%{status: status} = sub) when status in [:past_due, "past_due"] do
     on_trial?(sub)
   end
 
   defp active_subscription?(_), do: false
 
   defp on_trial?(%{status: status, trial_ends_at: %DateTime{} = trial_ends_at})
-       when status not in [:canceled, "canceled"] do
+       when status in [:trialing, "trialing", :past_due, "past_due"] do
     DateTime.compare(trial_ends_at, DateTime.utc_now()) == :gt
   end
 
-  defp on_trial?(%{status: status}) when status in [:trialing, "trialing"], do: true
+  defp on_trial?(%{status: status, trial_ends_at: nil})
+       when status in [:trialing, "trialing"],
+       do: true
+
+  defp on_trial?(%{status: status})
+       when status in [:trialing, "trialing"],
+       do: true
+
   defp on_trial?(_), do: false
+
+  defp persisted_record?(%_resource{__meta__: %{state: :loaded}}), do: true
+  defp persisted_record?(_), do: false
 
   defp resolve_customer_id(%_resource{} = record), do: customer_id(record)
   defp resolve_customer_id(id) when is_binary(id), do: id

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.1.3] - 2026-10-27
+
+### Added
+
+- **Atomic Deduplication Leases**:
+  - Implemented `AshBilling.Deduplication.acquire/2`, `complete/2`, and `release/2`. Uses unique primary key insertion for `:resource` and `:ets.insert_new` for `:memory` to guarantee strictly single-worker execution across concurrent requests and clustered nodes.
+- **Multiple Stripe `v1` Signature Verification**:
+  - `AshBilling.Providers.Stripe.verify_webhook/4` now parses and validates all `v1` signatures present in `Stripe-Signature` headers using constant-time comparison, allowing zero-downtime webhook secret rotation.
+- **Webhook Timestamp Ordering & Live Stripe Reconciliation**:
+  - Injected `last_event_created_at` timestamp tracking into `AshBilling.Subscription` DSL. Incoming webhooks older than the recorded event are safely rejected.
+  - Added live status reconciliation against Stripe (`provider.get_subscription/2`) to resolve backward or conflicting status transitions (e.g. from `:past_due` to `:active`).
+- **Automatic Customer Persistence by Default**:
+  - `AshBilling.create_customer/2` now automatically persists generated provider customer IDs onto loaded Ash customer records by default.
+
+### Fixed
+
+- **Custom Handler Failure & Retry Safety**:
+  - In `AshBilling.Plug`, custom handlers now run inside the deduplication transaction pipeline. Handlers returning `{:error, reason}` or raising exceptions now trigger lease release and return HTTP 500 so Stripe automatically retries.
+- **DSL and Public API Authorization Parity**:
+  - Unified evaluation rules across `AshBilling.active_subscription?/1`, `AshBilling.on_trial?/1`, and the DSL calculation `active?`. Terminated or incomplete states (`:unpaid`, `:incomplete`, `:incomplete_expired`, `:canceled`, `:paused`) are strictly prevented from evaluating to active, even when future `trial_ends_at` timestamps exist.
+
+---
+
 ## [v0.1.2] - 2026-10-27
 
 ### Added
