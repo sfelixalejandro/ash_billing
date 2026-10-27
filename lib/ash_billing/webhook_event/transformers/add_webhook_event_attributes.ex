@@ -7,6 +7,11 @@ defmodule AshBilling.WebhookEvent.Transformers.AddWebhookEventAttributes do
   @impl true
   def before?(Resource.Transformers.DefaultAccept), do: true
   def before?(Resource.Transformers.ValidateRelationshipAttributes), do: true
+  def before?(Resource.Transformers.CachePrimaryKey), do: true
+  def before?(Resource.Transformers.CacheUniqueKeys), do: true
+  def before?(Resource.Transformers.AttributesByName), do: true
+  def before?(Resource.Transformers.CacheActionInputs), do: true
+  def before?(Resource.Transformers.SetPrimaryActions), do: true
   def before?(_), do: false
 
   @impl true

@@ -20,7 +20,15 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
   ]
 
   setup do
+    Application.delete_env(:ash_billing, :deduplication_strategy)
+    Application.delete_env(:ash_billing, :deduplication_resource)
     Deduplication.clear()
+
+    on_exit(fn ->
+      Application.delete_env(:ash_billing, :deduplication_strategy)
+      Application.delete_env(:ash_billing, :deduplication_resource)
+    end)
+
     :ok
   end
 

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.1.4] - 2026-10-27
+
+### Fixed
+
+- **Spark DSL Transformer Topological Ordering for WebhookEvent**:
+  - Declared explicit transformer ordering constraints (`before?`) for `AshBilling.WebhookEvent.Transformers.AddWebhookEventAttributes`, ensuring it executes ahead of `Ash.Resource.Transformers.CachePrimaryKey`, `CacheUniqueKeys`, `AttributesByName`, and `CacheActionInputs`. Guarantees consistent primary key caching across all compiler environments and Elixir versions.
+- **Deduplication Error Predicate Generalization**:
+  - Relaxed `duplicate_key_error?/1` predicate to match standard uniqueness and constraint error descriptors across PostgreSQL, MySQL, SQLite, and ETS data layers.
+- **Application Environment Test Isolation**:
+  - Ensured deterministic test isolation by resetting `Application` environment keys in ExUnit `setup` and `on_exit` handlers.
+
+---
+
 ## [v0.1.3] - 2026-10-27
 
 ### Added

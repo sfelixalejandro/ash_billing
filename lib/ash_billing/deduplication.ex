@@ -197,16 +197,15 @@ defmodule AshBilling.Deduplication do
     end
   end
 
-  defp duplicate_key_error?(%Ash.Error.Invalid{} = error) do
+  defp duplicate_key_error?(error) do
     error_str = inspect(error)
 
     String.contains?(error_str, "unique") or
       String.contains?(error_str, "already exists") or
       String.contains?(error_str, "already been taken") or
-      String.contains?(error_str, "duplicate")
+      String.contains?(error_str, "duplicate") or
+      String.contains?(error_str, "constraint")
   end
-
-  defp duplicate_key_error?(_), do: false
 
   @doc """
   Clears all tracked events in memory (useful in tests).

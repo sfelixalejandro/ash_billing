@@ -1,7 +1,7 @@
 defmodule AshBilling.MixProject do
   use Mix.Project
 
-  @version "0.1.3"
+  @version "0.1.4"
   @description "Declarative billing, subscriptions, and payment providers for the Ash Framework."
   @source_url "https://github.com/sfelixalejandro/ash_billing"
 

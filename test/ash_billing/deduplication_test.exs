@@ -7,7 +7,15 @@ defmodule AshBilling.DeduplicationTest do
   alias AshBilling.Test.{Domain, WebhookEvent}
 
   setup do
+    Application.delete_env(:ash_billing, :deduplication_strategy)
+    Application.delete_env(:ash_billing, :deduplication_resource)
     Deduplication.clear()
+
+    on_exit(fn ->
+      Application.delete_env(:ash_billing, :deduplication_strategy)
+      Application.delete_env(:ash_billing, :deduplication_resource)
+    end)
+
     :ok
   end
 
@@ -47,6 +55,7 @@ defmodule AshBilling.DeduplicationTest do
       # Test application env config
       Application.put_env(:ash_billing, :deduplication_strategy, :memory)
       assert Deduplication.processed?(event_id)
+      Application.delete_env(:ash_billing, :deduplication_strategy)
     end
 
     test "sweep removes entries older than 24h" do
