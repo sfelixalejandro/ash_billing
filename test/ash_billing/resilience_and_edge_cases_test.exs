@@ -625,7 +625,8 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
         |> Plug.Conn.put_req_header("stripe-signature", "t=1,v1=abc")
         |> BillingPlug.call(BillingPlug.init(webhook_secret: nil, customer_resource: User))
 
-      assert conn.status == 400
+      assert conn.status == 500
+      assert conn.resp_body =~ "unconfigured_webhook_secret"
     end
   end
 
@@ -716,10 +717,15 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
 
       assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
 
-      # Second acquire fails due to primary key conflict
+      # Second acquire fails because event is actively being processed
+      assert {:error, status} = Deduplication.acquire(event_id, opts)
+      assert status in [:already_processing, :already_processed]
+
+      # Complete marks processed
+      assert :ok = Deduplication.complete(event_id, opts)
       assert {:error, :already_processed} = Deduplication.acquire(event_id, opts)
 
-      # Release deletes record on failure
+      # Release transitions lease so retry is possible
       assert :ok = Deduplication.release(event_id, opts)
       assert Deduplication.processed?(event_id, opts) == false
       assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
@@ -992,6 +998,181 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
       }
 
       assert {:ok, _} = WebhookSync.sync_event(dt_event, @opts)
+    end
+
+    test "AshBilling.create_customer/1 supports default opts" do
+      # Test calling create_customer with only 1 argument when customer ID already exists
+      user_existing = %User{
+        id: Ash.UUID.generate(),
+        email: "existing_cust@example.com",
+        stripe_customer_id: "cus_existing_default_123"
+      }
+
+      assert {:ok, "cus_existing_default_123"} = AshBilling.create_customer(user_existing)
+
+      stub_name = "create_cust_default_opts_stub"
+
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(%{"id" => "cus_default_opts_123"}))
+      end)
+
+      user = %User{id: Ash.UUID.generate(), email: "default_opts@example.com"}
+
+      assert {:ok, "cus_default_opts_123"} =
+               AshBilling.create_customer(user,
+                 req_options: [plug: {Req.Test, stub_name}, retry: false],
+                 persist: false,
+                 api_key: "sk_test_dummy"
+               )
+    end
+
+    test "Stripe.verify_webhook fails closed with empty or nil secret" do
+      payload = ~s({"id":"evt_sec_test"})
+      sig = "t=1700000000,v1=abcdef"
+
+      assert {:error, :missing_webhook_secret} =
+               AshBilling.Providers.Stripe.verify_webhook(payload, sig, nil)
+
+      assert {:error, :missing_webhook_secret} =
+               AshBilling.Providers.Stripe.verify_webhook(payload, sig, "")
+    end
+
+    test "Plug fails closed when webhook secret is unconfigured or empty" do
+      conn_nil =
+        Plug.Test.conn(:post, "/webhooks/stripe", ~s({"id":"evt_nil_sec"}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+        |> Plug.Conn.put_req_header("stripe-signature", "t=1700000000,v1=abc")
+        |> BillingPlug.call(BillingPlug.init(webhook_secret: nil))
+
+      assert conn_nil.status == 500
+      assert conn_nil.resp_body =~ "unconfigured_webhook_secret"
+
+      conn_empty =
+        Plug.Test.conn(:post, "/webhooks/stripe", ~s({"id":"evt_empty_sec"}))
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+        |> Plug.Conn.put_req_header("stripe-signature", "t=1700000000,v1=abc")
+        |> BillingPlug.call(BillingPlug.init(webhook_secret: ""))
+
+      assert conn_empty.status == 500
+      assert conn_empty.resp_body =~ "unconfigured_webhook_secret"
+    end
+
+    test "WebhookEvent database lifecycle: processing -> failed -> retry -> processed and lease recovery" do
+      event_id = "evt_lifecycle_#{System.unique_integer([:positive])}"
+      opts = [deduplication_resource: WebhookEvent, domain: Domain]
+
+      # Step 1: Initial acquisition sets :processing
+      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      assert {:ok, record} = Ash.get(WebhookEvent, event_id, domain: Domain, authorize?: false)
+      assert record.status == :processing
+      assert record.attempts == 1
+
+      # Concurrent worker attempting to acquire gets :already_processing
+      assert {:error, :already_processing} = Deduplication.acquire(event_id, opts)
+
+      # Step 2: Processing fails, release with error transitions to :failed
+      assert :ok = Deduplication.release(event_id, [error: :external_timeout] ++ opts)
+
+      assert {:ok, failed_record} =
+               Ash.get(WebhookEvent, event_id, domain: Domain, authorize?: false)
+
+      assert failed_record.status == :failed
+      assert failed_record.error =~ "external_timeout"
+
+      # Step 3: Provider retry re-acquires successfully, increments attempts
+      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+
+      assert {:ok, retried_record} =
+               Ash.get(WebhookEvent, event_id, domain: Domain, authorize?: false)
+
+      assert retried_record.status == :processing
+      assert retried_record.attempts == 2
+
+      # Step 4: Stale lease reclamation (> 60s)
+      stale_dt = DateTime.utc_now() |> DateTime.add(-75, :second)
+
+      {:ok, stale_record} =
+        Ash.update(retried_record, %{last_attempt_at: stale_dt},
+          domain: Domain,
+          authorize?: false
+        )
+
+      assert stale_record.status == :processing
+
+      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+
+      # Step 5: Successful completion marks :processed
+      assert :ok = Deduplication.complete(event_id, opts)
+
+      assert {:ok, completed_record} =
+               Ash.get(WebhookEvent, event_id, domain: Domain, authorize?: false)
+
+      assert completed_record.status == :processed
+
+      # Subsequent deliveries are recognized as duplicate
+      assert {:error, :already_processed} = Deduplication.acquire(event_id, opts)
+      assert Deduplication.processed?(event_id, opts) == true
+    end
+
+    test "WebhookSync fails safely and requests retry when conflicting live reconciliation fails" do
+      stub_name = "reconcile_fail_stub"
+
+      # Stub provider get_subscription returning 500 error
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          500,
+          Jason.encode!(%{"error" => %{"message" => "Stripe API Down"}})
+        )
+      end)
+
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{
+          email: "recon_fail@example.com",
+          stripe_customer_id: "cus_recon_fail"
+        })
+        |> Ash.create!(domain: Domain, authorize?: false)
+
+      sub =
+        Subscription
+        |> Ash.Changeset.for_create(:create, %{
+          user_id: user.id,
+          provider_subscription_id: "sub_recon_fail_1",
+          status: :past_due,
+          price_id: "price_pro"
+        })
+        |> Ash.create!(domain: Domain, authorize?: false)
+
+      # Incoming webhook claims status is active (conflicting backwards transition)
+      event = %{
+        "id" => "evt_recon_fail",
+        "type" => "customer.subscription.updated",
+        "data" => %{
+          "object" => %{
+            "id" => "sub_recon_fail_1",
+            "customer" => "cus_recon_fail",
+            "status" => "active"
+          }
+        }
+      }
+
+      opts = [
+        customer_resource: User,
+        subscription_resource: Subscription,
+        domain: Domain,
+        req_options: [plug: {Req.Test, stub_name}, retry: false]
+      ]
+
+      # Sync MUST fail with {:error, {:reconciliation_failed, _}} rather than corrupting DB with stale data
+      assert {:error, {:reconciliation_failed, _}} = WebhookSync.sync_event(event, opts)
+
+      # Ensure database status was NOT mutated to active
+      persisted = Ash.get!(Subscription, sub.id, domain: Domain, authorize?: false)
+      assert persisted.status == :past_due
     end
   end
 end

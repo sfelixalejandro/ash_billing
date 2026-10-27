@@ -27,6 +27,8 @@ defmodule AshBilling do
   """
   @spec create_customer(struct() | map(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
+  def create_customer(record_or_params, opts \\ [])
+
   def create_customer(%resource{} = record, opts) do
     provider = Keyword.get(opts, :provider, ResourceInfo.provider(resource))
     existing_id = customer_id(record)
@@ -473,44 +475,52 @@ defmodule AshBilling do
   defp check_customer_resource(errors, nil), do: errors
 
   defp check_customer_resource(errors, res) do
-    attr = ResourceInfo.customer_id_attribute(res)
+    if is_atom(res) and Spark.Dsl.is?(res, Ash.Resource) do
+      attr = ResourceInfo.customer_id_attribute(res)
 
-    errors =
-      if Ash.Resource.Info.attribute(res, attr) do
+      errors =
+        if Ash.Resource.Info.attribute(res, attr) do
+          errors
+        else
+          ["Customer resource #{inspect(res)} is missing attribute #{inspect(attr)}" | errors]
+        end
+
+      if Ash.Resource.Info.relationship(res, :subscriptions) do
         errors
       else
-        ["Customer resource #{inspect(res)} is missing attribute #{inspect(attr)}" | errors]
+        ["Customer resource #{inspect(res)} is missing :subscriptions relationship" | errors]
       end
-
-    if Ash.Resource.Info.relationship(res, :subscriptions) do
-      errors
     else
-      ["Customer resource #{inspect(res)} is missing :subscriptions relationship" | errors]
+      ["Customer resource #{inspect(res)} is not a valid Ash.Resource" | errors]
     end
   end
 
   defp check_subscription_resource(errors, nil), do: errors
 
   defp check_subscription_resource(errors, res) do
-    required_attrs = [:provider_subscription_id, :status, :price_id]
+    if is_atom(res) and Spark.Dsl.is?(res, Ash.Resource) do
+      required_attrs = [:provider_subscription_id, :status, :price_id]
 
-    missing_attrs =
-      Enum.reject(required_attrs, fn a -> Ash.Resource.Info.attribute(res, a) != nil end)
+      missing_attrs =
+        Enum.reject(required_attrs, fn a -> Ash.Resource.Info.attribute(res, a) != nil end)
 
-    errors =
-      if missing_attrs == [] do
+      errors =
+        if missing_attrs == [] do
+          errors
+        else
+          [
+            "Subscription resource #{inspect(res)} is missing required attributes: #{inspect(missing_attrs)}"
+            | errors
+          ]
+        end
+
+      if Ash.Resource.Info.calculation(res, :active?) do
         errors
       else
-        [
-          "Subscription resource #{inspect(res)} is missing required attributes: #{inspect(missing_attrs)}"
-          | errors
-        ]
+        ["Subscription resource #{inspect(res)} is missing :active? calculation" | errors]
       end
-
-    if Ash.Resource.Info.calculation(res, :active?) do
-      errors
     else
-      ["Subscription resource #{inspect(res)} is missing :active? calculation" | errors]
+      ["Subscription resource #{inspect(res)} is not a valid Ash.Resource" | errors]
     end
   end
 

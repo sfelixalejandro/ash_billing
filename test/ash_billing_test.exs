@@ -52,6 +52,20 @@ defmodule AshBillingTest do
       assert {:ok, "cus_raw_map_99"} =
                AshBilling.create_customer(%{email: "raw@example.com", name: "Raw Map"}, opts)
     end
+
+    test "respects explicit idempotency_key in opts", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        assert Plug.Conn.get_req_header(conn, "idempotency-key") == ["custom_idemp_key_1"]
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(%{"id" => "cus_idemp_1"}))
+      end)
+
+      user = %User{id: Ash.UUID.generate(), email: "idemp@example.com"}
+      opts_with_idemp = Keyword.put(opts, :idempotency_key, "custom_idemp_key_1")
+      assert {:ok, "cus_idemp_1"} = AshBilling.create_customer(user, opts_with_idemp)
+    end
   end
 
   describe "create_checkout_session/2" do
@@ -536,6 +550,135 @@ defmodule AshBillingTest do
     test "returns false when subscriptions relationship is not loaded" do
       user = %User{}
       assert AshBilling.subscribed?(user) == false
+    end
+  end
+
+  describe "subscription management delegators" do
+    test "get_subscription/2 delegator", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        Req.Test.json(conn, %{"id" => "sub_del_1", "status" => "active"})
+      end)
+
+      assert {:ok, %{"id" => "sub_del_1"}} = AshBilling.get_subscription("sub_del_1", opts)
+    end
+
+    test "cancel_subscription/2 delegator", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        Req.Test.json(conn, %{"id" => "sub_del_1", "cancel_at_period_end" => true})
+      end)
+
+      assert {:ok, %{"cancel_at_period_end" => true}} =
+               AshBilling.cancel_subscription("sub_del_1", opts)
+    end
+
+    test "resume_subscription/2 delegator", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        Req.Test.json(conn, %{"id" => "sub_del_1", "cancel_at_period_end" => false})
+      end)
+
+      assert {:ok, %{"cancel_at_period_end" => false}} =
+               AshBilling.resume_subscription("sub_del_1", opts)
+    end
+
+    test "swap_plan/3 delegator", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        case conn.method do
+          "GET" ->
+            Req.Test.json(conn, %{
+              "id" => "sub_del_1",
+              "items" => %{"data" => [%{"id" => "si_del_1", "price" => %{"id" => "price_old"}}]}
+            })
+
+          "POST" ->
+            Req.Test.json(conn, %{"id" => "sub_del_1", "status" => "active"})
+        end
+      end)
+
+      assert {:ok, %{"id" => "sub_del_1"}} = AshBilling.swap_plan("sub_del_1", "price_new", opts)
+    end
+
+    test "update_quantity/3 delegator with and without price_id", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        case conn.method do
+          "GET" ->
+            Req.Test.json(conn, %{
+              "id" => "sub_del_1",
+              "items" => %{"data" => [%{"id" => "si_del_1", "price" => %{"id" => "price_known"}}]}
+            })
+
+          "POST" ->
+            Req.Test.json(conn, %{"id" => "sub_del_1", "status" => "active"})
+        end
+      end)
+
+      # without price_id
+      assert {:ok, %{"id" => "sub_del_1"}} = AshBilling.update_quantity("sub_del_1", 5, opts)
+
+      # with price_id
+      assert {:ok, %{"id" => "sub_del_1"}} =
+               AshBilling.update_quantity(
+                 "sub_del_1",
+                 10,
+                 Keyword.put(opts, :price_id, "price_known")
+               )
+    end
+  end
+
+  describe "check_configuration/1 and verify_configuration!/1" do
+    test "validates proper configuration" do
+      valid_opts = [
+        customer_resource: AshBilling.Test.User,
+        subscription_resource: AshBilling.Test.Subscription,
+        api_key: "sk_test_1234567890abcdef",
+        webhook_secret: "whsec_1234567890abcdef"
+      ]
+
+      assert {:ok, %{status: :valid}} = AshBilling.check_configuration(valid_opts)
+      assert :ok = AshBilling.verify_configuration!(valid_opts)
+    end
+
+    test "detects misconfigurations and raises on verify_configuration!" do
+      invalid_opts = [
+        customer_resource: AshBilling.Test.NotResource,
+        api_key: "invalid_prefix",
+        webhook_secret: "invalid_secret"
+      ]
+
+      assert {:error, errors} = AshBilling.check_configuration(invalid_opts)
+      assert length(errors) >= 2
+
+      assert_raise ArgumentError, ~r/AshBilling configuration verification failed/, fn ->
+        AshBilling.verify_configuration!(invalid_opts)
+      end
+    end
+
+    test "check_configuration/0 with default opts returns valid when no resources specified" do
+      assert {:ok, %{status: :valid}} = AshBilling.check_configuration([])
+    end
+
+    test "subscription helper utilities: active? with past_due and resolve_subscription_id with map",
+         %{
+           stub_name: stub_name,
+           opts: opts
+         } do
+      user_past_due = %User{
+        subscriptions: [
+          %{status: :past_due, trial_ends_at: nil}
+        ]
+      }
+
+      refute AshBilling.subscribed?(user_past_due)
+
+      Req.Test.stub(stub_name, fn conn ->
+        Req.Test.json(conn, %{"id" => "sub_map_1", "status" => "active"})
+      end)
+
+      # resolves id from map
+      assert {:ok, %{"id" => "sub_map_1"}} =
+               AshBilling.get_subscription(%{id: "sub_map_1"}, opts)
     end
   end
 end

@@ -26,84 +26,57 @@ defmodule AshBilling.Plug do
   @impl true
   def call(conn, opts) do
     provider = Keyword.get(opts, :provider, AshBilling.Providers.Stripe)
-    secret = resolve_secret(Keyword.get(opts, :webhook_secret))
     handler = Keyword.get(opts, :handler)
 
-    :telemetry.span([:ash_billing, :webhook], %{conn: conn, provider: provider}, fn ->
-      case read_raw_body(conn, opts) do
-        {:ok, raw_body, conn} ->
-          signature_header = get_req_header(conn, "stripe-signature") |> List.first()
+    case resolve_secret(Keyword.get(opts, :webhook_secret)) do
+      {:error, :missing_webhook_secret} ->
+        require Logger
 
-          case provider.verify_webhook(raw_body, signature_header, secret, opts) do
-            {:ok, event} ->
-              event_id = Map.get(event, "id")
-              event_type = Map.get(event, "type")
-              deduplicate? = Keyword.get(opts, :deduplicate?, true)
-              return_500? = Keyword.get(opts, :return_500_on_sync_error, true)
+        Logger.error(
+          "AshBilling.Plug: Webhook secret is not configured or is empty. Rejecting incoming webhook to prevent unauthorized access."
+        )
 
-              dedup_status =
-                if deduplicate? do
-                  AshBilling.Deduplication.acquire(event_id, opts)
-                else
-                  {:ok, :acquired}
-                end
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(500, Jason.encode!(%{error: "unconfigured_webhook_secret"}))
+        |> halt()
 
-              case dedup_status do
-                {:error, already} when already in [:already_processed, :already_processing] ->
-                  resp_conn =
-                    conn
-                    |> put_resp_content_type("application/json")
-                    |> send_resp(200, Jason.encode!(%{status: to_string(already)}))
-                    |> halt()
+      {:ok, secret} ->
+        :telemetry.span([:ash_billing, :webhook], %{conn: conn, provider: provider}, fn ->
+          case read_raw_body(conn, opts) do
+            {:ok, raw_body, conn} ->
+              signature_header = get_req_header(conn, "stripe-signature") |> List.first()
 
-                  {resp_conn, %{status: already, event_id: event_id, event_type: event_type}}
+              case provider.verify_webhook(raw_body, signature_header, secret, opts) do
+                {:ok, event} ->
+                  event_id = Map.get(event, "id")
+                  event_type = Map.get(event, "type")
+                  deduplicate? = Keyword.get(opts, :deduplicate?, true)
+                  return_500? = Keyword.get(opts, :return_500_on_sync_error, true)
 
-                {:error, dedup_reason} when return_500? ->
-                  require Logger
-
-                  Logger.error(
-                    "AshBilling.Plug: Failed to acquire deduplication lease for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(dedup_reason)}. Returning HTTP 500."
-                  )
-
-                  resp_conn =
-                    conn
-                    |> put_resp_content_type("application/json")
-                    |> send_resp(
-                      500,
-                      Jason.encode!(%{
-                        error: "deduplication_failed",
-                        details: inspect(dedup_reason)
-                      })
-                    )
-                    |> halt()
-
-                  {resp_conn,
-                   %{
-                     status: :dedup_failed,
-                     event_id: event_id,
-                     event_type: event_type,
-                     error: dedup_reason
-                   }}
-
-                {:ok, :acquired} ->
-                  sync_result =
-                    if Keyword.has_key?(opts, :subscription_resource) or
-                         Keyword.has_key?(opts, :customer_resource) or
-                         Keyword.has_key?(opts, :resource) do
-                      AshBilling.WebhookSync.sync_event(event, opts)
+                  dedup_status =
+                    if deduplicate? do
+                      AshBilling.Deduplication.acquire(event_id, opts)
                     else
-                      {:ok, :not_configured}
+                      {:ok, :acquired}
                     end
 
-                  case sync_result do
-                    {:error, reason} when return_500? ->
+                  case dedup_status do
+                    {:error, already} when already in [:already_processed, :already_processing] ->
+                      resp_conn =
+                        conn
+                        |> put_resp_content_type("application/json")
+                        |> send_resp(200, Jason.encode!(%{status: to_string(already)}))
+                        |> halt()
+
+                      {resp_conn, %{status: already, event_id: event_id, event_type: event_type}}
+
+                    {:error, dedup_reason} when return_500? ->
                       require Logger
 
                       Logger.error(
-                        "AshBilling.Plug: Webhook synchronization failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(reason)}. Releasing lease. Returning HTTP 500 to trigger Stripe retry."
+                        "AshBilling.Plug: Failed to acquire deduplication lease for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(dedup_reason)}. Returning HTTP 500."
                       )
-
-                      if deduplicate?, do: AshBilling.Deduplication.release(event_id, opts)
 
                       resp_conn =
                         conn
@@ -111,43 +84,41 @@ defmodule AshBilling.Plug do
                         |> send_resp(
                           500,
                           Jason.encode!(%{
-                            error: "synchronization_failed",
-                            details: inspect(reason)
+                            error: "deduplication_failed",
+                            details: inspect(dedup_reason)
                           })
                         )
                         |> halt()
 
                       {resp_conn,
                        %{
-                         status: :sync_failed,
+                         status: :dedup_failed,
                          event_id: event_id,
                          event_type: event_type,
-                         error: reason
+                         error: dedup_reason
                        }}
 
-                    _ ->
-                      handler_result =
-                        if is_atom(handler) and function_exported?(handler, :handle_event, 1) do
-                          try do
-                            handler.handle_event(event)
-                          rescue
-                            e -> {:error, e}
-                          catch
-                            kind, reason -> {:error, {kind, reason}}
-                          end
+                    {:ok, :acquired} ->
+                      sync_result =
+                        if Keyword.has_key?(opts, :subscription_resource) or
+                             Keyword.has_key?(opts, :customer_resource) or
+                             Keyword.has_key?(opts, :resource) do
+                          AshBilling.WebhookSync.sync_event(event, opts)
                         else
-                          :ok
+                          {:ok, :not_configured}
                         end
 
-                      case handler_result do
-                        {:error, handler_reason} when return_500? ->
+                      case sync_result do
+                        {:error, reason} when return_500? ->
                           require Logger
 
                           Logger.error(
-                            "AshBilling.Plug: Custom handler #{inspect(handler)} failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(handler_reason)}. Releasing lease and returning HTTP 500 to trigger retry."
+                            "AshBilling.Plug: Webhook synchronization failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(reason)}. Releasing lease. Returning HTTP 500 to trigger Stripe retry."
                           )
 
-                          if deduplicate?, do: AshBilling.Deduplication.release(event_id, opts)
+                          if deduplicate? do
+                            AshBilling.Deduplication.release(event_id, [error: reason] ++ opts)
+                          end
 
                           resp_conn =
                             conn
@@ -155,33 +126,93 @@ defmodule AshBilling.Plug do
                             |> send_resp(
                               500,
                               Jason.encode!(%{
-                                error: "handler_failed",
-                                details: inspect(handler_reason)
+                                error: "synchronization_failed",
+                                details: inspect(reason)
                               })
                             )
                             |> halt()
 
                           {resp_conn,
                            %{
-                             status: :handler_failed,
+                             status: :sync_failed,
                              event_id: event_id,
                              event_type: event_type,
-                             error: handler_reason
+                             error: reason
                            }}
 
                         _ ->
-                          if deduplicate?, do: AshBilling.Deduplication.complete(event_id, opts)
+                          handler_result =
+                            if is_atom(handler) and function_exported?(handler, :handle_event, 1) do
+                              try do
+                                handler.handle_event(event)
+                              rescue
+                                e -> {:error, e}
+                              catch
+                                kind, reason -> {:error, {kind, reason}}
+                              end
+                            else
+                              :ok
+                            end
 
-                          resp_conn =
-                            conn
-                            |> put_resp_content_type("application/json")
-                            |> send_resp(200, ~s({"status":"received"}))
-                            |> halt()
+                          case handler_result do
+                            {:error, handler_reason} when return_500? ->
+                              require Logger
 
-                          {resp_conn,
-                           %{status: :received, event_id: event_id, event_type: event_type}}
+                              Logger.error(
+                                "AshBilling.Plug: Custom handler #{inspect(handler)} failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(handler_reason)}. Releasing lease and returning HTTP 500 to trigger retry."
+                              )
+
+                              if deduplicate? do
+                                AshBilling.Deduplication.release(
+                                  event_id,
+                                  [error: handler_reason] ++ opts
+                                )
+                              end
+
+                              resp_conn =
+                                conn
+                                |> put_resp_content_type("application/json")
+                                |> send_resp(
+                                  500,
+                                  Jason.encode!(%{
+                                    error: "handler_failed",
+                                    details: inspect(handler_reason)
+                                  })
+                                )
+                                |> halt()
+
+                              {resp_conn,
+                               %{
+                                 status: :handler_failed,
+                                 event_id: event_id,
+                                 event_type: event_type,
+                                 error: handler_reason
+                               }}
+
+                            _ ->
+                              if deduplicate?,
+                                do: AshBilling.Deduplication.complete(event_id, opts)
+
+                              resp_conn =
+                                conn
+                                |> put_resp_content_type("application/json")
+                                |> send_resp(200, ~s({"status":"received"}))
+                                |> halt()
+
+                              {resp_conn,
+                               %{status: :received, event_id: event_id, event_type: event_type}}
+                          end
                       end
                   end
+
+                {:error, reason} ->
+                  resp_conn =
+                    conn
+                    |> put_resp_content_type("application/json")
+                    |> send_resp(400, Jason.encode!(%{error: to_string(reason)}))
+                    |> halt()
+
+                  {resp_conn, %{status: :error, error: reason}}
               end
 
             {:error, reason} ->
@@ -193,17 +224,8 @@ defmodule AshBilling.Plug do
 
               {resp_conn, %{status: :error, error: reason}}
           end
-
-        {:error, reason} ->
-          resp_conn =
-            conn
-            |> put_resp_content_type("application/json")
-            |> send_resp(400, Jason.encode!(%{error: to_string(reason)}))
-            |> halt()
-
-          {resp_conn, %{status: :error, error: reason}}
-      end
-    end)
+        end)
+    end
   end
 
   defp read_raw_body(%{assigns: %{raw_body: body}} = conn, _opts) when is_binary(body) do
@@ -221,10 +243,23 @@ defmodule AshBilling.Plug do
   end
 
   defp resolve_secret({module, function, args}) when is_atom(module) and is_atom(function) do
-    apply(module, function, args)
+    case apply(module, function, args) do
+      secret when is_binary(secret) and byte_size(secret) > 0 -> {:ok, secret}
+      _ -> {:error, :missing_webhook_secret}
+    end
+  rescue
+    _ -> {:error, :missing_webhook_secret}
   end
 
-  defp resolve_secret(fun) when is_function(fun, 0), do: fun.()
-  defp resolve_secret(secret) when is_binary(secret), do: secret
-  defp resolve_secret(_), do: ""
+  defp resolve_secret(fun) when is_function(fun, 0) do
+    case fun.() do
+      secret when is_binary(secret) and byte_size(secret) > 0 -> {:ok, secret}
+      _ -> {:error, :missing_webhook_secret}
+    end
+  rescue
+    _ -> {:error, :missing_webhook_secret}
+  end
+
+  defp resolve_secret(secret) when is_binary(secret) and byte_size(secret) > 0, do: {:ok, secret}
+  defp resolve_secret(_), do: {:error, :missing_webhook_secret}
 end

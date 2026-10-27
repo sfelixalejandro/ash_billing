@@ -182,7 +182,8 @@ defmodule AshBilling.Providers.Stripe do
   def verify_webhook(payload, signature_header, secret, opts \\ []) do
     tolerance = Keyword.get(opts, :tolerance, @default_tolerance)
 
-    with {:ok, header} when is_binary(header) <- extract_signature_header(signature_header),
+    with :ok <- validate_secret(secret),
+         {:ok, header} when is_binary(header) <- extract_signature_header(signature_header),
          {:ok, timestamp, signatures} <- parse_header(header),
          :ok <- verify_timestamp(timestamp, tolerance),
          :ok <- verify_signature(payload, timestamp, signatures, secret),
@@ -194,6 +195,9 @@ defmodule AshBilling.Providers.Stripe do
   end
 
   # Helpers
+
+  defp validate_secret(secret) when is_binary(secret) and byte_size(secret) > 0, do: :ok
+  defp validate_secret(_), do: {:error, :missing_webhook_secret}
 
   defp extract_signature_header(nil), do: {:error, :missing_signature_header}
   defp extract_signature_header(header) when is_binary(header), do: {:ok, header}
@@ -278,7 +282,7 @@ defmodule AshBilling.Providers.Stripe do
       )
       |> resolve_key()
 
-    req_opts = Keyword.get(opts, :req_opts, [])
+    req_opts = Keyword.get(opts, :req_opts) || Keyword.get(opts, :req_options) || []
 
     idemp_header =
       case Keyword.get(opts, :idempotency_key) do

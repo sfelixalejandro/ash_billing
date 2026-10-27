@@ -150,5 +150,103 @@ defmodule AshBilling.DeduplicationTest do
       assert :ok = Deduplication.mark_processed(event_id, opts)
       assert Deduplication.processed?(event_id, opts)
     end
+
+    test "supports simple resource without status attribute and destroys on release" do
+      alias AshBilling.Test.SimpleEvent
+
+      opts = [
+        deduplication_strategy: :resource,
+        deduplication_resource: SimpleEvent,
+        domain: Domain
+      ]
+
+      event_id = "evt_simple_res_99"
+
+      refute Deduplication.processed?(event_id, opts)
+      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      assert {:error, :already_processed} = Deduplication.acquire(event_id, opts)
+      assert Deduplication.processed?(event_id, opts) == true
+
+      # Releasing lease on resource without status falls back to destroy
+      assert :ok = Deduplication.release(event_id, opts)
+      refute Deduplication.processed?(event_id, opts)
+    end
+
+    test "handles memory lifecycle: processing, failed, and expired lease reclamation" do
+      event_id = "evt_mem_lifecycle_#{System.unique_integer([:positive])}"
+      opts = [deduplication_strategy: :memory]
+
+      # 1. Acquire puts event in :processing
+      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+      refute Deduplication.processed?(event_id, opts)
+      assert {:error, :already_processing} = Deduplication.acquire(event_id, opts)
+
+      # 2. Release marks event as :failed
+      assert :ok = Deduplication.release(event_id, opts)
+      refute Deduplication.processed?(event_id, opts)
+
+      # 3. Re-acquire succeeds from :failed
+      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+
+      # 4. Expired lease (> 60s) is reclaimed
+      table = :ash_billing_processed_events
+      now = System.system_time(:second)
+      :ets.insert(table, {event_id, :processing, now - 100})
+      assert {:ok, :acquired} = Deduplication.acquire(event_id, opts)
+
+      # 5. Complete marks event as :processed
+      assert :ok = Deduplication.complete(event_id, opts)
+      assert Deduplication.processed?(event_id, opts) == true
+      assert {:error, :already_processed} = Deduplication.acquire(event_id, opts)
+    end
+
+    test "resource deduplication edge cases: missing record, simple event complete, and read-only resource" do
+      alias AshBilling.Test.{ReadOnlyEvent, SimpleEvent, WebhookEvent}
+
+      opts_webhook = [
+        deduplication_strategy: :resource,
+        deduplication_resource: WebhookEvent,
+        domain: Domain
+      ]
+
+      # Complete and release for non-existent record in resource strategy return :ok safely
+      assert :ok = Deduplication.complete("evt_not_in_db_123", opts_webhook)
+      assert :ok = Deduplication.release("evt_not_in_db_123", opts_webhook)
+
+      # Complete on SimpleEvent (resource without status)
+      opts_simple = [
+        deduplication_strategy: :resource,
+        deduplication_resource: SimpleEvent,
+        domain: Domain
+      ]
+
+      assert {:ok, :acquired} = Deduplication.acquire("evt_simple_comp_1", opts_simple)
+      assert :ok = Deduplication.complete("evt_simple_comp_1", opts_simple)
+
+      # Release on ReadOnlyEvent (lacks both update and destroy actions)
+      opts_ro = [
+        deduplication_strategy: :resource,
+        deduplication_resource: ReadOnlyEvent,
+        domain: Domain
+      ]
+
+      assert {:ok, :acquired} = Deduplication.acquire("evt_readonly_1", opts_ro)
+      assert {:error, :cannot_release_lease} = Deduplication.release("evt_readonly_1", opts_ro)
+    end
+
+    test "handles nil event_id gracefully across all operations" do
+      assert :ok = Deduplication.release(nil)
+      assert :ok = Deduplication.complete(nil)
+      assert :ok = Deduplication.mark_processed(nil)
+      refute Deduplication.processed?(nil)
+    end
+
+    test "handles ETS periodic sweep message" do
+      pid = Process.whereis(AshBilling.Deduplication)
+      assert is_pid(pid)
+      send(pid, :sweep)
+      # Process remains alive and responsive
+      assert Process.alive?(pid)
+    end
   end
 end

@@ -18,7 +18,17 @@ defmodule AshBilling.WebhookEvent.Transformers.AddWebhookEventAttributes do
   def transform(dsl_state) do
     attributes = [
       {:event_id, Ash.Type.String, [primary_key?: true, allow_nil?: false, public?: true]},
-      {:processed_at, Ash.Type.UtcDatetimeUsec, [allow_nil?: false, public?: true]}
+      {:status, Ash.Type.Atom,
+       [
+         constraints: [one_of: [:processing, :processed, :failed]],
+         default: :processing,
+         allow_nil?: false,
+         public?: true
+       ]},
+      {:processed_at, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]},
+      {:last_attempt_at, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]},
+      {:attempts, Ash.Type.Integer, [default: 1, allow_nil?: false, public?: true]},
+      {:error, Ash.Type.String, [allow_nil?: true, public?: true]}
     ]
 
     add_attributes(dsl_state, attributes)

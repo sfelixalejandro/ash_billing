@@ -261,7 +261,7 @@ defmodule MyApp.Billing.WebhookEvent do
 
   actions do
     default_accept :*
-    defaults [:read, :create]
+    defaults [:read, :create, :update, :destroy]
   end
 end
 ```

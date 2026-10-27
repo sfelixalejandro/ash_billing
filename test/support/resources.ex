@@ -8,6 +8,8 @@ defmodule AshBilling.Test.Domain do
     resource AshBilling.Test.PolicyUser
     resource AshBilling.Test.PolicySubscription
     resource AshBilling.Test.WebhookEvent
+    resource AshBilling.Test.SimpleEvent
+    resource AshBilling.Test.ReadOnlyEvent
     resource AshBilling.Test.PremiumFeature
     resource AshBilling.Test.IncompleteResource
   end
@@ -153,7 +155,37 @@ defmodule AshBilling.Test.WebhookEvent do
 
   actions do
     default_accept :*
+    defaults [:read, :create, :update, :destroy]
+  end
+end
+
+defmodule AshBilling.Test.SimpleEvent do
+  use Ash.Resource,
+    domain: AshBilling.Test.Domain,
+    data_layer: Ash.DataLayer.Ets
+
+  attributes do
+    attribute :event_id, :string, primary_key?: true, allow_nil?: false, public?: true
+  end
+
+  actions do
+    default_accept :*
     defaults [:read, :create, :destroy]
+  end
+end
+
+defmodule AshBilling.Test.ReadOnlyEvent do
+  use Ash.Resource,
+    domain: AshBilling.Test.Domain,
+    data_layer: Ash.DataLayer.Ets
+
+  attributes do
+    attribute :event_id, :string, primary_key?: true, allow_nil?: false, public?: true
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create]
   end
 end
 

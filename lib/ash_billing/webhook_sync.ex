@@ -179,6 +179,10 @@ defmodule AshBilling.WebhookSync do
             case provider.get_subscription(sub_id, opts) do
               {:ok, live_sub} when is_map(live_sub) ->
                 live_status = normalize_status(live_sub["status"])
+                live_price_id = extract_price_id(live_sub)
+                live_current_period_end = extract_current_period_end(live_sub)
+                live_trial_ends_at = extract_trial_ends_at(live_sub)
+                live_cancel_at_period_end = Map.get(live_sub, "cancel_at_period_end", false)
 
                 require Logger
 
@@ -186,11 +190,39 @@ defmodule AshBilling.WebhookSync do
                   "AshBilling.WebhookSync: Reconciled conflicting status transition for subscription #{inspect(sub_id)} with provider. Authoritative live status: #{inspect(live_status)}"
                 )
 
-                attrs = Map.put(attrs, :status, live_status)
-                Ash.update(existing, attrs, ash_opts)
+                reconciled_attrs =
+                  attrs
+                  |> Map.put(:status, live_status)
+                  |> Map.put(:price_id, live_price_id)
+                  |> Map.put(:current_period_end, live_current_period_end)
+                  |> Map.put(:cancel_at_period_end, live_cancel_at_period_end)
+                  |> then(fn a ->
+                    if Ash.Resource.Info.attribute(subscription_resource, :trial_ends_at) != nil do
+                      Map.put(a, :trial_ends_at, live_trial_ends_at)
+                    else
+                      a
+                    end
+                  end)
+
+                Ash.update(existing, reconciled_attrs, ash_opts)
+
+              {:error, reconcile_reason} ->
+                require Logger
+
+                Logger.error(
+                  "AshBilling.WebhookSync: Failed to reconcile conflicting status transition for subscription #{inspect(sub_id)} with provider: #{inspect(reconcile_reason)}. Aborting sync to trigger retry."
+                )
+
+                {:error, {:reconciliation_failed, reconcile_reason}}
 
               _ ->
-                Ash.update(existing, attrs, ash_opts)
+                require Logger
+
+                Logger.error(
+                  "AshBilling.WebhookSync: Unexpected response while reconciling subscription #{inspect(sub_id)} with provider. Aborting sync to trigger retry."
+                )
+
+                {:error, :reconciliation_failed}
             end
 
           existing ->

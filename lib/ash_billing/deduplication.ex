@@ -60,24 +60,7 @@ defmodule AshBilling.Deduplication do
             acquire_memory(event_id)
 
           resource ->
-            domain = Keyword.get(opts, :domain)
-
-            attrs = %{
-              event_id: event_id,
-              processed_at: DateTime.utc_now()
-            }
-
-            case Ash.create(resource, attrs, domain: domain, authorize?: false) do
-              {:ok, _record} ->
-                {:ok, :acquired}
-
-              {:error, reason} ->
-                if duplicate_key_error?(reason) do
-                  {:error, :already_processed}
-                else
-                  {:error, reason}
-                end
-            end
+            acquire_resource(resource, event_id, opts)
         end
 
       :memory ->
@@ -85,6 +68,107 @@ defmodule AshBilling.Deduplication do
     end
   rescue
     e -> {:error, e}
+  end
+
+  defp acquire_resource(resource, event_id, opts) do
+    domain = Keyword.get(opts, :domain)
+    now = DateTime.utc_now()
+    lease_ttl = Keyword.get(opts, :lease_ttl_seconds, 60)
+
+    create_resource_lease(resource, event_id, domain, now, lease_ttl)
+  end
+
+  defp create_resource_lease(resource, event_id, domain, now, lease_ttl) do
+    attrs =
+      %{event_id: event_id}
+      |> maybe_put_field(resource, :status, :processing)
+      |> maybe_put_field(resource, :last_attempt_at, now)
+      |> maybe_put_field(resource, :processed_at, now)
+      |> maybe_put_field(resource, :attempts, 1)
+
+    case Ash.create(resource, attrs, domain: domain, authorize?: false) do
+      {:ok, _record} ->
+        {:ok, :acquired}
+
+      {:error, reason} ->
+        if duplicate_key_error?(reason) do
+          case Ash.get(resource, event_id, domain: domain, authorize?: false) do
+            {:ok, record} when not is_nil(record) ->
+              handle_existing_resource_lease(record, resource, domain, now, lease_ttl)
+
+            _ ->
+              {:error, :already_processing}
+          end
+        else
+          {:error, reason}
+        end
+    end
+  end
+
+  defp handle_existing_resource_lease(record, resource, domain, now, lease_ttl) do
+    has_status? = Ash.Resource.Info.attribute(resource, :status) != nil
+
+    if has_status? do
+      status = Map.get(record, :status)
+
+      case status do
+        :processed ->
+          {:error, :already_processed}
+
+        :failed ->
+          reclaim_resource_lease(record, resource, domain, now)
+
+        :processing ->
+          attempt_dt = Map.get(record, :last_attempt_at) || Map.get(record, :processed_at)
+
+          if attempt_dt && DateTime.diff(now, attempt_dt, :second) > lease_ttl do
+            reclaim_resource_lease(record, resource, domain, now)
+          else
+            {:error, :already_processing}
+          end
+
+        _ ->
+          {:error, :already_processed}
+      end
+    else
+      {:error, :already_processed}
+    end
+  end
+
+  defp reclaim_resource_lease(record, resource, domain, now) do
+    if Ash.Resource.Info.action(resource, :update) do
+      update_attrs =
+        %{status: :processing, last_attempt_at: now, error: nil}
+        |> maybe_increment_attempts(record, resource)
+
+      case Ash.update(record, update_attrs, domain: domain, authorize?: false) do
+        {:ok, _} -> {:ok, :acquired}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      if Ash.Resource.Info.action(resource, :destroy) do
+        _ = Ash.destroy(record, domain: domain, authorize?: false)
+      end
+
+      {:ok, :acquired}
+    end
+  end
+
+  defp maybe_put_field(attrs, resource, field, value) do
+    if Ash.Resource.Info.attribute(resource, field) != nil do
+      Map.put(attrs, field, value)
+    else
+      attrs
+    end
+  end
+
+  defp maybe_increment_attempts(attrs, record, resource) do
+    if Ash.Resource.Info.attribute(resource, :attempts) != nil do
+      current = Map.get(record, :attempts) || 1
+      Map.put(attrs, :attempts, current + 1)
+    else
+      attrs
+    end
   end
 
   @doc """
@@ -97,7 +181,43 @@ defmodule AshBilling.Deduplication do
   def complete(event_id, opts) when is_binary(event_id) do
     case resolve_strategy(opts) do
       :resource ->
-        :ok
+        case resolve_resource(opts) do
+          nil ->
+            insert_memory(event_id)
+
+          resource ->
+            domain = Keyword.get(opts, :domain)
+            now = DateTime.utc_now()
+
+            case Ash.get(resource, event_id, domain: domain, authorize?: false) do
+              {:ok, record} when not is_nil(record) ->
+                if Ash.Resource.Info.attribute(resource, :status) != nil and
+                     Ash.Resource.Info.action(resource, :update) != nil do
+                  update_attrs =
+                    %{status: :processed, error: nil}
+                    |> maybe_put_field(resource, :processed_at, now)
+
+                  case Ash.update(record, update_attrs, domain: domain, authorize?: false) do
+                    {:ok, _} ->
+                      :ok
+
+                    {:error, reason} ->
+                      require Logger
+
+                      Logger.warning(
+                        "AshBilling.Deduplication: Failed to mark event #{inspect(event_id)} as :processed: #{inspect(reason)}"
+                      )
+
+                      :ok
+                  end
+                else
+                  :ok
+                end
+
+              _ ->
+                :ok
+            end
+        end
 
       :memory ->
         insert_memory(event_id)
@@ -109,7 +229,7 @@ defmodule AshBilling.Deduplication do
   @doc """
   Releases an acquired event lease on failure so retries can be processed.
   """
-  @spec release(String.t() | nil, keyword()) :: :ok
+  @spec release(String.t() | nil, keyword()) :: :ok | {:error, term()}
   def release(event_id, opts \\ [])
   def release(nil, _opts), do: :ok
 
@@ -122,14 +242,63 @@ defmodule AshBilling.Deduplication do
 
           resource ->
             domain = Keyword.get(opts, :domain)
+            err_msg = Keyword.get(opts, :error)
 
             case Ash.get(resource, event_id, domain: domain, authorize?: false) do
               {:ok, record} when not is_nil(record) ->
-                if Ash.Resource.Info.action(resource, :destroy) do
-                  Ash.destroy(record, domain: domain, authorize?: false)
-                end
+                cond do
+                  Ash.Resource.Info.attribute(resource, :status) != nil and
+                      Ash.Resource.Info.action(resource, :update) != nil ->
+                    update_attrs = %{
+                      status: :failed,
+                      error: if(err_msg, do: String.slice(inspect(err_msg), 0, 500), else: nil)
+                    }
 
-                :ok
+                    case Ash.update(record, update_attrs, domain: domain, authorize?: false) do
+                      {:ok, _} ->
+                        :ok
+
+                      {:error, update_error} ->
+                        require Logger
+
+                        Logger.warning(
+                          "AshBilling.Deduplication: Failed to update event #{inspect(event_id)} to :failed: #{inspect(update_error)}. Falling back to destroy."
+                        )
+
+                        if Ash.Resource.Info.action(resource, :destroy) do
+                          Ash.destroy(record, domain: domain, authorize?: false)
+                        end
+
+                        :ok
+                    end
+
+                  Ash.Resource.Info.action(resource, :destroy) != nil ->
+                    case Ash.destroy(record, domain: domain, authorize?: false) do
+                      :ok ->
+                        :ok
+
+                      {:ok, _} ->
+                        :ok
+
+                      {:error, destroy_err} ->
+                        require Logger
+
+                        Logger.error(
+                          "AshBilling.Deduplication: Failed to destroy event record #{inspect(event_id)} on release: #{inspect(destroy_err)}"
+                        )
+
+                        {:error, destroy_err}
+                    end
+
+                  true ->
+                    require Logger
+
+                    Logger.error(
+                      "AshBilling.Deduplication: Cannot release lease for event #{inspect(event_id)}. Resource #{inspect(resource)} lacks both update and destroy actions."
+                    )
+
+                    {:error, :cannot_release_lease}
+                end
 
               _ ->
                 :ok
@@ -140,7 +309,7 @@ defmodule AshBilling.Deduplication do
         delete_memory(event_id)
     end
   rescue
-    _ -> :ok
+    e -> {:error, e}
   end
 
   @doc """
@@ -161,10 +330,18 @@ defmodule AshBilling.Deduplication do
             domain = Keyword.get(opts, :domain)
             require Ash.Query
 
-            resource
-            |> Ash.Query.new()
-            |> Ash.Query.filter(event_id == ^event_id)
-            |> Ash.exists?(domain: domain, authorize?: false)
+            query =
+              if Ash.Resource.Info.attribute(resource, :status) != nil do
+                resource
+                |> Ash.Query.new()
+                |> Ash.Query.filter(event_id == ^event_id and status == :processed)
+              else
+                resource
+                |> Ash.Query.new()
+                |> Ash.Query.filter(event_id == ^event_id)
+              end
+
+            Ash.exists?(query, domain: domain, authorize?: false)
         end
 
       :memory ->
@@ -250,27 +427,55 @@ defmodule AshBilling.Deduplication do
           {:error, :already_processed}
 
         [{^event_id, :processing, inserted_at}] ->
-          # If a lease is held longer than 60s without completing, allow reclamation
+          # If a lease is held longer than 60s without completing, allow atomic reclamation
           if now - inserted_at > 60 do
-            :ets.insert(@table, {event_id, :processing, now})
-            {:ok, :acquired}
+            ms = [
+              {
+                {event_id, :processing, :"$1"},
+                [{:>, {:-, now, :"$1"}, 60}],
+                [{:const, {event_id, :processing, now}}]
+              }
+            ]
+
+            if :ets.select_replace(@table, ms) == 1 do
+              {:ok, :acquired}
+            else
+              {:error, :already_processing}
+            end
           else
             {:error, :already_processing}
+          end
+
+        [{^event_id, :failed, _}] ->
+          # Previous attempt failed; atomically reclaim for retry
+          ms = [
+            {
+              {event_id, :failed, :_},
+              [],
+              [{:const, {event_id, :processing, now}}]
+            }
+          ]
+
+          if :ets.select_replace(@table, ms) == 1 do
+            {:ok, :acquired}
+          else
+            acquire_memory(event_id)
           end
 
         [{^event_id, _}] ->
           {:error, :already_processed}
 
         [] ->
-          {:ok, :acquired}
+          acquire_memory(event_id)
       end
     end
   rescue
-    _ -> {:ok, :acquired}
+    e -> {:error, {:ets_error, e}}
   end
 
   defp delete_memory(event_id) do
-    :ets.delete(@table, event_id)
+    now = System.system_time(:second)
+    :ets.insert(@table, {event_id, :failed, now})
     :ok
   rescue
     _ -> :ok
@@ -279,7 +484,8 @@ defmodule AshBilling.Deduplication do
   defp check_memory(event_id) do
     case :ets.lookup(@table, event_id) do
       [{^event_id, :processed, _}] -> true
-      [{^event_id, :processing, _}] -> true
+      [{^event_id, :processing, _}] -> false
+      [{^event_id, :failed, _}] -> false
       [{^event_id, _timestamp}] -> true
       [] -> false
     end

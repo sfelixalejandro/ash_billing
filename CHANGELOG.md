@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.1.5] - 2026-10-27
+
+### Fixed
+
+- **Persistent Multi-Node Deduplication State Machine & Lease Reclamation**:
+  - `AshBilling.WebhookEvent` expanded with persistent lifecycle states: `:status` (`:processing`, `:processed`, `:failed`), `:processed_at`, `:last_attempt_at`, `:attempts`, and `:error`.
+  - Abandoned leases held longer than configurable TTL (default 60s) or left in `:failed` state are atomically reclaimed with attempt counter incrementing, preventing event loss and unblocking retries during server restarts or transient crashes.
+  - Resource actions in README and DSL now standardise on `defaults [:read, :create, :update, :destroy]` with fallback action handling.
+- **Fail-Closed Webhook Secret Resolution**:
+  - `AshBilling.Plug` immediately rejects requests with HTTP 500 without computing HMAC signatures when `webhook_secret` is unset, nil, or empty string.
+  - `AshBilling.Providers.Stripe.verify_webhook/4` explicitly validates secrets and returns `{:error, :missing_webhook_secret}` rather than calculating hashes against empty strings.
+- **Fail-Closed & Atomic ETS Memory Concurrency**:
+  - `AshBilling.Deduplication.acquire_memory/1` now executes atomic `:ets.select_replace` with guard expressions for 60s lease reclamation and failed attempt retry.
+  - Failures in ETS operations fail closed with `{:error, {:ets_error, reason}}` rather than granting lease.
+- **Live Reconciliation Consistency & Retry Triggering**:
+  - Webhook synchronization now aborts with `{:error, {:reconciliation_failed, reason}}` when live provider retrieval fails during conflicting status transitions, returning HTTP 500 and triggering provider webhook retry rather than persisting stale payload data.
+  - When live reconciliation succeeds, all authoritative attributes (`status`, `price_id`, `current_period_end`, `cancel_at_period_end`, `trial_ends_at`) are extracted directly from the authoritative live subscription record.
+- **Public API Function Signature Parity**:
+  - `AshBilling.create_customer/2` now defines `def create_customer(record_or_params, opts \\ [])` function head with default empty keyword list.
+  - Stripe provider supports both `:req_opts` and `:req_options` for enhanced HTTP client configuration flexibility.
+
+---
+
 ## [v0.1.4] - 2026-10-27
 
 ### Fixed
