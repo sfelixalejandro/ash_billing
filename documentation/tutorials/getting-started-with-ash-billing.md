@@ -25,7 +25,7 @@ Add `ash_billing` to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.1.0"}
+    {:ash_billing, "~> 0.1.1"}
   ]
 end
 ```
@@ -174,7 +174,7 @@ defmodule MyApp.Content.Document do
 
     # Only users subscribed to the Enterprise price tier can export
     policy action(:export) do
-      authorize_if {AshBilling.Checks.HasPrice, price_id: "price_enterprise_annual"}
+      authorize_if {AshBilling.Checks.HasPrice, price: "price_enterprise_annual"}
     end
   end
 end
