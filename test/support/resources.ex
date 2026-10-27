@@ -13,6 +13,8 @@ defmodule AshBilling.Test.Domain do
     resource AshBilling.Test.FailingUpdateEvent
     resource AshBilling.Test.PremiumFeature
     resource AshBilling.Test.IncompleteResource
+    resource AshBilling.Test.NoUpdateEvent
+    resource AshBilling.Test.NoUpdateNoDestroyEvent
   end
 end
 
@@ -254,5 +256,43 @@ defmodule AshBilling.Test.IncompleteResource do
   actions do
     default_accept :*
     defaults [:read, :create, :update, :destroy]
+  end
+end
+
+defmodule AshBilling.Test.NoUpdateEvent do
+  use Ash.Resource,
+    domain: AshBilling.Test.Domain,
+    data_layer: Ash.DataLayer.Ets
+
+  attributes do
+    attribute :event_id, :string, primary_key?: true, allow_nil?: false, public?: true
+    attribute :status, :atom, default: :processing, public?: true
+    attribute :lease_token, :string, public?: true
+    attribute :last_attempt_at, :utc_datetime_usec, public?: true
+    attribute :processed_at, :utc_datetime_usec, public?: true
+    attribute :attempts, :integer, default: 1, public?: true
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :destroy]
+  end
+end
+
+defmodule AshBilling.Test.NoUpdateNoDestroyEvent do
+  use Ash.Resource,
+    domain: AshBilling.Test.Domain,
+    data_layer: Ash.DataLayer.Ets
+
+  attributes do
+    attribute :event_id, :string, primary_key?: true, allow_nil?: false, public?: true
+    attribute :status, :atom, default: :processing, public?: true
+    attribute :lease_token, :string, public?: true
+    attribute :last_attempt_at, :utc_datetime_usec, public?: true
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create]
   end
 end

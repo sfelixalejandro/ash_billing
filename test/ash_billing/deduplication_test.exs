@@ -593,5 +593,91 @@ defmodule AshBilling.DeduplicationTest do
       # Process remains alive and responsive
       assert Process.alive?(pid)
     end
+
+    test "reclaims expired lease on resource without :update action via atomic destroy and recreate" do
+      alias AshBilling.Test.NoUpdateEvent
+      event_id = "evt_no_update_reclaim_1"
+      opts = [deduplication_resource: NoUpdateEvent, domain: Domain, lease_ttl: 1]
+
+      past_dt = DateTime.utc_now() |> DateTime.add(-120, :second)
+
+      # Create an expired processing record
+      assert {:ok, _} =
+               Ash.create(
+                 NoUpdateEvent,
+                 %{
+                   event_id: event_id,
+                   status: :processing,
+                   lease_token: "old_token",
+                   last_attempt_at: past_dt
+                 },
+                 domain: Domain,
+                 authorize?: false
+               )
+
+      # Worker acquires and reclaims via atomic destroy + recreate
+      assert {:ok, new_token} = Deduplication.acquire(event_id, opts)
+      assert is_binary(new_token)
+      assert new_token != "old_token"
+
+      # Record in DB has new token
+      assert {:ok, record} = Ash.get(NoUpdateEvent, event_id, domain: Domain, authorize?: false)
+      assert record.lease_token == new_token
+      assert record.status == :processing
+
+      # Release deletes record via atomic_bulk_destroy fallback
+      assert :ok = Deduplication.release(event_id, opts ++ [lease_token: new_token])
+
+      assert {:error, %Ash.Error.Invalid{errors: [%Ash.Error.Query.NotFound{}]}} =
+               Ash.get(NoUpdateEvent, event_id, domain: Domain, authorize?: false)
+    end
+
+    test "reclaiming lease fails on resource without :update and without :destroy" do
+      alias AshBilling.Test.NoUpdateNoDestroyEvent
+      event_id = "evt_no_update_no_destroy_1"
+      opts = [deduplication_resource: NoUpdateNoDestroyEvent, domain: Domain, lease_ttl: 1]
+
+      past_dt = DateTime.utc_now() |> DateTime.add(-120, :second)
+
+      assert {:ok, _} =
+               Ash.create(
+                 NoUpdateNoDestroyEvent,
+                 %{
+                   event_id: event_id,
+                   status: :processing,
+                   lease_token: "old_token",
+                   last_attempt_at: past_dt
+                 },
+                 domain: Domain,
+                 authorize?: false
+               )
+
+      assert {:error, :resource_lacks_update_action} = Deduplication.acquire(event_id, opts)
+
+      # Release on resource without update or destroy returns error
+      assert {:error, :cannot_release_lease} = Deduplication.release(event_id, opts)
+    end
+
+    test "release returns :ok if event is already :failed" do
+      event_id = "evt_already_failed_release"
+      opts = [deduplication_resource: WebhookEvent, domain: Domain]
+
+      assert {:ok, token} = Deduplication.acquire(event_id, opts)
+      assert :ok = Deduplication.release(event_id, opts ++ [lease_token: token])
+
+      # Second release on already :failed event returns :ok idempotently
+      assert :ok = Deduplication.release(event_id, opts ++ [lease_token: token])
+    end
+
+    test "release returns :lease_token_mismatch if event is still processing under another token" do
+      event_id = "evt_token_mismatch_release"
+      opts = [deduplication_resource: WebhookEvent, domain: Domain]
+
+      assert {:ok, _token} = Deduplication.acquire(event_id, opts)
+
+      # Releasing with wrong token returns :lease_token_mismatch
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.release(event_id, opts ++ [lease_token: "wrong_token"])
+    end
   end
 end

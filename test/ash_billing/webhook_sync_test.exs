@@ -457,5 +457,37 @@ defmodule AshBilling.WebhookSyncTest do
 
       assert {:ok, :not_found} = WebhookSync.sync_event(event, @opts)
     end
+
+    test "resolves customer via customer_email when stripe_customer_id and metadata are absent" do
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{email: "lookup_by_email@example.com"},
+          domain: Domain
+        )
+
+      event = %{
+        "type" => "customer.subscription.created",
+        "created" => "invalid_timestamp_format",
+        "data" => %{
+          "object" => %{
+            "id" => "sub_stripe_email_resolved",
+            "customer" => "cus_unknown_by_id",
+            "customer_email" => "lookup_by_email@example.com",
+            "status" => "active",
+            "cancel_at_period_end" => false,
+            "items" => %{
+              "data" => [
+                %{"price" => %{"id" => "price_basic"}}
+              ]
+            }
+          }
+        }
+      }
+
+      assert {:ok, sub} = WebhookSync.sync_event(event, @opts)
+      assert sub.provider_subscription_id == "sub_stripe_email_resolved"
+      assert sub.user_id == user.id
+    end
   end
 end
