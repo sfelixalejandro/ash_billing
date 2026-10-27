@@ -243,6 +243,22 @@ config :ash_billing,
 
 ---
 
+## Supported Stripe API Baseline
+
+`ash_billing` targets modern Stripe API versions (`2023-10-16` through current releases). Payloads are parsed defensively with polymorphic fallback resolvers for customer objects, plans, prices, and timestamps, ensuring backward and forward compatibility across API upgrades.
+
+---
+
+## Security, Financial Responsibility & Support Scope
+
+`ash_billing` provides declarative primitives and synchronization logic for integrating Stripe with the Ash Framework. Please note the following architectural boundaries:
+
+- **Financial Compliance**: Tax calculation, invoice finalization, currency conversion rules, and PCI-DSS compliance boundaries remain the architectural responsibility of the implementing application.
+- **Webhook Resilience**: In production environments, always pair `AshBilling.Plug` with a database-backed deduplication resource (`AshBilling.WebhookEvent`) to ensure idempotency across multi-node deployments and automatic Stripe exponential retries.
+- **Support & Issues**: The issue tracker is strictly reserved for reproducible bugs and targeted feature enhancements. For architecture questions and implementation advice, please participate in the [Ash Discord](https://discord.gg/HTHRaaVPUc) or [Elixir Forum](https://elixirforum.com/c/ash-framework-forum/).
+
+---
+
 ## License
 
 MIT License. Copyright (c) 2026 Alejandro Felix.

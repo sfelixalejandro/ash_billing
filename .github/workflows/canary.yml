@@ -1,0 +1,41 @@
+name: Canary CI (Ash & Spark Main)
+
+on:
+  schedule:
+    # Runs every Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  canary:
+    name: Canary Build against ash@main & spark@main
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.18'
+          otp-version: '27'
+
+      - name: Point dependencies to ash-project/ash and spark main branches
+        run: |
+          elixir -e '
+            content = File.read!("mix.exs")
+            content = String.replace(content, ~s/{:ash, "~> 3.0"}/, ~s/{:ash, github: "ash-project\/ash", branch: "main", override: true}/)
+            content = String.replace(content, ~s/{:spark, "~> 2.1"}/, ~s/{:spark, github: "ash-project\/spark", branch: "main", override: true}/)
+            File.write!("mix.exs", content)
+          '
+
+      - name: Install dependencies from git
+        run: mix deps.get
+
+      - name: Compile with latest Ash & Spark
+        run: mix compile
+
+      - name: Run test suite against canary Ash & Spark
+        run: mix test

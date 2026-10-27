@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ash Framework Discord
+    url: https://discord.gg/HTHRaaVPUc
+    about: Ask implementation questions, get help, and discuss AshBilling with the community.
+  - name: Elixir Forum (Ash Framework)
+    url: https://elixirforum.com/c/ash-framework-forum/
+    about: General questions, tutorials, and long-form architecture discussions.

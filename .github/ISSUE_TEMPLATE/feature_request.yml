@@ -1,0 +1,42 @@
+name: Feature Request / Provider Proposal
+description: Propose a new feature, improvement, or payment provider integration
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        We welcome feature requests and architectural proposals, including new provider integrations (Paddle, LemonSqueezy, Polar).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Use Case
+      description: What problem does this solve, or what use case does it address?
+      placeholder: Currently, AshBilling does not support...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe the solution or new capability you would like to see.
+      placeholder: Add support for provider X or add a new DSL option...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any alternative implementations or workarounds you have considered.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to submit a pull request implementing this feature
