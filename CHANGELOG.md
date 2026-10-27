@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Implement the documented `AshBilling.Plug.read_body/2` parser callback, preserving exact webhook bytes across chunks for signature verification after `Plug.Parsers`.
+
 - Redact API key values from configuration diagnostics and raised verification errors.
 
 - Add a tenant-scoped subscription identity backed by a PostgreSQL unique index after migration. Concurrent create conflicts retry through the normal ownership and lifecycle checks; unrelated persistence errors are preserved. Existing applications must generate and apply the index migration after resolving any duplicate provider subscription IDs.

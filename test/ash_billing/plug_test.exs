@@ -28,6 +28,33 @@ defmodule AshBilling.PlugTest do
   end
 
   describe "AshBilling.Plug" do
+    test "documented body reader preserves signed bytes through Plug.Parsers" do
+      payload = ~s({"id":"evt_parsed_signed_body","type":"unknown.event", "data":{}})
+
+      parsed =
+        build_signed_conn(payload)
+        |> Plug.Parsers.call(
+          Plug.Parsers.init(
+            parsers: [:json],
+            json_decoder: Jason,
+            body_reader: {BillingPlug, :read_body, []}
+          )
+        )
+
+      assert parsed.body_params["id"] == "evt_parsed_signed_body"
+      assert parsed.assigns.raw_body == payload
+      assert BillingPlug.call(parsed, BillingPlug.init(webhook_secret: @secret)).status == 200
+    end
+
+    test "body reader accumulates every chunk without changing parser results" do
+      conn = conn(:post, "/", "abcdefgh")
+      assert {:more, "abc", conn} = BillingPlug.read_body(conn, length: 3)
+      assert conn.assigns.raw_body == "abc"
+      assert {:more, "def", conn} = BillingPlug.read_body(conn, length: 3)
+      assert {:ok, "gh", conn} = BillingPlug.read_body(conn, length: 3)
+      assert conn.assigns.raw_body == "abcdefgh"
+    end
+
     test "processes valid webhook and calls handler" do
       payload = ~s({"id":"evt_test_123","type":"customer.subscription.created"})
       conn = build_signed_conn(payload)
