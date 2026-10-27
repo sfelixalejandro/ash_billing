@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.1.10] - 2026-10-27
+
+### Fixed
+
+- **Strict Persistent Deduplication Contract (Zero-Race Architecture)**:
+  - Eliminated the non-atomic destruction/recreation fallback in `perform_atomic_reclaim/7`. Persistent deduplication requires an atomic `:update` action on the backing Ash resource.
+  - When an expired lease is encountered on a resource without `:update`, `AshBilling.Deduplication.acquire/2` strictly and immediately returns `{:error, :resource_lacks_update_action}`, completely eliminating the race window where an expired worker could destroy a freshly reclaimed lease.
+- **Fail-Fast Deduplication Configuration (No Silent ETS Fallback)**:
+  - `Deduplication.acquire/2`, `complete/2`, `release/2`, and `mark_processed/2` now strictly return `{:error, :deduplication_resource_not_configured}` when `:resource` strategy is configured without a resolvable resource.
+  - `AshBilling.Plug` responds with HTTP 500 when persistent deduplication is unconfigured, preventing multi-node deployments (e.g. Kubernetes) from silently and unsafely falling back to local node memory.
+- **Webhook Sync Error Governance**:
+  - Documented and validated `return_500_on_sync_error: true` as the recommended enterprise production default to ensure automatic exponential retries by payment providers.
+  - Added explicit audit logging when `return_500_on_sync_error: false` is forced by the host application.
+
+---
+
 ## [v0.1.9] - 2026-10-27
 
 ### Fixed
