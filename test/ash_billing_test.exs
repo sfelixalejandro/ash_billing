@@ -661,6 +661,28 @@ defmodule AshBillingTest do
   end
 
   describe "check_configuration/1 and verify_configuration!/1" do
+    test "credential diagnostics and exceptions never disclose the supplied API key" do
+      for key <- ["Bearer sk_test_DO_NOT_DISCLOSE", " sk_live_DO_NOT_DISCLOSE"] do
+        assert {:error, errors} = AshBilling.check_configuration(api_key: key)
+        refute inspect(errors) =~ key
+        refute inspect(errors) =~ "DO_NOT_DISCLOSE"
+
+        exception =
+          assert_raise ArgumentError, fn -> AshBilling.verify_configuration!(api_key: key) end
+
+        refute Exception.message(exception) =~ key
+        refute Exception.message(exception) =~ "DO_NOT_DISCLOSE"
+
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            require Logger
+            Logger.error(Exception.message(exception))
+          end)
+
+        refute log =~ "DO_NOT_DISCLOSE"
+      end
+    end
+
     test "validates proper configuration" do
       valid_opts = [
         customer_resource: AshBilling.Test.User,

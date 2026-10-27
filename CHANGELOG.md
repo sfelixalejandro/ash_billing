@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Redact API key values from configuration diagnostics and raised verification errors.
+
 - Add a tenant-scoped subscription identity backed by a PostgreSQL unique index after migration. Concurrent create conflicts retry through the normal ownership and lifecycle checks; unrelated persistence errors are preserved. Existing applications must generate and apply the index migration after resolving any duplicate provider subscription IDs.
 
 - Reject contradictory customer and subscription ownership, establish initial metadata-based customer associations atomically, and keep identity failures retryable. Email alone no longer establishes a billing identity; missing customers cannot be replaced by subscription or Checkout session IDs.
