@@ -7,212 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [v0.1.11] - 2026-10-27
+## [v0.2.0] - 2026-10-27
 
-### Fixed
-
-- **Strict Deduplication Contract on Initial Acquisition and Completion**:
-  - `Deduplication.acquire_resource/3` and `complete_resource/3` validate upfront that the persistent resource has both a `:status` attribute and an `:update` action.
-  - If either is missing, calls immediately fail fast with `{:error, :resource_lacks_update_action}`, preventing orphaned events in `:processing` or silent `:ok` completions on unupdatable resources.
-- **Atomic Conditional Update for Out-of-Order Webhooks on Same Subscription**:
-  - Implemented `update_subscription_safely/5` via `Ash.bulk_update` with `strategy: [:atomic]`, querying `id == ^existing.id and (is_nil(last_event_created_at) or last_event_created_at <= ^event_dt)`.
-  - Safely eliminates the race condition where concurrent webhooks affecting the same subscription could overwrite a newer state with an older state. When 0 records match the atomic query, the stale write is discarded and the authoritative state is preserved.
-- **Immutable `:processed` Events in `release/2`**:
-  - `Deduplication.release_resource/3`, `atomic_bulk_destroy/5`, and `delete_memory/2` now strictly filter `status == :processing`.
-  - Releasing a `:processed` event immediately returns `{:error, :already_processed}` without mutating the event record to `:failed`, guaranteeing that successfully processed webhook events are strictly immutable in both database and ETS backends.
-- **Normalization of `mode` in Checkout Sessions**:
-  - `AshBilling.create_checkout_session/2` normalizes the `mode` parameter with `to_string/1`, ensuring both atom `:subscription` and binary `"subscription"` attach metadata to `subscription_data`.
-  - Updated SaaS reference example documentation to specify `mode: "subscription"`.
-
----
-
-## [v0.1.10] - 2026-10-27
-
-### Fixed
-
-- **Strict Persistent Deduplication Contract (Zero-Race Architecture)**:
-  - Eliminated the non-atomic destruction/recreation fallback in `perform_atomic_reclaim/7`. Persistent deduplication requires an atomic `:update` action on the backing Ash resource.
-  - When an expired lease is encountered on a resource without `:update`, `AshBilling.Deduplication.acquire/2` strictly and immediately returns `{:error, :resource_lacks_update_action}`, completely eliminating the race window where an expired worker could destroy a freshly reclaimed lease.
-- **Fail-Fast Deduplication Configuration (No Silent ETS Fallback)**:
-  - `Deduplication.acquire/2`, `complete/2`, `release/2`, and `mark_processed/2` now strictly return `{:error, :deduplication_resource_not_configured}` when `:resource` strategy is configured without a resolvable resource.
-  - `AshBilling.Plug` responds with HTTP 500 when persistent deduplication is unconfigured, preventing multi-node deployments (e.g. Kubernetes) from silently and unsafely falling back to local node memory.
-- **Webhook Sync Error Governance**:
-  - Documented and validated `return_500_on_sync_error: true` as the recommended enterprise production default to ensure automatic exponential retries by payment providers.
-  - Added explicit audit logging when `return_500_on_sync_error: false` is forced by the host application.
-
----
-
-## [v0.1.9] - 2026-10-27
-
-### Fixed
-
-- **Persistent Atomic Reclaim for Custom/Degraded Resources**:
-  - In `perform_atomic_reclaim/7`, resources lacking `:update` actions no longer perform unpersisted destroys with orphaned tokens. Reclaiming now executes atomic conditional bulk destruction and immediately persists a new lease record with `Ash.create/4`.
-  - Propagates errors when resources lack both update and destroy capabilities (`{:error, :resource_lacks_update_action}`).
-- **Exhaustive Plug Error Handling & Unconditional Lease Release**:
-  - In `AshBilling.Plug`, synchronization, custom handler, deduplication, and completion errors now handle both `return_500_on_sync_error: true` (HTTP 500) and `return_500_on_sync_error: false` (HTTP 200 with error details).
-  - Webhooks that fail database synchronization are strictly prevented from executing custom handlers or marking the event as completed/processed, releasing the lease unconditionally to unblock retry delivery.
-- **PostgreSQL Fallback Race Integration Test**:
-  - Added test case in `postgres_deduplication_test.exs` verifying that a worker attempting fallback release with an obsolete token cannot delete a lease concurrently reclaimed by another worker in PostgreSQL.
-
----
-
-## [v0.1.8] - 2026-10-27
-
-### Fixed
-
-- **Atomic Conditional Fallback Destruction**:
-  - Replaced non-atomic read-then-destroy sequences in `AshBilling.Deduplication.release/2` with strictly conditional `Ash.bulk_destroy/4` (`strategy: [:atomic]`).
-  - Destruction queries enforce simultaneous matching of `event_id`, `status == :processing`, and `lease_token` at the SQL level, preventing race conditions where another worker reclaiming an event could have its record deleted by an earlier worker.
-- **Strict PostgreSQL CI Enforcement**:
-  - `test/test_helper.exs` and `test/ash_billing/postgres_deduplication_test.exs` fail loudly (`raise` / `flunk`) if PostgreSQL is unavailable when `CI=true`.
-  - Ensures continuous integration pipelines never silently skip distributed database tests.
-
----
-
-## [v0.1.7] - 2026-10-27
+Production-grade hardening release delivering distributed multi-node deduplication, atomic conditional webhook synchronization, live provider conflict reconciliation, and distributed PostgreSQL contention testing.
 
 ### Added
 
-- **PostgreSQL Distributed Integration Test Suite**:
-  - Added `{:ash_postgres, "~> 2.15", only: [:dev, :test]}` and `{:postgrex, ">= 0.0.0", only: [:dev, :test]}`.
-  - Implemented real integration tests (`AshBilling.PostgresDeduplicationTest`) verifying multi-process lease contention, atomic completion, stale lease reclamation, and zombie worker protection directly against PostgreSQL.
-  - Configured PostgreSQL 16 service container in GitHub Actions CI across all test matrix environments.
-
-### Fixed
-
-- **Atomic Conditional `complete/2` and `release/2`**:
-  - `Deduplication.complete/2` and `Deduplication.release/2` execute single atomic conditional queries via `Ash.bulk_update/4` with `strategy: [:atomic]`, verifying that `event_id`, `status == :processing`, and `lease_token` match simultaneously during write.
-  - Zero-record updates distinguish between terminal `:processed` state, `:lease_token_mismatch`, and unacquired leases, preventing zombie or delayed workers from altering records after their lease has been reclaimed.
-  - In-memory strategy (`:memory`) refactored with atomic `:ets.select_replace/2` operations, eliminating check-then-act race conditions between lookup and insert.
-- **Explicit HTTP 503 on `already_processing`**:
-  - `AshBilling.Plug` distinguishes between `already_processed` (HTTP 200) and `already_processing` (HTTP 503 with `Retry-After: 5` header).
-  - Webhooks delivered while another worker is actively processing return HTTP 503, instructing Stripe to back off and retry later without prematurely considering the webhook as permanently delivered.
-
----
-
-## [v0.1.6] - 2026-10-27
-
-### Fixed
-
-- **Atomic Conditional Lease Reclamation**:
-  - `AshBilling.Deduplication` implements atomic conditional updates during lease reclamation via `Ash.bulk_update` with an atomic filter ensuring the target record is strictly in `:failed` status or expired `:processing` status during the write operation.
-  - Node-level and clustered atomic locking prevents concurrent processes from racing during lease acquisition or reclamation.
-- **Unique Acquisition Lease Tokens & Zombie Worker Protection**:
-  - Each acquired lease generates a cryptographically secure unique `lease_token`.
-  - Reclaiming workers overwrite the `lease_token`. Workers completing (`Deduplication.complete/2`) or releasing (`Deduplication.release/2`) after their lease has expired or been reclaimed receive `{:error, :lease_token_mismatch}`, preventing expired workers from corrupting active processing states or overwriting active leases.
-- **Fail-Closed Plug Completion Verification**:
-  - `Deduplication.complete/2` contract updated to `@spec complete(String.t() | nil, keyword()) :: :ok | {:error, term()}`.
-  - Persistence errors during event completion are no longer silently masked. `AshBilling.Plug` verifies completion success and halts with HTTP 500 (`completion_failed`) if marking `:processed` fails, ensuring Stripe and payment providers retry unconfirmed events.
-- **Real Multi-Process Concurrency Test Coverage**:
-  - Added parallel concurrency test suites verifying that exactly 1 worker succeeds in winning initial acquisition or reclaiming expired/failed leases across concurrent `Task.async` processes.
-  - Added zombie worker rejection tests and persistence failure simulations verifying Plug HTTP 500 fail-closed semantics.
-
----
-
-## [v0.1.5] - 2026-10-27
-
-### Fixed
-
-- **Persistent Multi-Node Deduplication State Machine & Lease Reclamation**:
-  - `AshBilling.WebhookEvent` expanded with persistent lifecycle states: `:status` (`:processing`, `:processed`, `:failed`), `:processed_at`, `:last_attempt_at`, `:attempts`, and `:error`.
-  - Abandoned leases held longer than configurable TTL (default 60s) or left in `:failed` state are atomically reclaimed with attempt counter incrementing, preventing event loss and unblocking retries during server restarts or transient crashes.
-  - Resource actions in README and DSL now standardise on `defaults [:read, :create, :update, :destroy]` with fallback action handling.
-- **Fail-Closed Webhook Secret Resolution**:
-  - `AshBilling.Plug` immediately rejects requests with HTTP 500 without computing HMAC signatures when `webhook_secret` is unset, nil, or empty string.
-  - `AshBilling.Providers.Stripe.verify_webhook/4` explicitly validates secrets and returns `{:error, :missing_webhook_secret}` rather than calculating hashes against empty strings.
-- **Fail-Closed & Atomic ETS Memory Concurrency**:
-  - `AshBilling.Deduplication.acquire_memory/1` now executes atomic `:ets.select_replace` with guard expressions for 60s lease reclamation and failed attempt retry.
-  - Failures in ETS operations fail closed with `{:error, {:ets_error, reason}}` rather than granting lease.
-- **Live Reconciliation Consistency & Retry Triggering**:
-  - Webhook synchronization now aborts with `{:error, {:reconciliation_failed, reason}}` when live provider retrieval fails during conflicting status transitions, returning HTTP 500 and triggering provider webhook retry rather than persisting stale payload data.
-  - When live reconciliation succeeds, all authoritative attributes (`status`, `price_id`, `current_period_end`, `cancel_at_period_end`, `trial_ends_at`) are extracted directly from the authoritative live subscription record.
-- **Public API Function Signature Parity**:
-  - `AshBilling.create_customer/2` now defines `def create_customer(record_or_params, opts \\ [])` function head with default empty keyword list.
-  - Stripe provider supports both `:req_opts` and `:req_options` for enhanced HTTP client configuration flexibility.
-
----
-
-## [v0.1.4] - 2026-10-27
-
-### Fixed
-
-- **Spark DSL Transformer Topological Ordering for WebhookEvent**:
-  - Declared explicit transformer ordering constraints (`before?`) for `AshBilling.WebhookEvent.Transformers.AddWebhookEventAttributes`, ensuring it executes ahead of `Ash.Resource.Transformers.CachePrimaryKey`, `CacheUniqueKeys`, `AttributesByName`, and `CacheActionInputs`. Guarantees consistent primary key caching across all compiler environments and Elixir versions.
-- **Deduplication Error Predicate Generalization**:
-  - Relaxed `duplicate_key_error?/1` predicate to match standard uniqueness and constraint error descriptors across PostgreSQL, MySQL, SQLite, and ETS data layers.
-- **Application Environment Test Isolation**:
-  - Ensured deterministic test isolation by resetting `Application` environment keys in ExUnit `setup` and `on_exit` handlers.
-
----
-
-## [v0.1.3] - 2026-10-27
-
-### Added
-
-- **Atomic Deduplication Leases**:
-  - Implemented `AshBilling.Deduplication.acquire/2`, `complete/2`, and `release/2`. Uses unique primary key insertion for `:resource` and `:ets.insert_new` for `:memory` to guarantee strictly single-worker execution across concurrent requests and clustered nodes.
-- **Multiple Stripe `v1` Signature Verification**:
-  - `AshBilling.Providers.Stripe.verify_webhook/4` now parses and validates all `v1` signatures present in `Stripe-Signature` headers using constant-time comparison, allowing zero-downtime webhook secret rotation.
-- **Webhook Timestamp Ordering & Live Stripe Reconciliation**:
-  - Injected `last_event_created_at` timestamp tracking into `AshBilling.Subscription` DSL. Incoming webhooks older than the recorded event are safely rejected.
-  - Added live status reconciliation against Stripe (`provider.get_subscription/2`) to resolve backward or conflicting status transitions (e.g. from `:past_due` to `:active`).
-- **Automatic Customer Persistence by Default**:
-  - `AshBilling.create_customer/2` now automatically persists generated provider customer IDs onto loaded Ash customer records by default.
-
-### Fixed
-
-- **Custom Handler Failure & Retry Safety**:
-  - In `AshBilling.Plug`, custom handlers now run inside the deduplication transaction pipeline. Handlers returning `{:error, reason}` or raising exceptions now trigger lease release and return HTTP 500 so Stripe automatically retries.
-- **DSL and Public API Authorization Parity**:
-  - Unified evaluation rules across `AshBilling.active_subscription?/1`, `AshBilling.on_trial?/1`, and the DSL calculation `active?`. Terminated or incomplete states (`:unpaid`, `:incomplete`, `:incomplete_expired`, `:canceled`, `:paused`) are strictly prevented from evaluating to active, even when future `trial_ends_at` timestamps exist.
-
----
-
-## [v0.1.2] - 2026-10-27
-
-### Added
-
-- **Modern Stripe API Payloads (2025/2026)**:
-  - Added recursive payload extraction and fallback for nested `items.data[].current_period_end` and `trial_settings` alongside legacy root-level timestamps.
-- **Out-of-Order Webhook Protection**:
-  - Implemented terminal state guards (`:canceled`, `:incomplete_expired`). Delayed or reordered incoming webhooks cannot resurrect terminated subscriptions.
-- **Customer Creation Idempotency & Persistence**:
-  - `AshBilling.create_customer/2` now automatically injects a deterministic `Idempotency-Key: "ash_cust_<id>"` header on provider calls.
-  - Added `persist: true` option to optionally update customer records immediately in the local data layer.
-- **Resilience and Edge Case Test Suite**:
-  - Expanded test suite to 171 tests across 36 scenarios covering Spark compile-time verifiers, network/transport outages, out-of-order deliveries, and configuration auditing. Test coverage now stands at 91.32%.
-  - Added automated coverage gate in CI (`mix test --cover`).
-
-### Fixed
-
-- **Canceled Subscription Authorization Flaw**:
-  - Hardened `AshBilling.Subscription.Transformers.AddSubscriptionAttributes` and `AshBilling.active_subscription?/1` so that terminated subscriptions (`status in [:canceled, "canceled"]`) evaluate strictly to `active? == false`, preventing unauthorized access even if `trial_ends_at` is set in the future.
-- **Deduplication Error Propagation**:
-  - Hardened `AshBilling.Deduplication.mark_processed/2` to return `{:error, reason}` on storage failures instead of swallowing them. Duplicate key conflicts on `event_id` remain cleanly idempotent (`:ok`), while unexpected errors cause `AshBilling.Plug` to return HTTP 500 to trigger Stripe retry backoff.
-- **Database Read Failure Propagation**:
-  - Hardened `AshBilling.WebhookSync` to propagate unexpected read failures during customer and subscription lookups back to `AshBilling.Plug` as HTTP 500, preventing duplicate records from silent query misses.
-
----
-
-## [v0.1.1] - 2026-10-27
-
-### Added
-
+- **Multi-Node Distributed Deduplication Engine (`AshBilling.Deduplication`)**:
+  - Cryptographically secure `lease_token` generated on every lease acquisition.
+  - Zombie worker rejection: workers completing (`complete/2`) or releasing (`release/2`) after lease expiration or reclamation are strictly rejected with `{:error, :lease_token_mismatch}`, preventing state corruption from delayed workers.
+  - Automatic stale lease reclamation: abandoned leases exceeding configurable TTL (default 60s) or left in `:failed` state are atomically reclaimed with attempt counter incrementing.
+  - Fail-fast configuration validation: `:resource` strategy strictly fails with `{:error, :deduplication_resource_not_configured}` rather than silently falling back to local memory, ensuring multi-node deployments fail safely.
+  - Resource contract enforcement: validating upfront that persistent deduplication resources have both `:status` and an atomic `:update` action, failing fast with `{:error, :resource_lacks_update_action}`.
+  - Immutable `:processed` events: once marked `:processed`, records cannot be released or mutated back to `:failed`.
+- **Atomic Conditional Webhook Synchronization (`AshBilling.WebhookSync`)**:
+  - `update_subscription_safely/5`: executes conditional updates via `Ash.bulk_update` (`strategy: [:atomic]`) filtering on `(is_nil(last_event_created_at) or last_event_created_at <= ^event_dt)`. Out-of-order older webhooks are discarded without overwriting newer state.
+  - Same-second conflict resolution (`same_second_conflict?/3`): detects divergent subscription attributes arriving within the same second and queries the payment provider for authoritative live state.
+  - Safe live reconciliation (`reconcile_subscription_with_provider/7`): updates derived from authoritative live provider queries are written through atomic conditional bulk updates, preventing race conditions if newer events arrive during live API calls.
+  - Terminal state protection: subscription records in terminal states (`:canceled`, `:incomplete_expired`) cannot be resurrected by delayed or reordered incoming webhooks.
+- **Enterprise Webhook Ingestion Protocol (`AshBilling.Plug`)**:
+  - Explicit HTTP 503 with `Retry-After: 5` header when an incoming webhook is currently being processed by another worker (`already_processing`), instructing Stripe to back off and retry.
+  - HTTP 500 fail-closed semantics for unconfigured deduplication resources, persistence failures, database sync errors, or missing webhook secrets.
+  - Zero-downtime secret rotation: verifies all `v1` signatures present in `Stripe-Signature` header using constant-time comparison.
+- **PostgreSQL Distributed Contention Test Suite**:
+  - Real integration tests (`AshBilling.PostgresDeduplicationTest`) verifying multi-process lease contention, atomic completion, stale lease reclamation, and zombie worker protection against PostgreSQL 16.
+  - Automated PostgreSQL 16 service container in GitHub Actions CI with strict CI enforcement (`raise` if PostgreSQL is unavailable when `CI=true`).
 - **Spark DSL Compile-Time Verifiers**:
-  - `VerifyCustomerRelationship`: Validates at compile time that the relationship configured via `customer_relationship` actually exists on the resource.
-  - `VerifyCustomerIdAttribute`: Validates at compile time that custom `customer_id_attribute` types are string-compatible (`:string` or `:ci_string`).
+  - `VerifyCustomerRelationship`: validates at compile time that configured customer relationships exist on the target resource.
+  - `VerifyCustomerIdAttribute`: validates that custom customer ID attributes are string-compatible.
+- **Modernized Stripe API Compatibility**:
+  - Recursive payload extraction for nested `items.data[].current_period_end` and `trial_settings` alongside legacy root timestamps.
+  - Parameter normalization for `mode` in Checkout Sessions (accepting both `:subscription` and `"subscription"`).
+  - Deterministic idempotency keys (`ash_cust_<id>`) on customer creation.
 
-### Fixed
+### Changed
 
-- **Router and Igniter Option Consistency**:
-  - Standardized `customer_resource` option across `AshBilling.Plug`, `AshBilling.WebhookSync`, `Mix.Tasks.AshBilling.Install`, and all documentation.
-  - Added transparent backwards-compatible normalization for `:resource` in `AshBilling.Plug` and `AshBilling.WebhookSync`.
-- **Test Resources and Multi-Version CI Stability**:
-  - Pruned unsupported actions on `AshBilling.Test.WebhookEvent` to ensure clean compile-time validation under `Ash.DataLayer.Ets` across Elixir 1.17 and 1.18.
-  - Refactored live Stripe integration test suites to provision dynamic test customers on Stripe instead of relying on static accounts.
-
----
+- Updated minimum test coverage gate to >= 90.00% in CI.
+- Updated documentation and tutorials to `{:ash_billing, "~> 0.2.0"}`.
 
 ## [v0.1.0] - 2026-10-26
 
