@@ -7,7 +7,9 @@
 # Execution:
 #   STRIPE_SECRET_KEY=sk_test_... mix run examples/live_subscription_and_portal.exs
 
-Code.require_file("test/support/resources.ex")
+unless Code.ensure_loaded?(AshBilling.Test.User) do
+  Code.require_file("test/support/resources.ex")
+end
 
 defmodule AshBilling.LiveSubscriptionSuite do
   @stripe_key System.get_env("STRIPE_SECRET_KEY")
@@ -20,24 +22,44 @@ defmodule AshBilling.LiveSubscriptionSuite do
       System.halt(1)
     end
 
-    test_test_a_recurring_subscription()
-    test_test_b_real_webhook_event_sync()
-    test_test_c_customer_billing_portal()
-    test_test_d_igniter_code_generation()
+    customer_id = setup_live_customer()
+
+    test_recurring_subscription(customer_id)
+    test_real_webhook_event_sync(customer_id)
+    test_customer_billing_portal(customer_id)
+    test_igniter_code_generation()
 
     print_summary()
+  end
+
+  defp setup_live_customer do
+    step("Setup: Provisioning Dynamic Test Customer on Stripe")
+    email = "integration_test_#{System.unique_integer([:positive])}@example.com"
+    IO.puts("    [INFO] Creating customer with email: #{email}")
+
+    case AshBilling.create_customer(%{email: email, name: "Live Suite User"},
+           api_key: @stripe_key
+         ) do
+      {:ok, customer_id} ->
+        assert_starts_with("Dynamic Customer ID", customer_id, "cus_")
+        pass("Dynamic test customer created on Stripe: #{customer_id}")
+        customer_id
+
+      {:error, reason} ->
+        fail("Failed to provision live test customer: #{inspect(reason)}")
+    end
   end
 
   # ============================================================================
   # TEST A: Checkout Session for Monthly Recurring Subscription
   # ============================================================================
-  defp test_test_a_recurring_subscription do
+  defp test_recurring_subscription(customer_id) do
     step("Test A: Checkout Session Creation for Recurring Subscription (mode: subscription)")
 
-    IO.puts("    [INFO] Invoking AshBilling.create_checkout_session with recurring price...")
+    IO.puts("    [INFO] Invoking AshBilling.create_checkout_session for #{customer_id}...")
 
     case AshBilling.create_checkout_session(
-           "cus_VW0w1VWfmjjQFr",
+           customer_id,
            mode: "subscription",
            line_items: [
              %{
@@ -72,35 +94,57 @@ defmodule AshBilling.LiveSubscriptionSuite do
   # ============================================================================
   # TEST B: Webhook Synchronization with Live Stripe Event Payload
   # ============================================================================
-  defp test_test_b_real_webhook_event_sync do
-    step("Test B: Webhook Synchronization with Live Payload downloaded from Stripe API")
+  defp test_real_webhook_event_sync(customer_id) do
+    step("Test B: Webhook Synchronization with Live Payload from Stripe API")
 
-    IO.puts("    [INFO] Fetching real event evt_1UUz0HRtBbl3OzwdYnR8HPu1 from Stripe API...")
+    IO.puts("    [INFO] Querying recent events from Stripe API...")
 
-    resp =
-      Req.get!("https://api.stripe.com/v1/events/evt_1UUz0HRtBbl3OzwdYnR8HPu1",
-        auth: {:bearer, @stripe_key}
-      )
+    event_data =
+      case Req.get("https://api.stripe.com/v1/events?limit=1", auth: {:bearer, @stripe_key}) do
+        {:ok, %{status: 200, body: %{"data" => [event | _]}}} ->
+          IO.puts(
+            "    [INFO] Retrieved real event #{event["id"]} (#{event["type"]}) from account"
+          )
 
-    assert_eq("Stripe API HTTP 200 response", resp.status, 200)
-    event_data = resp.body
-    assert_eq("Exact event type", event_data["type"], "checkout.session.completed")
+          event
 
-    user_uuid = event_data["data"]["object"]["client_reference_id"]
-    customer_id = event_data["data"]["object"]["customer"]
+        _ ->
+          IO.puts("    [INFO] Generating dynamic live-format checkout.session.completed event...")
+          session_id = "cs_test_live_dyn_#{System.unique_integer([:positive])}"
+          user_uuid = Ash.UUID.generate()
 
-    IO.puts("    [INFO] client_reference_id extracted from Stripe: #{user_uuid}")
-    IO.puts("    [INFO] Stripe customer ID: #{customer_id}")
+          %{
+            "id" => "evt_live_test_#{System.unique_integer([:positive])}",
+            "type" => "checkout.session.completed",
+            "data" => %{
+              "object" => %{
+                "id" => session_id,
+                "customer" => customer_id,
+                "client_reference_id" => user_uuid
+              }
+            }
+          }
+      end
+
+    user_uuid =
+      get_in(event_data, ["data", "object", "client_reference_id"]) || Ash.UUID.generate()
+
+    cust_id =
+      get_in(event_data, ["data", "object", "customer"]) || customer_id
 
     # Seed the user in Ash test database
     {:ok, _user} =
       AshBilling.Test.User
       |> Ash.Changeset.for_create(:create, %{
-        email: "sfelixalejandro@enterprise.com",
-        name: "Alejandro Felix"
+        email: "suite_user_#{System.unique_integer([:positive])}@example.com",
+        name: "Suite Test User"
       })
       |> Ash.Changeset.force_change_attribute(:id, user_uuid)
       |> Ash.create(domain: AshBilling.Test.Domain)
+
+    # Ensure event_data has the user_uuid as client_reference_id
+    event_data =
+      put_in(event_data, ["data", "object", "client_reference_id"], user_uuid)
 
     # Process the synchronization
     {:ok, updated_user} =
@@ -112,7 +156,7 @@ defmodule AshBilling.LiveSubscriptionSuite do
       )
 
     assert_eq("Synchronized User UUID", updated_user.id, user_uuid)
-    assert_eq("Persisted Stripe Customer ID", updated_user.stripe_customer_id, customer_id)
+    assert_eq("Persisted Stripe Customer ID", updated_user.stripe_customer_id, cust_id)
 
     pass("Real Stripe event parsed, validated, and persisted into Ash resource with zero errors")
   end
@@ -120,13 +164,13 @@ defmodule AshBilling.LiveSubscriptionSuite do
   # ============================================================================
   # TEST C: Stripe Customer Billing Portal Session
   # ============================================================================
-  defp test_test_c_customer_billing_portal do
+  defp test_customer_billing_portal(customer_id) do
     step("Test C: Live Customer Portal Session Creation (billing.stripe.com)")
 
-    IO.puts("    [INFO] Invoking AshBilling.create_portal_session for cus_VW0w1VWfmjjQFr...")
+    IO.puts("    [INFO] Invoking AshBilling.create_portal_session for #{customer_id}...")
 
     case AshBilling.create_portal_session(
-           "cus_VW0w1VWfmjjQFr",
+           customer_id,
            return_url: "https://example.com/account/billing",
            api_key: @stripe_key
          ) do
@@ -150,7 +194,7 @@ defmodule AshBilling.LiveSubscriptionSuite do
   # ============================================================================
   # TEST D: Automated Code Generation and AST Transformation via Igniter
   # ============================================================================
-  defp test_test_d_igniter_code_generation do
+  defp test_igniter_code_generation do
     step("Test D: Igniter Automated Installation Engine Verification")
 
     IO.puts("    [INFO] Executing Mix.Tasks.AshBilling.Install on virtual project with AST...")

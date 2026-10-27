@@ -153,7 +153,7 @@ defmodule AshBilling.Test.WebhookEvent do
 
   actions do
     default_accept :*
-    defaults [:read, :create, :update, :destroy]
+    defaults [:read, :create]
   end
 end
 

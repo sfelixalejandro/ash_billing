@@ -25,7 +25,7 @@ defmodule AshBilling.WebhookSync do
     event_type = Map.get(event, "type")
     event_id = Map.get(event, "id")
     domain = Keyword.get(opts, :domain)
-    customer_resource = Keyword.get(opts, :customer_resource)
+    customer_resource = Keyword.get(opts, :customer_resource) || Keyword.get(opts, :resource)
     subscription_resource = Keyword.get(opts, :subscription_resource)
 
     Logger.debug("AshBilling.WebhookSync: Processing event #{inspect(event_type)}")

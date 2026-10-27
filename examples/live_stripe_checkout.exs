@@ -1,7 +1,9 @@
 # AshBilling Live Stripe Integration Test Runner
 # Run with: mix run examples/live_stripe_checkout.exs
 
-Code.require_file("test/support/resources.ex")
+unless Code.ensure_loaded?(AshBilling.Test.User) do
+  Code.require_file("test/support/resources.ex")
+end
 
 defmodule AshBilling.LiveStripe.Router do
   use Plug.Router
@@ -123,8 +125,8 @@ defmodule AshBilling.LiveStripeRunner do
   defp test_valid_hmac_and_persistence(user) do
     step("2. Cryptographic HMAC-SHA256 Signature Verification and DB Persistence")
 
-    event_id = "evt_empiric_create_001"
-    sub_id = "sub_empiric_live_100"
+    event_id = "evt_live_test_create_001"
+    sub_id = "sub_live_test_100"
 
     payload =
       Jason.encode!(%{
@@ -215,13 +217,13 @@ defmodule AshBilling.LiveStripeRunner do
   defp test_idempotent_deduplication do
     step("5. Idempotency and Deduplication against Network Retries")
 
-    event_id = "evt_empiric_dedup_888"
+    event_id = "evt_live_test_dedup_888"
 
     payload =
       Jason.encode!(%{
         "id" => event_id,
         "type" => "customer.subscription.updated",
-        "data" => %{"object" => %{"id" => "sub_empiric_live_100", "status" => "active"}}
+        "data" => %{"object" => %{"id" => "sub_live_test_100", "status" => "active"}}
       })
 
     sig = generate_signature(payload, @secret)
@@ -259,7 +261,7 @@ defmodule AshBilling.LiveStripeRunner do
         "type" => "customer.subscription.updated",
         "data" => %{
           "object" => %{
-            "id" => "sub_empiric_live_100",
+            "id" => "sub_live_test_100",
             "customer" => user.stripe_customer_id,
             "status" => "paused"
           }
@@ -287,7 +289,7 @@ defmodule AshBilling.LiveStripeRunner do
         "type" => "customer.subscription.deleted",
         "data" => %{
           "object" => %{
-            "id" => "sub_empiric_live_100",
+            "id" => "sub_live_test_100",
             "customer" => user.stripe_customer_id,
             "status" => "canceled"
           }

@@ -103,6 +103,8 @@ defmodule AshBilling.Testbed do
 end
 
 # Ensure test support modules are loaded
-Code.require_file("test/support/resources.ex")
+unless Code.ensure_loaded?(AshBilling.Test.User) do
+  Code.require_file("test/support/resources.ex")
+end
 
 AshBilling.Testbed.start()

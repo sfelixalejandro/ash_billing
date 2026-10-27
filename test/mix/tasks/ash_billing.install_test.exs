@@ -48,7 +48,7 @@ defmodule Mix.Tasks.AshBilling.InstallTest do
     |> assert_has_patch("lib/test_app_web/router.ex", """
     |  scope "/webhooks" do
     |    forward("/stripe", AshBilling.Plug,
-    |      resource: TestApp.Accounts.User,
+    |      customer_resource: TestApp.Accounts.User,
     |      subscription_resource: TestApp.Billing.Subscription
     |    )
     |  end

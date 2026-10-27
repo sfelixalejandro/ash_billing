@@ -15,7 +15,13 @@ defmodule AshBilling.Plug do
   import Plug.Conn
 
   @impl true
-  def init(opts), do: opts
+  def init(opts) do
+    if Keyword.has_key?(opts, :resource) and not Keyword.has_key?(opts, :customer_resource) do
+      Keyword.put(opts, :customer_resource, Keyword.get(opts, :resource))
+    else
+      opts
+    end
+  end
 
   @impl true
   def call(conn, opts) do
@@ -46,7 +52,8 @@ defmodule AshBilling.Plug do
               else
                 sync_result =
                   if Keyword.has_key?(opts, :subscription_resource) or
-                       Keyword.has_key?(opts, :customer_resource) do
+                       Keyword.has_key?(opts, :customer_resource) or
+                       Keyword.has_key?(opts, :resource) do
                     AshBilling.WebhookSync.sync_event(event, opts)
                   else
                     {:ok, :not_configured}

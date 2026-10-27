@@ -214,7 +214,7 @@ if Code.ensure_loaded?(Igniter) do
       if router do
         scope_code = """
         forward "/stripe", AshBilling.Plug,
-          resource: #{inspect(customer)},
+          customer_resource: #{inspect(customer)},
           subscription_resource: #{inspect(subscription)}
         """
 
@@ -230,7 +230,7 @@ if Code.ensure_loaded?(Igniter) do
 
             scope "/webhooks" do
               forward "/stripe", AshBilling.Plug,
-                resource: #{inspect(customer)},
+                customer_resource: #{inspect(customer)},
                 subscription_resource: #{inspect(subscription)}
             end
         """)

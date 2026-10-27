@@ -212,7 +212,7 @@ Then configure it in your router or application config:
 
 ```elixir
 forward "/webhooks/stripe", AshBilling.Plug,
-  resource: MyApp.Accounts.User,
+  customer_resource: MyApp.Accounts.User,
   subscription_resource: MyApp.Billing.Subscription,
   deduplication_resource: MyApp.Billing.WebhookEvent
 ```
