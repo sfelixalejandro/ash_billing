@@ -176,6 +176,8 @@ defmodule AshBilling.PlugTest do
       capture_log(fn ->
         conn2 = BillingPlug.call(conn2, opts2)
         assert conn2.status == 200
+        assert conn2.resp_body =~ "synchronization_failed"
+        assert AshBilling.Deduplication.processed?("evt_sync_fail_500", opts2) == false
       end)
     end
 

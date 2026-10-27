@@ -93,18 +93,20 @@ defmodule AshBilling.Plug do
                          event_type: event_type
                        }}
 
-                    {:error, dedup_reason} when return_500? ->
+                    {:error, dedup_reason} ->
                       require Logger
 
+                      status_code = if return_500?, do: 500, else: 200
+
                       Logger.error(
-                        "AshBilling.Plug: Failed to acquire deduplication lease for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(dedup_reason)}. Returning HTTP 500."
+                        "AshBilling.Plug: Failed to acquire deduplication lease for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(dedup_reason)}. Returning HTTP #{status_code}."
                       )
 
                       resp_conn =
                         conn
                         |> put_resp_content_type("application/json")
                         |> send_resp(
-                          500,
+                          status_code,
                           Jason.encode!(%{
                             error: "deduplication_failed",
                             details: inspect(dedup_reason)
@@ -131,11 +133,17 @@ defmodule AshBilling.Plug do
                         end
 
                       case sync_result do
-                        {:error, reason} when return_500? ->
+                        {:error, reason} ->
                           require Logger
 
+                          status_code = if return_500?, do: 500, else: 200
+
                           Logger.error(
-                            "AshBilling.Plug: Webhook synchronization failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(reason)}. Releasing lease. Returning HTTP 500 to trigger Stripe retry."
+                            "AshBilling.Plug: Webhook synchronization failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(reason)}. Releasing lease. " <>
+                              if(return_500?,
+                                do: "Returning HTTP 500 to trigger Stripe retry.",
+                                else: "Returning HTTP 200."
+                              )
                           )
 
                           if deduplicate? do
@@ -149,7 +157,7 @@ defmodule AshBilling.Plug do
                             conn
                             |> put_resp_content_type("application/json")
                             |> send_resp(
-                              500,
+                              status_code,
                               Jason.encode!(%{
                                 error: "synchronization_failed",
                                 details: inspect(reason)
@@ -180,11 +188,17 @@ defmodule AshBilling.Plug do
                             end
 
                           case handler_result do
-                            {:error, handler_reason} when return_500? ->
+                            {:error, handler_reason} ->
                               require Logger
 
+                              status_code = if return_500?, do: 500, else: 200
+
                               Logger.error(
-                                "AshBilling.Plug: Custom handler #{inspect(handler)} failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(handler_reason)}. Releasing lease and returning HTTP 500 to trigger retry."
+                                "AshBilling.Plug: Custom handler #{inspect(handler)} failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(handler_reason)}. Releasing lease and " <>
+                                  if(return_500?,
+                                    do: "returning HTTP 500 to trigger retry.",
+                                    else: "returning HTTP 200."
+                                  )
                               )
 
                               if deduplicate? do
@@ -198,7 +212,7 @@ defmodule AshBilling.Plug do
                                 conn
                                 |> put_resp_content_type("application/json")
                                 |> send_resp(
-                                  500,
+                                  status_code,
                                   Jason.encode!(%{
                                     error: "handler_failed",
                                     details: inspect(handler_reason)
@@ -240,18 +254,24 @@ defmodule AshBilling.Plug do
                                      event_type: event_type
                                    }}
 
-                                {:error, complete_reason} when return_500? ->
+                                {:error, complete_reason} ->
                                   require Logger
 
+                                  status_code = if return_500?, do: 500, else: 200
+
                                   Logger.error(
-                                    "AshBilling.Plug: Failed to complete deduplication lease for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(complete_reason)}. Returning HTTP 500 to trigger retry."
+                                    "AshBilling.Plug: Failed to complete deduplication lease for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(complete_reason)}. " <>
+                                      if(return_500?,
+                                        do: "Returning HTTP 500 to trigger retry.",
+                                        else: "Returning HTTP 200."
+                                      )
                                   )
 
                                   resp_conn =
                                     conn
                                     |> put_resp_content_type("application/json")
                                     |> send_resp(
-                                      500,
+                                      status_code,
                                       Jason.encode!(%{
                                         error: "completion_failed",
                                         details: inspect(complete_reason)

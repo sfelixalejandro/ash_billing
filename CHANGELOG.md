@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.1.9] - 2026-10-27
+
+### Fixed
+
+- **Persistent Atomic Reclaim for Custom/Degraded Resources**:
+  - In `perform_atomic_reclaim/7`, resources lacking `:update` actions no longer perform unpersisted destroys with orphaned tokens. Reclaiming now executes atomic conditional bulk destruction and immediately persists a new lease record with `Ash.create/4`.
+  - Propagates errors when resources lack both update and destroy capabilities (`{:error, :resource_lacks_update_action}`).
+- **Exhaustive Plug Error Handling & Unconditional Lease Release**:
+  - In `AshBilling.Plug`, synchronization, custom handler, deduplication, and completion errors now handle both `return_500_on_sync_error: true` (HTTP 500) and `return_500_on_sync_error: false` (HTTP 200 with error details).
+  - Webhooks that fail database synchronization are strictly prevented from executing custom handlers or marking the event as completed/processed, releasing the lease unconditionally to unblock retry delivery.
+- **PostgreSQL Fallback Race Integration Test**:
+  - Added test case in `postgres_deduplication_test.exs` verifying that a worker attempting fallback release with an obsolete token cannot delete a lease concurrently reclaimed by another worker in PostgreSQL.
+
+---
+
 ## [v0.1.8] - 2026-10-27
 
 ### Fixed

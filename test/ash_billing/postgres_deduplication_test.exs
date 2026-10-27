@@ -146,5 +146,46 @@ defmodule AshBilling.PostgresDeduplicationTest do
       assert :ok = Deduplication.complete(event_id, [lease_token: retry_token] ++ @opts)
       assert Deduplication.processed?(event_id, @opts) == true
     end
+
+    test "atomic fallback destruction race: worker attempting fallback destruction with stale token cannot delete a reclaimed lease" do
+      event_id = "evt_pg_destroy_race_#{System.unique_integer([:positive])}"
+
+      # Worker A acquires lease
+      assert {:ok, token_a} = Deduplication.acquire(event_id, @opts)
+
+      # Age the lease in PostgreSQL beyond 60s cutoff so Worker B can reclaim it
+      two_minutes_ago = DateTime.add(DateTime.utc_now(), -120, :second)
+
+      Ecto.Adapters.SQL.query!(
+        Repo,
+        "UPDATE webhook_events SET last_attempt_at = $1 WHERE event_id = $2",
+        [two_minutes_ago, event_id]
+      )
+
+      # Worker B reclaims the lease atomically with a new token
+      assert {:ok, token_b} = Deduplication.acquire(event_id, @opts)
+      assert token_b != token_a
+
+      # Worker A, having encountered a failure, attempts to release/destroy the lease with stale token_a
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.release(
+                 event_id,
+                 [lease_token: token_a, error: :worker_a_failed] ++ @opts
+               )
+
+      # Ensure Worker B's active lease record was NOT destroyed from PostgreSQL
+      result =
+        Ecto.Adapters.SQL.query!(
+          Repo,
+          "SELECT lease_token, status FROM webhook_events WHERE event_id = $1",
+          [event_id]
+        )
+
+      assert [[^token_b, "processing"]] = result.rows
+
+      # Worker B can successfully complete the event
+      assert :ok = Deduplication.complete(event_id, [lease_token: token_b] ++ @opts)
+      assert Deduplication.processed?(event_id, @opts) == true
+    end
   end
 end
