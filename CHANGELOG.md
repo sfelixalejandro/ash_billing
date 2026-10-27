@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.1.7] - 2026-10-27
+
+### Added
+
+- **PostgreSQL Distributed Integration Test Suite**:
+  - Added `{:ash_postgres, "~> 2.15", only: [:dev, :test]}` and `{:postgrex, ">= 0.0.0", only: [:dev, :test]}`.
+  - Implemented real integration tests (`AshBilling.PostgresDeduplicationTest`) verifying multi-process lease contention, atomic completion, stale lease reclamation, and zombie worker protection directly against PostgreSQL.
+  - Configured PostgreSQL 16 service container in GitHub Actions CI across all test matrix environments.
+
+### Fixed
+
+- **Atomic Conditional `complete/2` and `release/2`**:
+  - `Deduplication.complete/2` and `Deduplication.release/2` execute single atomic conditional queries via `Ash.bulk_update/4` with `strategy: [:atomic]`, verifying that `event_id`, `status == :processing`, and `lease_token` match simultaneously during write.
+  - Zero-record updates distinguish between terminal `:processed` state, `:lease_token_mismatch`, and unacquired leases, preventing zombie or delayed workers from altering records after their lease has been reclaimed.
+  - In-memory strategy (`:memory`) refactored with atomic `:ets.select_replace/2` operations, eliminating check-then-act race conditions between lookup and insert.
+- **Explicit HTTP 503 on `already_processing`**:
+  - `AshBilling.Plug` distinguishes between `already_processed` (HTTP 200) and `already_processing` (HTTP 503 with `Retry-After: 5` header).
+  - Webhooks delivered while another worker is actively processing return HTTP 503, instructing Stripe to back off and retry later without prematurely considering the webhook as permanently delivered.
+
+---
+
 ## [v0.1.6] - 2026-10-27
 
 ### Fixed

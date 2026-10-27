@@ -273,16 +273,76 @@ defmodule AshBilling.DeduplicationTest do
       assert {:ok, _} = Deduplication.acquire("evt_failing_upd_2", opts_failing)
       assert {:error, _} = Deduplication.acquire("evt_failing_upd_2", opts_failing)
 
-      # Exception rescues on invalid configuration
-      opts_invalid = [
-        deduplication_strategy: :resource,
-        deduplication_resource: :invalid_not_a_resource
-      ]
+      # Resource release and complete branches on WebhookEvent
+      evt_fail_res = "evt_res_failed_#{System.unique_integer([:positive])}"
+      assert {:ok, tok_f} = Deduplication.acquire(evt_fail_res, opts_webhook)
+      assert :ok = Deduplication.release(evt_fail_res, [lease_token: tok_f] ++ opts_webhook)
+      # Release on already failed record returns :ok
+      assert :ok = Deduplication.release(evt_fail_res, opts_webhook)
 
-      assert {:error, _} = Deduplication.acquire("evt_invalid_cfg", opts_invalid)
-      assert {:error, _} = Deduplication.complete("evt_invalid_cfg", opts_invalid)
-      assert {:error, _} = Deduplication.release("evt_invalid_cfg", opts_invalid)
-      assert false == Deduplication.processed?("evt_invalid_cfg", opts_invalid)
+      # Mismatching token on an actively processing event
+      evt_processing_res = "evt_res_proc_#{System.unique_integer([:positive])}"
+      assert {:ok, _tok_p} = Deduplication.acquire(evt_processing_res, opts_webhook)
+
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.release(
+                 evt_processing_res,
+                 [lease_token: "wrong_tok"] ++ opts_webhook
+               )
+
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.complete(
+                 evt_processing_res,
+                 [lease_token: "wrong_tok"] ++ opts_webhook
+               )
+
+      # Exception rescues on non-keyword list options
+      assert {:error, _} = Deduplication.acquire("evt_raise", :not_a_keyword_list)
+      assert {:error, _} = Deduplication.complete("evt_raise", :not_a_keyword_list)
+      assert {:error, _} = Deduplication.release("evt_raise", :not_a_keyword_list)
+      assert false == Deduplication.processed?("evt_raise", :not_a_keyword_list)
+
+      # Release with matching token on an already processed record returns {:error, :lease_not_acquired}
+      evt_proc_res = "evt_res_proc_already_#{System.unique_integer([:positive])}"
+      assert {:ok, tok_p} = Deduplication.acquire(evt_proc_res, opts_webhook)
+      assert :ok = Deduplication.complete(evt_proc_res, [lease_token: tok_p] ++ opts_webhook)
+
+      assert {:error, :lease_not_acquired} =
+               Deduplication.release(evt_proc_res, [lease_token: tok_p] ++ opts_webhook)
+
+      # Complete on an already failed record with matching token returns {:error, :lease_not_acquired}
+      evt_fail_res2 = "evt_res_fail_already_#{System.unique_integer([:positive])}"
+      assert {:ok, tok_f2} = Deduplication.acquire(evt_fail_res2, opts_webhook)
+      assert :ok = Deduplication.release(evt_fail_res2, [lease_token: tok_f2] ++ opts_webhook)
+
+      assert {:error, :lease_not_acquired} =
+               Deduplication.complete(evt_fail_res2, [lease_token: tok_f2] ++ opts_webhook)
+
+      # Five workers race to reclaim an expired WebhookEvent record
+      evt_expire_race = "evt_exp_race_#{System.unique_integer([:positive])}"
+      assert {:ok, _tok1} = Deduplication.acquire(evt_expire_race, opts_webhook)
+      two_min_ago = DateTime.add(DateTime.utc_now(), -120, :second)
+
+      Ash.update!(
+        Ash.get!(WebhookEvent, evt_expire_race, domain: Domain),
+        %{
+          last_attempt_at: two_min_ago
+        },
+        domain: Domain
+      )
+
+      reclaim_results =
+        1..5
+        |> Enum.map(fn _ ->
+          Task.async(fn -> Deduplication.acquire(evt_expire_race, opts_webhook) end)
+        end)
+        |> Enum.map(&Task.await(&1, 5000))
+
+      assert Enum.count(reclaim_results, &match?({:ok, _}, &1)) == 1
+      assert Enum.count(reclaim_results, &match?({:error, :already_processing}, &1)) == 4
+
+      # Sweep callback
+      send(Process.whereis(AshBilling.Deduplication), :sweep)
     end
 
     test "memory strategy legacy tuple formats and fallback branches" do
@@ -345,6 +405,50 @@ defmodule AshBilling.DeduplicationTest do
       # Legacy 3-tuple release
       :ets.insert(:ash_billing_processed_events, {"evt_legacy_rel_proc", :processing, 12345})
       assert :ok = Deduplication.release("evt_legacy_rel_proc", deduplication_strategy: :memory)
+
+      # delete_memory with mismatching lease token
+      :ets.insert(
+        :ash_billing_processed_events,
+        {"evt_mem_mismatch", :processing, 12345, "token_1"}
+      )
+
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.release("evt_mem_mismatch",
+                 lease_token: "token_2",
+                 deduplication_strategy: :memory
+               )
+
+      # delete_memory on already failed records
+      :ets.insert(
+        :ash_billing_processed_events,
+        {"evt_mem_already_failed_4", :failed, 12345, "token_1"}
+      )
+
+      assert :ok =
+               Deduplication.release("evt_mem_already_failed_4",
+                 lease_token: "token_1",
+                 deduplication_strategy: :memory
+               )
+
+      :ets.insert(:ash_billing_processed_events, {"evt_mem_already_failed_3", :failed, 12345})
+
+      assert :ok =
+               Deduplication.release("evt_mem_already_failed_3", deduplication_strategy: :memory)
+
+      # complete_memory on 3-tuple :processed
+      :ets.insert(:ash_billing_processed_events, {"evt_mem_3tuple_proc", :processed, 12345})
+      assert :ok = Deduplication.complete("evt_mem_3tuple_proc", deduplication_strategy: :memory)
+
+      # Reclaim an ETS 3-tuple failed event
+      :ets.insert(:ash_billing_processed_events, {"evt_reclaim_failed_3", :failed, 12345})
+
+      assert {:ok, _} =
+               Deduplication.acquire("evt_reclaim_failed_3", deduplication_strategy: :memory)
+
+      # Nil arguments to API functions
+      assert :ok = Deduplication.release(nil)
+      assert :ok = Deduplication.complete(nil)
+      assert false == Deduplication.processed?(nil)
     end
 
     test "real concurrency: exactly one process wins the acquisition race across multiple parallel tasks" do

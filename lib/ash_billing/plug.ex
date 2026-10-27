@@ -62,14 +62,36 @@ defmodule AshBilling.Plug do
                     end
 
                   case dedup_status do
-                    {:error, already} when already in [:already_processed, :already_processing] ->
+                    {:error, :already_processed} ->
                       resp_conn =
                         conn
                         |> put_resp_content_type("application/json")
-                        |> send_resp(200, Jason.encode!(%{status: to_string(already)}))
+                        |> send_resp(200, Jason.encode!(%{status: "already_processed"}))
                         |> halt()
 
-                      {resp_conn, %{status: already, event_id: event_id, event_type: event_type}}
+                      {resp_conn,
+                       %{status: :already_processed, event_id: event_id, event_type: event_type}}
+
+                    {:error, :already_processing} ->
+                      resp_conn =
+                        conn
+                        |> put_resp_header("retry-after", "5")
+                        |> put_resp_content_type("application/json")
+                        |> send_resp(
+                          503,
+                          Jason.encode!(%{
+                            error: "already_processing",
+                            message: "Event is currently being processed by another worker"
+                          })
+                        )
+                        |> halt()
+
+                      {resp_conn,
+                       %{
+                         status: :already_processing,
+                         event_id: event_id,
+                         event_type: event_type
+                       }}
 
                     {:error, dedup_reason} when return_500? ->
                       require Logger

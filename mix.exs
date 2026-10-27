@@ -1,7 +1,7 @@
 defmodule AshBilling.MixProject do
   use Mix.Project
 
-  @version "0.1.6"
+  @version "0.1.7"
   @description "Declarative billing, subscriptions, and payment providers for the Ash Framework."
   @source_url "https://github.com/sfelixalejandro/ash_billing"
 
@@ -71,7 +71,9 @@ defmodule AshBilling.MixProject do
       # Dev & Test
       {:bandit, "~> 1.5", only: [:dev, :test]},
       {:simple_sat, ">= 0.0.0", only: [:dev, :test]},
-      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
+      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
+      {:ash_postgres, "~> 2.15", only: [:dev, :test]},
+      {:postgrex, ">= 0.0.0", only: [:dev, :test]}
     ]
   end
 

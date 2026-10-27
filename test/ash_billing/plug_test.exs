@@ -63,6 +63,29 @@ defmodule AshBilling.PlugTest do
       refute_received {:webhook_handled, %{"id" => "evt_duplicate_check_99"}}
     end
 
+    test "returns 503 with Retry-After when event is currently already_processing" do
+      event_id = "evt_in_flight_#{System.unique_integer([:positive])}"
+      payload = ~s({"id":"#{event_id}","type":"customer.subscription.created"})
+      opts = BillingPlug.init(webhook_secret: @secret, handler: MockHandler)
+
+      # Acquire lease in advance simulating an in-flight worker
+      assert {:ok, _token} =
+               AshBilling.Deduplication.acquire(event_id, deduplication_strategy: :memory)
+
+      conn = build_signed_conn(payload)
+      conn = BillingPlug.call(conn, opts)
+
+      assert conn.status == 503
+      assert get_resp_header(conn, "retry-after") == ["5"]
+
+      assert Jason.decode!(conn.resp_body) == %{
+               "error" => "already_processing",
+               "message" => "Event is currently being processed by another worker"
+             }
+
+      refute_received {:webhook_handled, %{"id" => ^event_id}}
+    end
+
     test "rejects request with invalid signature" do
       timestamp = System.system_time(:second)
 
