@@ -603,14 +603,14 @@ defmodule AshBilling.WebhookSyncTest do
       assert result.price_id == "price_authoritative_t2"
       assert DateTime.compare(result.last_event_created_at, t2) == :eq
 
-      # When record no longer exists in DB during 0-records match, returns {:ok, existing}
+      # A missing record must not be reported as a successful stale write.
       deleted_existing = %{
         existing
         | id: Ash.UUID.generate(),
           provider_subscription_id: "sub_missing_race"
       }
 
-      assert {:ok, returned_existing} =
+      assert {:error, :subscription_not_found} =
                WebhookSync.update_subscription_safely(
                  Subscription,
                  deleted_existing,
@@ -619,9 +619,7 @@ defmodule AshBilling.WebhookSyncTest do
                  ash_opts
                )
 
-      assert returned_existing.provider_subscription_id == "sub_missing_race"
-
-      # When event_dt is nil, falls back to Ash.update
+      # Missing timestamps still use the atomic state guard.
       assert {:ok, updated_fallback} =
                WebhookSync.update_subscription_safely(
                  Subscription,

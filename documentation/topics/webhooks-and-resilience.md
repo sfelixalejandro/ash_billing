@@ -131,3 +131,16 @@ Stripe APIs evolve over time, and webhooks may contain string identifiers (`"cus
   nil
 )
 ```
+
+## Concurrent subscription updates
+
+Subscription updates compare the persisted status at commit time with the status read
+by the worker. A pending nonterminal update cannot overwrite a terminal status committed
+while a provider request was in flight, including events with equal timestamps. Older
+event timestamps are also rejected. A conflicting nonterminal status change returns
+`{:error, :subscription_changed_concurrently}` so the webhook can be retried.
+
+For Stripe, `canceled` and `incomplete_expired` are terminal for the same subscription ID.
+A new subscription uses a new ID; resuming a scheduled cancellation before it becomes
+terminal remains supported. Custom providers can transition a terminal state that the
+worker actually read, subject to the same timestamp and atomic concurrency guards.

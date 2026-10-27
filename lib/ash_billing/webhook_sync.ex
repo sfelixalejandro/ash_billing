@@ -159,7 +159,9 @@ defmodule AshBilling.WebhookSync do
           # Out-of-order event protection:
           # Terminal states in Stripe (canceled, incomplete_expired) can never legitimately
           # transition back to active/past_due. If a delayed webhook arrives out of order, ignore it.
-          existing && terminal_status?(existing.status) && !terminal_status?(status) ->
+          existing && terminal_status?(existing.status) && !terminal_status?(status) &&
+              Keyword.get(opts, :provider, SubscriptionInfo.provider(subscription_resource)) ==
+                AshBilling.Providers.Stripe ->
             require Logger
 
             Logger.warning(
@@ -178,6 +180,10 @@ defmodule AshBilling.WebhookSync do
             )
 
             {:ok, existing}
+
+          # A terminal notification must not be replaced by a same-second live snapshot.
+          existing && terminal_status?(status) ->
+            update_subscription_safely(subscription_resource, existing, attrs, event_dt, ash_opts)
 
           # Conflicting status transition protection:
           # If transitioning backwards from :past_due / :unpaid to :active, reconcile with provider.
@@ -423,17 +429,31 @@ defmodule AshBilling.WebhookSync do
 
     has_update? = Ash.Resource.Info.action(subscription_resource, :update) != nil
 
-    if has_timestamp? and has_update? and not is_nil(event_dt) do
+    if has_update? do
       require Ash.Query
 
-      # Atomic condition: only update if record currently has NULL timestamp
-      # or a timestamp less than or equal to incoming event_dt
+      # Compare at commit time, including when the provider request was in flight.
+      # Nonterminal writes may only replace the status that this worker actually read.
+      # This still permits an intentional transition from an already-read terminal state
+      # for providers whose lifecycle supports it; Stripe rejects those earlier.
+      query = Ash.Query.filter(subscription_resource, id == ^existing.id)
+
       query =
-        subscription_resource
-        |> Ash.Query.filter(
-          id == ^existing.id and
-            (is_nil(last_event_created_at) or last_event_created_at <= ^event_dt)
-        )
+        if has_timestamp? and not is_nil(event_dt) do
+          Ash.Query.filter(
+            query,
+            is_nil(last_event_created_at) or last_event_created_at <= ^event_dt
+          )
+        else
+          query
+        end
+
+      query =
+        if terminal_status?(attrs[:status]) do
+          query
+        else
+          Ash.Query.filter(query, status == ^existing.status)
+        end
 
       bulk_opts =
         ash_opts
@@ -449,7 +469,7 @@ defmodule AshBilling.WebhookSync do
           require Logger
 
           Logger.warning(
-            "AshBilling.WebhookSync: Atomic conditional update matched 0 records for subscription #{inspect(existing.provider_subscription_id)}. A newer event was already applied. Discarding out-of-order write."
+            "AshBilling.WebhookSync: Atomic conditional update matched 0 records for subscription #{inspect(existing.provider_subscription_id)}. The subscription changed concurrently or a newer event was applied."
           )
 
           case fetch_existing_subscription(
@@ -457,8 +477,18 @@ defmodule AshBilling.WebhookSync do
                  existing.provider_subscription_id,
                  ash_opts
                ) do
-            {:ok, latest} when not is_nil(latest) -> {:ok, latest}
-            _ -> {:ok, existing}
+            {:ok, latest} when not is_nil(latest) ->
+              if terminal_status?(latest.status) or existing_event_newer?(latest, event_dt) do
+                {:ok, latest}
+              else
+                {:error, :subscription_changed_concurrently}
+              end
+
+            {:error, reason} ->
+              {:error, reason}
+
+            _ ->
+              {:error, :subscription_not_found}
           end
 
         %Ash.BulkResult{errors: [err | _]} ->
