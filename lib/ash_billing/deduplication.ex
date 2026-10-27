@@ -71,11 +71,18 @@ defmodule AshBilling.Deduplication do
   end
 
   defp acquire_resource(resource, event_id, opts) do
-    domain = Keyword.get(opts, :domain)
-    now = DateTime.utc_now()
-    lease_ttl = Keyword.get(opts, :lease_ttl_seconds, 60)
+    has_status? = Ash.Resource.Info.attribute(resource, :status) != nil
+    has_update? = Ash.Resource.Info.action(resource, :update) != nil
 
-    create_resource_lease(resource, event_id, domain, now, lease_ttl)
+    if has_status? and has_update? do
+      domain = Keyword.get(opts, :domain)
+      now = DateTime.utc_now()
+      lease_ttl = Keyword.get(opts, :lease_ttl_seconds, 60)
+
+      create_resource_lease(resource, event_id, domain, now, lease_ttl)
+    else
+      {:error, :resource_lacks_update_action}
+    end
   end
 
   defp create_resource_lease(resource, event_id, domain, now, lease_ttl) do
@@ -338,7 +345,7 @@ defmodule AshBilling.Deduplication do
           {:error, reason}
       end
     else
-      :ok
+      {:error, :resource_lacks_update_action}
     end
   end
 
@@ -386,7 +393,7 @@ defmodule AshBilling.Deduplication do
             )
           else
             resource
-            |> Ash.Query.filter(event_id == ^event_id)
+            |> Ash.Query.filter(event_id == ^event_id and status == :processing)
           end
 
         update_attrs = %{
@@ -410,6 +417,9 @@ defmodule AshBilling.Deduplication do
                 cond do
                   Map.get(record, :status) == :failed ->
                     :ok
+
+                  Map.get(record, :status) == :processed ->
+                    {:error, :already_processed}
 
                   lease_token != nil and Map.get(record, :lease_token) != nil and
                       Map.get(record, :lease_token) != lease_token ->
@@ -453,14 +463,20 @@ defmodule AshBilling.Deduplication do
       has_status? = Ash.Resource.Info.attribute(resource, :status) != nil
 
       query =
-        if lease_token && has_status? do
-          resource
-          |> Ash.Query.filter(
-            event_id == ^event_id and status == :processing and lease_token == ^lease_token
-          )
-        else
-          resource
-          |> Ash.Query.filter(event_id == ^event_id)
+        cond do
+          lease_token && has_status? ->
+            resource
+            |> Ash.Query.filter(
+              event_id == ^event_id and status == :processing and lease_token == ^lease_token
+            )
+
+          has_status? ->
+            resource
+            |> Ash.Query.filter(event_id == ^event_id and status == :processing)
+
+          true ->
+            resource
+            |> Ash.Query.filter(event_id == ^event_id)
         end
 
       case Ash.bulk_destroy(query, :destroy, %{},
@@ -476,11 +492,16 @@ defmodule AshBilling.Deduplication do
         %Ash.BulkResult{status: :success, records: []} ->
           case Ash.get(resource, event_id, domain: domain, authorize?: false) do
             {:ok, record} when not is_nil(record) ->
-              if lease_token != nil and Map.get(record, :lease_token) != nil and
-                   Map.get(record, :lease_token) != lease_token do
-                {:error, :lease_token_mismatch}
-              else
-                :ok
+              cond do
+                Map.get(record, :status) == :processed ->
+                  {:error, :already_processed}
+
+                lease_token != nil and Map.get(record, :lease_token) != nil and
+                    Map.get(record, :lease_token) != lease_token ->
+                  {:error, :lease_token_mismatch}
+
+                true ->
+                  :ok
               end
 
             _ ->
@@ -794,17 +815,12 @@ defmodule AshBilling.Deduplication do
       else
         [
           {
-            {event_id, :_, :_, :_},
+            {event_id, :processing, :_, :_},
             [],
             [{:const, {event_id, :failed, now, nil}}]
           },
           {
-            {event_id, :_, :_},
-            [],
-            [{:const, {event_id, :failed, now, nil}}]
-          },
-          {
-            {event_id, :_},
+            {event_id, :processing, :_},
             [],
             [{:const, {event_id, :failed, now, nil}}]
           }
@@ -829,20 +845,10 @@ defmodule AshBilling.Deduplication do
           :ok
 
         [{^event_id, :processed, _, _}] ->
-          if lease_token == nil do
-            :ets.insert(@table, {event_id, :failed, now, nil})
-            :ok
-          else
-            :ok
-          end
+          {:error, :already_processed}
 
         [{^event_id, :processed, _}] ->
-          if lease_token == nil do
-            :ets.insert(@table, {event_id, :failed, now, nil})
-            :ok
-          else
-            :ok
-          end
+          {:error, :already_processed}
 
         [] ->
           :ok

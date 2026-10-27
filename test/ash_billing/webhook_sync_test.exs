@@ -73,6 +73,7 @@ defmodule AshBilling.WebhookSyncTest do
 
       update_event = %{
         "type" => "customer.subscription.updated",
+        "created" => 1_735_689_600,
         "data" => %{
           "object" => %{
             "id" => "sub_stripe_200",
@@ -488,6 +489,149 @@ defmodule AshBilling.WebhookSyncTest do
       assert {:ok, sub} = WebhookSync.sync_event(event, @opts)
       assert sub.provider_subscription_id == "sub_stripe_email_resolved"
       assert sub.user_id == user.id
+    end
+
+    test "atomic conditional update protects against stale out-of-order writes on the same subscription" do
+      {:ok, _user} =
+        Ash.create(
+          User,
+          %{email: "atomic_race@example.com", stripe_customer_id: "cus_atomic_race"},
+          domain: Domain
+        )
+
+      now_unix = System.system_time(:second)
+      newer_unix = now_unix + 100
+      older_unix = now_unix + 10
+
+      # 1. First event creates subscription at newer_unix
+      newer_event = %{
+        "id" => "evt_newer_webhook",
+        "type" => "customer.subscription.created",
+        "created" => newer_unix,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_atomic_race_1",
+            "customer" => "cus_atomic_race",
+            "status" => "active",
+            "cancel_at_period_end" => false,
+            "items" => %{
+              "data" => [%{"price" => %{"id" => "price_pro"}}]
+            }
+          }
+        }
+      }
+
+      assert {:ok, sub} = WebhookSync.sync_event(newer_event, @opts)
+      assert sub.status == :active
+      assert sub.price_id == "price_pro"
+
+      # 2. Older event arrives out of order with older timestamp
+      older_event = %{
+        "id" => "evt_older_webhook",
+        "type" => "customer.subscription.updated",
+        "created" => older_unix,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_atomic_race_1",
+            "customer" => "cus_atomic_race",
+            "status" => "past_due",
+            "cancel_at_period_end" => false,
+            "items" => %{
+              "data" => [%{"price" => %{"id" => "price_basic"}}]
+            }
+          }
+        }
+      }
+
+      # Syncing older event MUST NOT overwrite the active pro subscription
+      assert {:ok, updated_sub} = WebhookSync.sync_event(older_event, @opts)
+      assert updated_sub.status == :active
+      assert updated_sub.price_id == "price_pro"
+    end
+
+    test "update_subscription_safely atomically rejects stale update when DB record has newer timestamp" do
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{
+            email: "stale_race@example.com",
+            stripe_customer_id: "cus_stale_race"
+          },
+          domain: Domain
+        )
+
+      sub_id = "sub_stale_race_#{System.unique_integer([:positive])}"
+      t1 = ~U[2026-10-27 10:00:00Z]
+      t2 = ~U[2026-10-27 12:00:00Z]
+
+      # Subscription created with older timestamp t1
+      {:ok, existing} =
+        Ash.create(
+          Subscription,
+          %{
+            provider_subscription_id: sub_id,
+            status: :active,
+            user_id: user.id,
+            price_id: "price_initial",
+            last_event_created_at: t1
+          },
+          domain: Domain
+        )
+
+      # Another concurrent worker updates DB record to newer timestamp t2
+      {:ok, newer_db_record} =
+        Ash.update(
+          existing,
+          %{price_id: "price_authoritative_t2", last_event_created_at: t2},
+          domain: Domain
+        )
+
+      # Stale worker attempts to execute update_subscription_safely with older timestamp t1
+      stale_attrs = %{price_id: "price_stale_t1", status: :past_due}
+      ash_opts = [domain: Domain, authorize?: false]
+
+      assert {:ok, result} =
+               WebhookSync.update_subscription_safely(
+                 Subscription,
+                 existing,
+                 stale_attrs,
+                 t1,
+                 ash_opts
+               )
+
+      # The result must be the authoritative record from DB, not the stale write
+      assert result.price_id == "price_authoritative_t2"
+      assert DateTime.compare(result.last_event_created_at, t2) == :eq
+
+      # When record no longer exists in DB during 0-records match, returns {:ok, existing}
+      deleted_existing = %{
+        existing
+        | id: Ash.UUID.generate(),
+          provider_subscription_id: "sub_missing_race"
+      }
+
+      assert {:ok, returned_existing} =
+               WebhookSync.update_subscription_safely(
+                 Subscription,
+                 deleted_existing,
+                 stale_attrs,
+                 t1,
+                 ash_opts
+               )
+
+      assert returned_existing.provider_subscription_id == "sub_missing_race"
+
+      # When event_dt is nil, falls back to Ash.update
+      assert {:ok, updated_fallback} =
+               WebhookSync.update_subscription_safely(
+                 Subscription,
+                 newer_db_record,
+                 %{status: :active},
+                 nil,
+                 ash_opts
+               )
+
+      assert updated_fallback.status == :active
     end
   end
 end

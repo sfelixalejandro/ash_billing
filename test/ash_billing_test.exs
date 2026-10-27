@@ -106,6 +106,39 @@ defmodule AshBillingTest do
                AshBilling.create_checkout_session(user, checkout_opts)
     end
 
+    test "supports atom mode: :subscription and attaches metadata to subscription_data", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
+      Req.Test.stub(stub_name, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        params = URI.decode_query(body)
+
+        assert params["mode"] == "subscription"
+        assert params["subscription_data[metadata][team]"] == "core"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{"id" => "cs_atom_sub", "url" => "https://checkout.test/cs_atom"})
+        )
+      end)
+
+      checkout_opts =
+        opts
+        |> Keyword.merge(
+          mode: :subscription,
+          line_items: [%{price: "price_pro", quantity: 1}],
+          success_url: "https://example.com/success",
+          cancel_url: "https://example.com/cancel",
+          metadata: %{team: "core"}
+        )
+
+      assert {:ok, %{id: "cs_atom_sub"}} =
+               AshBilling.create_checkout_session("cus_atom_test", checkout_opts)
+    end
+
     test "creates checkout session with explicit line_items and payment mode", %{
       stub_name: stub_name,
       opts: opts

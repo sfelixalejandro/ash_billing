@@ -752,11 +752,11 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
 
       assert Deduplication.processed?(event_id, deduplication_strategy: :memory) == true
 
-      # Release deletes lease so retry is possible
-      assert :ok = Deduplication.release(event_id, deduplication_strategy: :memory)
-      assert Deduplication.processed?(event_id, deduplication_strategy: :memory) == false
-      assert {:ok, token2} = Deduplication.acquire(event_id, deduplication_strategy: :memory)
-      assert is_binary(token2)
+      # Release on already processed event returns {:error, :already_processed} and preserves processed state
+      assert {:error, :already_processed} =
+               Deduplication.release(event_id, deduplication_strategy: :memory)
+
+      assert Deduplication.processed?(event_id, deduplication_strategy: :memory) == true
     end
 
     test "acquire locks the lease and enforces uniqueness across database resource" do
@@ -779,11 +779,9 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
       assert :ok = Deduplication.complete(event_id, [lease_token: token1] ++ opts)
       assert {:error, :already_processed} = Deduplication.acquire(event_id, opts)
 
-      # Release transitions lease so retry is possible
-      assert :ok = Deduplication.release(event_id, opts)
-      assert Deduplication.processed?(event_id, opts) == false
-      assert {:ok, token2} = Deduplication.acquire(event_id, opts)
-      assert is_binary(token2)
+      # Release on already processed event returns {:error, :already_processed} and preserves processed state
+      assert {:error, :already_processed} = Deduplication.release(event_id, opts)
+      assert Deduplication.processed?(event_id, opts) == true
     end
   end
 

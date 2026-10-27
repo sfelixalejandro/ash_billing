@@ -187,5 +187,29 @@ defmodule AshBilling.PostgresDeduplicationTest do
       assert :ok = Deduplication.complete(event_id, [lease_token: token_b] ++ @opts)
       assert Deduplication.processed?(event_id, @opts) == true
     end
+
+    test "release strictly refuses to mutate an already :processed event in PostgreSQL" do
+      event_id = "evt_pg_immutable_proc_#{System.unique_integer([:positive])}"
+
+      assert {:ok, lease_token} = Deduplication.acquire(event_id, @opts)
+      assert :ok = Deduplication.complete(event_id, [lease_token: lease_token] ++ @opts)
+      assert Deduplication.processed?(event_id, @opts) == true
+
+      # Calling release without token must return {:error, :already_processed} and not alter status in PG
+      assert {:error, :already_processed} = Deduplication.release(event_id, @opts)
+
+      # Calling release with token must also return {:error, :already_processed}
+      assert {:error, :already_processed} =
+               Deduplication.release(event_id, [lease_token: lease_token] ++ @opts)
+
+      result =
+        Ecto.Adapters.SQL.query!(
+          Repo,
+          "SELECT status FROM webhook_events WHERE event_id = $1",
+          [event_id]
+        )
+
+      assert [["processed"]] = result.rows
+    end
   end
 end

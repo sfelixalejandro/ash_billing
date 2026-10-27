@@ -148,7 +148,7 @@ defmodule MyAppWeb.BillingController do
     user = conn.assigns.current_user
 
     case AshBilling.create_checkout_session(user,
-      mode: :subscription,
+      mode: "subscription",
       line_items: [%{price: price_id, quantity: 1}],
       success_url: url(~p"/dashboard?billing=success"),
       cancel_url: url(~p"/pricing?billing=canceled")

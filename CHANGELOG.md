@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v0.1.11] - 2026-10-27
+
+### Fixed
+
+- **Strict Deduplication Contract on Initial Acquisition and Completion**:
+  - `Deduplication.acquire_resource/3` and `complete_resource/3` validate upfront that the persistent resource has both a `:status` attribute and an `:update` action.
+  - If either is missing, calls immediately fail fast with `{:error, :resource_lacks_update_action}`, preventing orphaned events in `:processing` or silent `:ok` completions on unupdatable resources.
+- **Atomic Conditional Update for Out-of-Order Webhooks on Same Subscription**:
+  - Implemented `update_subscription_safely/5` via `Ash.bulk_update` with `strategy: [:atomic]`, querying `id == ^existing.id and (is_nil(last_event_created_at) or last_event_created_at <= ^event_dt)`.
+  - Safely eliminates the race condition where concurrent webhooks affecting the same subscription could overwrite a newer state with an older state. When 0 records match the atomic query, the stale write is discarded and the authoritative state is preserved.
+- **Immutable `:processed` Events in `release/2`**:
+  - `Deduplication.release_resource/3`, `atomic_bulk_destroy/5`, and `delete_memory/2` now strictly filter `status == :processing`.
+  - Releasing a `:processed` event immediately returns `{:error, :already_processed}` without mutating the event record to `:failed`, guaranteeing that successfully processed webhook events are strictly immutable in both database and ETS backends.
+- **Normalization of `mode` in Checkout Sessions**:
+  - `AshBilling.create_checkout_session/2` normalizes the `mode` parameter with `to_string/1`, ensuring both atom `:subscription` and binary `"subscription"` attach metadata to `subscription_data`.
+  - Updated SaaS reference example documentation to specify `mode: "subscription"`.
+
+---
+
 ## [v0.1.10] - 2026-10-27
 
 ### Fixed

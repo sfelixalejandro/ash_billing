@@ -226,7 +226,13 @@ defmodule AshBilling.WebhookSync do
             end
 
           existing ->
-            Ash.update(existing, attrs, ash_opts)
+            update_subscription_safely(
+              subscription_resource,
+              existing,
+              attrs,
+              event_dt,
+              ash_opts
+            )
 
           true ->
             cust_rel_name = SubscriptionInfo.customer_relationship(subscription_resource)
@@ -249,7 +255,13 @@ defmodule AshBilling.WebhookSync do
                 # retry as an update to guarantee idempotency across nodes.
                 case fetch_existing_subscription(subscription_resource, sub_id, ash_opts) do
                   {:ok, newly_created} when not is_nil(newly_created) ->
-                    Ash.update(newly_created, attrs, ash_opts)
+                    update_subscription_safely(
+                      subscription_resource,
+                      newly_created,
+                      attrs,
+                      event_dt,
+                      ash_opts
+                    )
 
                   _ ->
                     {:error, error}
@@ -346,6 +358,59 @@ defmodule AshBilling.WebhookSync do
     |> Ash.Query.new()
     |> Ash.Query.filter(provider_subscription_id == ^sub_id)
     |> Ash.read_one(ash_opts)
+  end
+
+  @doc false
+  def update_subscription_safely(subscription_resource, existing, attrs, event_dt, ash_opts) do
+    has_timestamp? =
+      Ash.Resource.Info.attribute(subscription_resource, :last_event_created_at) != nil
+
+    has_update? = Ash.Resource.Info.action(subscription_resource, :update) != nil
+
+    if has_timestamp? and has_update? and not is_nil(event_dt) do
+      require Ash.Query
+
+      # Atomic condition: only update if record currently has NULL timestamp
+      # or a timestamp less than or equal to incoming event_dt
+      query =
+        subscription_resource
+        |> Ash.Query.filter(
+          id == ^existing.id and
+            (is_nil(last_event_created_at) or last_event_created_at <= ^event_dt)
+        )
+
+      bulk_opts =
+        ash_opts
+        |> Keyword.put(:strategy, [:atomic])
+        |> Keyword.put(:return_records?, true)
+        |> Keyword.put(:return_errors?, true)
+
+      case Ash.bulk_update(query, :update, attrs, bulk_opts) do
+        %Ash.BulkResult{status: :success, records: [updated | _]} ->
+          {:ok, updated}
+
+        %Ash.BulkResult{status: :success, records: []} ->
+          require Logger
+
+          Logger.warning(
+            "AshBilling.WebhookSync: Atomic conditional update matched 0 records for subscription #{inspect(existing.provider_subscription_id)}. A newer event was already applied. Discarding out-of-order write."
+          )
+
+          case fetch_existing_subscription(
+                 subscription_resource,
+                 existing.provider_subscription_id,
+                 ash_opts
+               ) do
+            {:ok, latest} when not is_nil(latest) -> {:ok, latest}
+            _ -> {:ok, existing}
+          end
+
+        _ ->
+          Ash.update(existing, attrs, ash_opts)
+      end
+    else
+      Ash.update(existing, attrs, ash_opts)
+    end
   end
 
   defp find_customer(nil, _stripe_cust_id, _object, _ash_opts), do: {:ok, nil}

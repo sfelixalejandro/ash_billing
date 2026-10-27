@@ -170,7 +170,7 @@ defmodule AshBilling.DeduplicationTest do
                Deduplication.release(event_id, opts)
     end
 
-    test "supports simple resource without status attribute and destroys on release" do
+    test "strictly rejects resources lacking :update action or :status attribute upon acquire and complete" do
       alias AshBilling.Test.SimpleEvent
 
       opts = [
@@ -182,14 +182,12 @@ defmodule AshBilling.DeduplicationTest do
       event_id = "evt_simple_res_99"
 
       refute Deduplication.processed?(event_id, opts)
-      assert {:ok, token} = Deduplication.acquire(event_id, opts)
-      assert is_binary(token)
-      assert {:error, :already_processed} = Deduplication.acquire(event_id, opts)
-      assert Deduplication.processed?(event_id, opts) == true
 
-      # Releasing lease on resource without status falls back to destroy
-      assert :ok = Deduplication.release(event_id, opts)
-      refute Deduplication.processed?(event_id, opts)
+      # Acquisition strictly requires :status attribute and :update action
+      assert {:error, :resource_lacks_update_action} = Deduplication.acquire(event_id, opts)
+
+      # Completion strictly requires :status attribute and :update action
+      assert {:error, :resource_lacks_update_action} = Deduplication.complete(event_id, opts)
     end
 
     test "handles memory lifecycle: processing, failed, and expired lease reclamation" do
@@ -240,35 +238,31 @@ defmodule AshBilling.DeduplicationTest do
       assert {:error, _} = Deduplication.complete("evt_not_in_db_123", opts_webhook)
       assert :ok = Deduplication.release("evt_not_in_db_123", opts_webhook)
 
-      # Complete on SimpleEvent (resource without status)
+      # Complete on SimpleEvent (resource without status or update action) strictly rejected
       opts_simple = [
         deduplication_strategy: :resource,
         deduplication_resource: SimpleEvent,
         domain: Domain
       ]
 
-      assert {:ok, token_simple} = Deduplication.acquire("evt_simple_comp_1", opts_simple)
-      assert is_binary(token_simple)
-      assert :ok = Deduplication.complete("evt_simple_comp_1", opts_simple)
+      assert {:error, :resource_lacks_update_action} =
+               Deduplication.acquire("evt_simple_comp_1", opts_simple)
 
-      # Release on ReadOnlyEvent (lacks both update and destroy actions)
+      assert {:error, :resource_lacks_update_action} =
+               Deduplication.complete("evt_simple_comp_1", opts_simple)
+
+      # Release on ReadOnlyEvent (lacks update action)
       opts_ro = [
         deduplication_strategy: :resource,
         deduplication_resource: ReadOnlyEvent,
         domain: Domain
       ]
 
-      assert {:ok, token_ro} = Deduplication.acquire("evt_readonly_1", opts_ro)
-      assert is_binary(token_ro)
-      assert {:error, :cannot_release_lease} = Deduplication.release("evt_readonly_1", opts_ro)
+      assert {:error, :resource_lacks_update_action} =
+               Deduplication.acquire("evt_readonly_1", opts_ro)
 
-      # SimpleEvent without status rejects duplicate acquisition as already processed
-      assert {:ok, _} = Deduplication.acquire("evt_simple_reclaim_1", opts_simple)
-
-      assert {:error, :already_processed} =
-               Deduplication.acquire("evt_simple_reclaim_1", opts_simple)
-
-      assert :ok = Deduplication.release("evt_simple_reclaim_1", opts_simple)
+      assert {:error, :resource_lacks_update_action} =
+               Deduplication.complete("evt_readonly_1", opts_ro)
 
       # Complete and release on FailingUpdateEvent (triggers update failure and fallback)
       opts_failing = [
@@ -297,9 +291,9 @@ defmodule AshBilling.DeduplicationTest do
                  [lease_token: "wrong_tok"] ++ opts_failing
                )
 
-      # SimpleEvent without status or update action release
-      assert {:ok, _} = Deduplication.acquire("evt_simple_reclaim_2", opts_simple)
-      assert :ok = Deduplication.release("evt_simple_reclaim_2", opts_simple)
+      # SimpleEvent without status or update action rejected
+      assert {:error, :resource_lacks_update_action} =
+               Deduplication.acquire("evt_simple_reclaim_2", opts_simple)
 
       # FailingUpdateEvent bulk_update error branch during reclaim
       assert {:ok, _} = Deduplication.acquire("evt_failing_upd_2", opts_failing)
@@ -334,12 +328,12 @@ defmodule AshBilling.DeduplicationTest do
       assert {:error, _} = Deduplication.release("evt_raise", :not_a_keyword_list)
       assert false == Deduplication.processed?("evt_raise", :not_a_keyword_list)
 
-      # Release with matching token on an already processed record returns {:error, :lease_not_acquired}
+      # Release with matching token on an already processed record returns {:error, :already_processed}
       evt_proc_res = "evt_res_proc_already_#{System.unique_integer([:positive])}"
       assert {:ok, tok_p} = Deduplication.acquire(evt_proc_res, opts_webhook)
       assert :ok = Deduplication.complete(evt_proc_res, [lease_token: tok_p] ++ opts_webhook)
 
-      assert {:error, :lease_not_acquired} =
+      assert {:error, :already_processed} =
                Deduplication.release(evt_proc_res, [lease_token: tok_p] ++ opts_webhook)
 
       # Complete on an already failed record with matching token returns {:error, :lease_not_acquired}
@@ -476,6 +470,24 @@ defmodule AshBilling.DeduplicationTest do
 
       assert {:ok, _} =
                Deduplication.acquire("evt_reclaim_failed_3", deduplication_strategy: :memory)
+
+      # Attempting to release a :processed event in ETS memory returns {:error, :already_processed}
+      :ets.insert(
+        :ash_billing_processed_events,
+        {"evt_mem_4tuple_proc", :processed, 12345, "tok_proc"}
+      )
+
+      assert {:error, :already_processed} =
+               Deduplication.release("evt_mem_4tuple_proc", deduplication_strategy: :memory)
+
+      assert {:error, :already_processed} =
+               Deduplication.release("evt_mem_3tuple_proc", deduplication_strategy: :memory)
+
+      assert Deduplication.processed?("evt_mem_4tuple_proc", deduplication_strategy: :memory) ==
+               true
+
+      assert Deduplication.processed?("evt_mem_3tuple_proc", deduplication_strategy: :memory) ==
+               true
 
       # Nil arguments to API functions
       assert :ok = Deduplication.release(nil)
@@ -689,6 +701,21 @@ defmodule AshBilling.DeduplicationTest do
       # Releasing with wrong token returns :lease_token_mismatch
       assert {:error, :lease_token_mismatch} =
                Deduplication.release(event_id, opts ++ [lease_token: "wrong_token"])
+    end
+
+    test "release without token strictly refuses to invalidate or mutate a :processed event" do
+      event_id = "evt_processed_cannot_be_invalidated"
+      opts = [deduplication_resource: WebhookEvent, domain: Domain]
+
+      assert {:ok, token} = Deduplication.acquire(event_id, opts)
+      assert :ok = Deduplication.complete(event_id, [lease_token: token] ++ opts)
+
+      # Attempting to release a completed/processed event without token returns {:error, :already_processed}
+      assert {:error, :already_processed} = Deduplication.release(event_id, opts)
+
+      # Status in database remains intact as :processed
+      assert {:ok, record} = Ash.get(WebhookEvent, event_id, domain: Domain, authorize?: false)
+      assert record.status == :processed
     end
   end
 end

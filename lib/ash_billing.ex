@@ -149,7 +149,7 @@ defmodule AshBilling do
         line_items: line_items,
         success_url: Keyword.fetch!(opts, :success_url),
         cancel_url: Keyword.fetch!(opts, :cancel_url),
-        mode: Keyword.get(opts, :mode, "subscription")
+        mode: to_string(Keyword.get(opts, :mode, "subscription"))
       }
       |> then(fn p -> if cust_id, do: Map.put(p, :customer, cust_id), else: p end)
       |> then(fn p ->
@@ -160,7 +160,7 @@ defmodule AshBilling do
       end)
       |> then(fn p -> if map_size(metadata) > 0, do: Map.put(p, :metadata, metadata), else: p end)
       |> then(fn p ->
-        if p.mode == "subscription" and map_size(metadata) > 0 do
+        if to_string(p.mode) == "subscription" and map_size(metadata) > 0 do
           existing_sub_data = Keyword.get(opts, :subscription_data, %{}) |> Enum.into(%{})
           sub_metadata = Map.get(existing_sub_data, :metadata, %{}) |> Map.merge(metadata)
           sub_data = Map.put(existing_sub_data, :metadata, sub_metadata)
