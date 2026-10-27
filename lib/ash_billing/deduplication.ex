@@ -273,21 +273,31 @@ defmodule AshBilling.Deduplication do
       domain = Keyword.get(opts, :domain)
       now = DateTime.utc_now()
       lease_token = Keyword.get(opts, :lease_token)
+      has_token_attr? = Ash.Resource.Info.attribute(resource, :lease_token) != nil
       require Ash.Query
 
       query =
-        if lease_token do
-          resource
-          |> Ash.Query.filter(
-            event_id == ^event_id and status == :processing and lease_token == ^lease_token
-          )
-        else
-          resource
-          |> Ash.Query.filter(event_id == ^event_id and status == :processing)
+        cond do
+          lease_token ->
+            resource
+            |> Ash.Query.filter(
+              event_id == ^event_id and status == :processing and lease_token == ^lease_token
+            )
+
+          has_token_attr? ->
+            resource
+            |> Ash.Query.filter(
+              event_id == ^event_id and status == :processing and is_nil(lease_token)
+            )
+
+          true ->
+            resource
+            |> Ash.Query.filter(event_id == ^event_id and status == :processing)
         end
 
       update_attrs =
-        %{status: :processed, error: nil}
+        %{status: :processed}
+        |> maybe_put_field(resource, :error, nil)
         |> maybe_put_field(resource, :processed_at, now)
 
       case Ash.bulk_update(query, :update, update_attrs,
@@ -307,7 +317,7 @@ defmodule AshBilling.Deduplication do
                 Map.get(record, :status) == :processed ->
                   :ok
 
-                lease_token != nil and Map.get(record, :lease_token) != nil and
+                Map.get(record, :lease_token) != nil and
                     Map.get(record, :lease_token) != lease_token ->
                   {:error, :lease_token_mismatch}
 
@@ -383,23 +393,35 @@ defmodule AshBilling.Deduplication do
         domain = Keyword.get(opts, :domain)
         err_msg = Keyword.get(opts, :error)
         lease_token = Keyword.get(opts, :lease_token)
+        has_token_attr? = Ash.Resource.Info.attribute(resource, :lease_token) != nil
         require Ash.Query
 
         query =
-          if lease_token do
-            resource
-            |> Ash.Query.filter(
-              event_id == ^event_id and status == :processing and lease_token == ^lease_token
-            )
-          else
-            resource
-            |> Ash.Query.filter(event_id == ^event_id and status == :processing)
+          cond do
+            lease_token ->
+              resource
+              |> Ash.Query.filter(
+                event_id == ^event_id and status == :processing and lease_token == ^lease_token
+              )
+
+            has_token_attr? ->
+              resource
+              |> Ash.Query.filter(
+                event_id == ^event_id and status == :processing and is_nil(lease_token)
+              )
+
+            true ->
+              resource
+              |> Ash.Query.filter(event_id == ^event_id and status == :processing)
           end
 
-        update_attrs = %{
-          status: :failed,
-          error: if(err_msg, do: String.slice(inspect(err_msg), 0, 500), else: nil)
-        }
+        update_attrs =
+          %{status: :failed}
+          |> maybe_put_field(
+            resource,
+            :error,
+            if(err_msg, do: String.slice(inspect(err_msg), 0, 500), else: nil)
+          )
 
         case Ash.bulk_update(query, :update, update_attrs,
                domain: domain,
@@ -421,7 +443,7 @@ defmodule AshBilling.Deduplication do
                   Map.get(record, :status) == :processed ->
                     {:error, :already_processed}
 
-                  lease_token != nil and Map.get(record, :lease_token) != nil and
+                  Map.get(record, :lease_token) != nil and
                       Map.get(record, :lease_token) != lease_token ->
                     {:error, :lease_token_mismatch}
 
@@ -461,6 +483,7 @@ defmodule AshBilling.Deduplication do
     if Ash.Resource.Info.action(resource, :destroy) != nil do
       require Ash.Query
       has_status? = Ash.Resource.Info.attribute(resource, :status) != nil
+      has_token? = Ash.Resource.Info.attribute(resource, :lease_token) != nil
 
       query =
         cond do
@@ -468,6 +491,12 @@ defmodule AshBilling.Deduplication do
             resource
             |> Ash.Query.filter(
               event_id == ^event_id and status == :processing and lease_token == ^lease_token
+            )
+
+          has_status? && has_token? ->
+            resource
+            |> Ash.Query.filter(
+              event_id == ^event_id and status == :processing and is_nil(lease_token)
             )
 
           has_status? ->
@@ -747,9 +776,9 @@ defmodule AshBilling.Deduplication do
       else
         [
           {
-            {event_id, :processing, :_, :"$1"},
+            {event_id, :processing, :_, nil},
             [],
-            [{:const, {event_id, :processed, now, :"$1"}}]
+            [{:const, {event_id, :processed, now, nil}}]
           },
           {
             {event_id, :processing, :_},
@@ -770,7 +799,7 @@ defmodule AshBilling.Deduplication do
           :ok
 
         [{^event_id, :processing, _, current_token}] ->
-          if lease_token != nil and current_token != lease_token do
+          if current_token != nil and current_token != lease_token do
             {:error, :lease_token_mismatch}
           else
             {:error, :lease_not_acquired}
@@ -815,7 +844,7 @@ defmodule AshBilling.Deduplication do
       else
         [
           {
-            {event_id, :processing, :_, :_},
+            {event_id, :processing, :_, nil},
             [],
             [{:const, {event_id, :failed, now, nil}}]
           },
@@ -832,7 +861,7 @@ defmodule AshBilling.Deduplication do
     else
       case :ets.lookup(@table, event_id) do
         [{^event_id, :processing, _, current_token}] ->
-          if lease_token != nil and current_token != lease_token do
+          if current_token != nil and current_token != lease_token do
             {:error, :lease_token_mismatch}
           else
             {:error, :lease_not_acquired}

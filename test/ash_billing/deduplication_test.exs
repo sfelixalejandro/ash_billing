@@ -291,9 +291,12 @@ defmodule AshBilling.DeduplicationTest do
                  [lease_token: "wrong_tok"] ++ opts_failing
                )
 
-      # SimpleEvent without status or update action rejected
+      # SimpleEvent without status or update action rejected on acquire and complete
       assert {:error, :resource_lacks_update_action} =
                Deduplication.acquire("evt_simple_reclaim_2", opts_simple)
+
+      # Release on SimpleEvent (which has :destroy action) executes atomic_bulk_destroy fallback
+      assert :ok = Deduplication.release("evt_simple_reclaim_2", opts_simple)
 
       # FailingUpdateEvent bulk_update error branch during reclaim
       assert {:ok, _} = Deduplication.acquire("evt_failing_upd_2", opts_failing)
@@ -389,20 +392,58 @@ defmodule AshBilling.DeduplicationTest do
                Deduplication.complete("evt_mem_legacy_fail", deduplication_strategy: :memory)
 
       # Complete on already processed event in memory
-      assert {:ok, _} =
+      assert {:ok, tok_mem} =
                Deduplication.acquire("evt_mem_already_proc", deduplication_strategy: :memory)
 
-      assert :ok = Deduplication.complete("evt_mem_already_proc", deduplication_strategy: :memory)
-      assert :ok = Deduplication.complete("evt_mem_already_proc", deduplication_strategy: :memory)
+      assert :ok =
+               Deduplication.complete("evt_mem_already_proc",
+                 lease_token: tok_mem,
+                 deduplication_strategy: :memory
+               )
+
+      assert :ok =
+               Deduplication.complete("evt_mem_already_proc",
+                 lease_token: tok_mem,
+                 deduplication_strategy: :memory
+               )
+
+      # Attempting to complete with mismatching or absent token returns {:error, :lease_token_mismatch}
+      assert {:ok, tok_locked} =
+               Deduplication.acquire("evt_mem_token_locked", deduplication_strategy: :memory)
+
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.complete("evt_mem_token_locked", deduplication_strategy: :memory)
+
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.complete("evt_mem_token_locked",
+                 lease_token: "wrong_token",
+                 deduplication_strategy: :memory
+               )
+
+      assert {:error, :lease_token_mismatch} =
+               Deduplication.release("evt_mem_token_locked", deduplication_strategy: :memory)
+
+      assert :ok =
+               Deduplication.complete("evt_mem_token_locked",
+                 lease_token: tok_locked,
+                 deduplication_strategy: :memory
+               )
 
       # Complete on a failed 4-tuple event in memory
-      assert {:ok, _} =
+      assert {:ok, tok_fail_mem} =
                Deduplication.acquire("evt_mem_failed_comp", deduplication_strategy: :memory)
 
-      assert :ok = Deduplication.release("evt_mem_failed_comp", deduplication_strategy: :memory)
+      assert :ok =
+               Deduplication.release("evt_mem_failed_comp",
+                 lease_token: tok_fail_mem,
+                 deduplication_strategy: :memory
+               )
 
       assert {:error, :lease_failed} =
-               Deduplication.complete("evt_mem_failed_comp", deduplication_strategy: :memory)
+               Deduplication.complete("evt_mem_failed_comp",
+                 lease_token: tok_fail_mem,
+                 deduplication_strategy: :memory
+               )
 
       # Complete on an unseen event in memory
       assert :ok = Deduplication.complete("evt_mem_unseen_1", deduplication_strategy: :memory)
@@ -716,6 +757,44 @@ defmodule AshBilling.DeduplicationTest do
       # Status in database remains intact as :processed
       assert {:ok, record} = Ash.get(WebhookEvent, event_id, domain: Domain, authorize?: false)
       assert record.status == :processed
+    end
+
+    test "strictly requires matching lease_token on complete and release for active leased events" do
+      event_id = "evt_unowned_attempt_#{System.unique_integer([:positive])}"
+      opts = [deduplication_resource: WebhookEvent, domain: Domain]
+
+      assert {:ok, lease_token} = Deduplication.acquire(event_id, opts)
+
+      # Attempting to complete without providing lease_token returns {:error, :lease_token_mismatch}
+      assert {:error, :lease_token_mismatch} = Deduplication.complete(event_id, opts)
+
+      # Attempting to release without providing lease_token returns {:error, :lease_token_mismatch}
+      assert {:error, :lease_token_mismatch} = Deduplication.release(event_id, opts)
+
+      # Calling with correct token completes successfully
+      assert :ok = Deduplication.complete(event_id, [lease_token: lease_token] ++ opts)
+      assert Deduplication.processed?(event_id, opts) == true
+    end
+
+    test "handles resource without :lease_token attribute transparently" do
+      alias AshBilling.Test.EventWithoutToken
+      event_id = "evt_no_token_attr_#{System.unique_integer([:positive])}"
+      opts = [deduplication_resource: EventWithoutToken, domain: Domain]
+
+      assert {:ok, token} = Deduplication.acquire(event_id, opts)
+      assert is_binary(token)
+
+      # Complete succeeds on resource without lease_token attribute
+      assert :ok = Deduplication.complete(event_id, opts)
+      assert Deduplication.processed?(event_id, opts) == true
+
+      # Release on new event without lease_token attribute transitions to failed
+      event_id2 = "evt_no_token_rel_#{System.unique_integer([:positive])}"
+      assert {:ok, _} = Deduplication.acquire(event_id2, opts)
+      assert :ok = Deduplication.release(event_id2, opts)
+
+      assert {:ok, rec} = Ash.get(EventWithoutToken, event_id2, domain: Domain, authorize?: false)
+      assert rec.status == :failed
     end
   end
 end

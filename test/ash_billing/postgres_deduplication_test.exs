@@ -211,5 +211,21 @@ defmodule AshBilling.PostgresDeduplicationTest do
 
       assert [["processed"]] = result.rows
     end
+
+    test "strictly requires matching lease_token on complete and release in PostgreSQL" do
+      event_id = "evt_pg_unowned_#{System.unique_integer([:positive])}"
+
+      assert {:ok, lease_token} = Deduplication.acquire(event_id, @opts)
+
+      # Attempting to complete without providing lease_token returns {:error, :lease_token_mismatch}
+      assert {:error, :lease_token_mismatch} = Deduplication.complete(event_id, @opts)
+
+      # Attempting to release without providing lease_token returns {:error, :lease_token_mismatch}
+      assert {:error, :lease_token_mismatch} = Deduplication.release(event_id, @opts)
+
+      # Completing with correct token succeeds
+      assert :ok = Deduplication.complete(event_id, [lease_token: lease_token] ++ @opts)
+      assert Deduplication.processed?(event_id, @opts) == true
+    end
   end
 end

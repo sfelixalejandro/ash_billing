@@ -633,5 +633,122 @@ defmodule AshBilling.WebhookSyncTest do
 
       assert updated_fallback.status == :active
     end
+
+    test "update_subscription_safely strictly propagates bulk_update errors without unconditioned fallback" do
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{
+            email: "error_prop@example.com",
+            stripe_customer_id: "cus_error_prop"
+          },
+          domain: Domain
+        )
+
+      sub_id = "sub_err_prop_#{System.unique_integer([:positive])}"
+      t1 = ~U[2026-10-27 10:00:00Z]
+
+      {:ok, existing} =
+        Ash.create(
+          Subscription,
+          %{
+            provider_subscription_id: sub_id,
+            status: :active,
+            user_id: user.id,
+            price_id: "price_initial",
+            last_event_created_at: t1
+          },
+          domain: Domain
+        )
+
+      ash_opts = [domain: Domain, authorize?: false]
+
+      # Attempting to bulk_update with an invalid status strictly returns an error
+      # and never falls back to an unconditioned update
+      invalid_attrs = %{status: :invalid_unsupported_status}
+
+      assert {:error, _err} =
+               WebhookSync.update_subscription_safely(
+                 Subscription,
+                 existing,
+                 invalid_attrs,
+                 t1,
+                 ash_opts
+               )
+
+      # Record in DB was NOT mutated
+      reloaded = Ash.get!(Subscription, existing.id, domain: Domain)
+      assert reloaded.status == :active
+    end
+
+    test "same-second conflicting events trigger live provider reconciliation" do
+      stub_name = "same_second_reconcile_stub"
+      same_unix = 1_735_689_600
+      same_dt = DateTime.from_unix!(same_unix)
+
+      Req.Test.stub(stub_name, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{
+            "id" => "sub_same_sec_1",
+            "status" => "past_due",
+            "cancel_at_period_end" => false,
+            "items" => %{"data" => [%{"price" => %{"id" => "price_authoritative_live"}}]}
+          })
+        )
+      end)
+
+      {:ok, user} =
+        Ash.create(
+          User,
+          %{
+            email: "same_sec@example.com",
+            stripe_customer_id: "cus_same_sec"
+          },
+          domain: Domain
+        )
+
+      {:ok, _existing} =
+        Ash.create(
+          Subscription,
+          %{
+            provider_subscription_id: "sub_same_sec_1",
+            status: :active,
+            user_id: user.id,
+            price_id: "price_initial",
+            last_event_created_at: same_dt
+          },
+          domain: Domain
+        )
+
+      # Incoming event has the EXACT same second (same_unix) but reports status "past_due"
+      event = %{
+        "id" => "evt_same_second",
+        "type" => "customer.subscription.updated",
+        "created" => same_unix,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_same_sec_1",
+            "customer" => "cus_same_sec",
+            "status" => "past_due",
+            "cancel_at_period_end" => false,
+            "items" => %{"data" => [%{"price" => %{"id" => "price_incoming"}}]}
+          }
+        }
+      }
+
+      opts = [
+        customer_resource: User,
+        subscription_resource: Subscription,
+        domain: Domain,
+        req_options: [plug: {Req.Test, stub_name}, retry: false]
+      ]
+
+      assert {:ok, reconciled_sub} = WebhookSync.sync_event(event, opts)
+      assert reconciled_sub.status == :past_due
+      assert reconciled_sub.price_id == "price_authoritative_live"
+    end
   end
 end

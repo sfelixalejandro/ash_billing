@@ -15,6 +15,7 @@ defmodule AshBilling.Test.Domain do
     resource AshBilling.Test.IncompleteResource
     resource AshBilling.Test.NoUpdateEvent
     resource AshBilling.Test.NoUpdateNoDestroyEvent
+    resource AshBilling.Test.EventWithoutToken
   end
 end
 
@@ -294,5 +295,25 @@ defmodule AshBilling.Test.NoUpdateNoDestroyEvent do
   actions do
     default_accept :*
     defaults [:read, :create]
+  end
+end
+
+defmodule AshBilling.Test.EventWithoutToken do
+  use Ash.Resource,
+    domain: AshBilling.Test.Domain,
+    data_layer: Ash.DataLayer.Ets
+
+  attributes do
+    attribute :event_id, :string, primary_key?: true, allow_nil?: false, public?: true
+
+    attribute :status, :atom,
+      constraints: [one_of: [:processing, :processed, :failed]],
+      default: :processing,
+      public?: true
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
   end
 end
