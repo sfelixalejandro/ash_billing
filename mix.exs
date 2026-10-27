@@ -47,9 +47,13 @@ defmodule AshBilling.MixProject do
       name: "ash_billing",
       maintainers: ["Alejandro Felix <SFelixAlejandro@hotmail.com>"],
       licenses: ["MIT"],
-      files: ~w(lib .formatter.exs mix.exs README* LICENSE* documentation),
+      files: ~w(lib .formatter.exs mix.exs README* LICENSE* CHANGELOG* documentation),
       links: %{
-        "GitHub" => @source_url
+        "GitHub" => @source_url,
+        "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md",
+        "Discord" => "https://discord.gg/HTHRaaVPUc",
+        "Forum" => "https://elixirforum.com/c/ash-framework-forum/",
+        "Website" => "https://ash-hq.org"
       }
     ]
   end
@@ -88,17 +92,26 @@ defmodule AshBilling.MixProject do
     [
       main: "readme",
       source_ref: "v#{@version}",
+      extra_section: "GUIDES",
       extras: [
         {"README.md", title: "Home"},
+        {"documentation/tutorials/getting-started-with-ash-billing.md",
+         title: "Getting Started with AshBilling"},
+        {"documentation/topics/webhooks-and-resilience.md",
+         title: "Webhooks & Operational Resilience"},
         {"documentation/dsls/DSL-AshBilling.Resource.md",
          search_data: Spark.Docs.search_data_for(AshBilling.Resource)},
         {"documentation/dsls/DSL-AshBilling.Subscription.md",
          search_data: Spark.Docs.search_data_for(AshBilling.Subscription)},
         {"documentation/dsls/DSL-AshBilling.WebhookEvent.md",
          search_data: Spark.Docs.search_data_for(AshBilling.WebhookEvent)},
+        "CHANGELOG.md",
+        "SECURITY.md",
         ".github/CONTRIBUTING.md"
       ],
       groups_for_extras: [
+        Tutorials: ~r"documentation/tutorials",
+        Topics: ~r"documentation/topics",
         DSLs: ~r"documentation/dsls"
       ],
       groups_for_modules: [
@@ -108,6 +121,10 @@ defmodule AshBilling.MixProject do
           AshBilling.Plug,
           AshBilling.WebhookSync,
           AshBilling.Deduplication
+        ],
+        "Policy Checks": [
+          AshBilling.Checks.Subscribed,
+          AshBilling.Checks.HasPrice
         ],
         Providers: [
           AshBilling.Providers.Stripe
