@@ -159,3 +159,20 @@ The Plug returns HTTP 500 and releases the event lease by default. These events 
 not permanently discarded: repair the association or configuration and retry the same
 event. Applications must generate local references on the server and must not accept
 arbitrary ownership metadata from clients.
+
+## Subscription identity and migration
+
+`AshBilling.Subscription` adds the `:unique_provider_subscription` identity on
+`:provider_subscription_id`, unless an equivalent unconditional identity already exists.
+Its scope is the subscription resource and the Ash tenant, when configured. Each scope
+must represent one provider, billing account and environment (for example, one Stripe
+account in test mode). Use separate resources/tables or tenants for separate account
+namespaces. This is not a claim that IDs from arbitrary providers or accounts are
+globally unique. Webhook routing and provider credentials must use the same scope.
+
+On PostgreSQL, generate and apply the unique index using `mix ash.codegen` and
+`mix ash.migrate`. Audit and resolve existing duplicate IDs in each scope before applying
+the migration; the library does not delete or merge records automatically. The database
+constraint, rather than a preflight lookup, prevents concurrent duplicates. A conflicting
+creation re-enters the regular synchronization checks once, including terminal precedence
+and customer ownership. Other create failures remain errors and can be retried.

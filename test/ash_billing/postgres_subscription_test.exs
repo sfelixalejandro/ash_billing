@@ -24,7 +24,11 @@ defmodule AshBilling.PostgresSubscriptionTest do
     assert Application.get_env(:ash_billing, :postgres_available),
            "PostgreSQL required for these regressions"
 
-    Ecto.Adapters.SQL.query!(Repo, "TRUNCATE billing_test_subscriptions, billing_test_customers")
+    Ecto.Adapters.SQL.query!(
+      Repo,
+      "TRUNCATE billing_test_subscriptions, billing_test_customers, billing_scoped_subscriptions"
+    )
+
     user = Ash.create!(PostgresCustomer, %{stripe_customer_id: "cus_pg"}, @opts)
     %{user: user}
   end
@@ -443,5 +447,150 @@ defmodule AshBilling.PostgresSubscriptionTest do
 
     assert updated.status == :active
     assert updated.user_id == user.id
+  end
+
+  test "subscription extension declares a tenant-scoped provider identity" do
+    identity = Ash.Resource.Info.identity(PostgresSubscription, :unique_provider_subscription)
+    assert identity != nil
+    assert identity.keys == [:provider_subscription_id]
+    refute identity.all_tenants?
+  end
+
+  test "different events concurrently create exactly one subscription", %{user: user} do
+    owner = self()
+
+    tasks =
+      for _ <- 1..10 do
+        Task.async(fn ->
+          send(owner, {:ready_create, self()})
+
+          receive do
+            :go -> :ok
+          end
+
+          WebhookSync.sync_event(event("sub_unique_race", "active", 1_700_000_001), @sync_opts)
+        end)
+      end
+
+    for _ <- tasks do
+      assert_receive {:ready_create, _}, 2000
+    end
+
+    Enum.each(tasks, &send(&1.pid, :go))
+    results = Task.await_many(tasks, 10000)
+    assert Enum.all?(results, &match?({:ok, _}, &1))
+    assert results |> Enum.map(fn {:ok, sub} -> sub.id end) |> Enum.uniq() |> length() == 1
+    [persisted] = Ash.read!(PostgresSubscription, @opts)
+    assert persisted.user_id == user.id
+
+    assert {:ok, next} =
+             WebhookSync.sync_event(event("sub_unique_race", "active", 1_700_000_002), @sync_opts)
+
+    assert next.id == persisted.id
+  end
+
+  test "PostgreSQL rejects a duplicate independently of a preflight read", %{user: user} do
+    params = %{provider_subscription_id: "sub_database_unique", user_id: user.id, status: :active}
+    Ash.create!(PostgresSubscription, params, @opts)
+    assert {:error, %Ash.Error.Invalid{}} = Ash.create(PostgresSubscription, params, @opts)
+
+    assert {:error, %Postgrex.Error{postgres: %{code: :unique_violation}}} =
+             Ecto.Adapters.SQL.query(
+               Repo,
+               "INSERT INTO billing_test_subscriptions (id, provider_subscription_id, status) VALUES ($1, $2, $3)",
+               [Ecto.UUID.dump!(Ash.UUID.generate()), "sub_database_unique", "active"]
+             )
+
+    assert length(Ash.read!(PostgresSubscription, @opts)) == 1
+  end
+
+  test "identical provider IDs remain isolated between account tenants" do
+    resource = AshBilling.Test.PostgresScopedSubscription
+    opts = [domain: PostgresDomain, subscription_resource: resource]
+
+    for tenant <- ["stripe:acct_a:test", "stripe:acct_b:test"] do
+      assert {:ok, sub} =
+               WebhookSync.sync_event(
+                 event("sub_scoped", "active", 1_700_000_001),
+                 [tenant: tenant] ++ opts
+               )
+
+      assert sub.tenant_id == tenant
+
+      assert {:error, %Ash.Error.Invalid{}} =
+               Ash.create(
+                 resource,
+                 %{provider_subscription_id: "sub_scoped", status: :active},
+                 [tenant: tenant] ++ @opts
+               )
+
+      assert {:ok, updated} =
+               WebhookSync.sync_event(
+                 event("sub_scoped", "active", 1_700_000_002, "price_#{tenant}"),
+                 [tenant: tenant] ++ opts
+               )
+
+      assert updated.id == sub.id
+    end
+
+    assert Ash.read!(resource, [tenant: "stripe:acct_a:test"] ++ @opts) |> length() == 1
+    assert Ash.read!(resource, [tenant: "stripe:acct_b:test"] ++ @opts) |> length() == 1
+  end
+
+  test "concurrent updates retain the newest event and a single row", %{user: user} do
+    Ash.create!(
+      PostgresSubscription,
+      %{
+        provider_subscription_id: "sub_update_race",
+        user_id: user.id,
+        status: :active,
+        last_event_created_at: DateTime.from_unix!(1_700_000_000)
+      },
+      @opts
+    )
+
+    tasks =
+      for n <- 1..10 do
+        Task.async(fn ->
+          WebhookSync.sync_event(
+            event("sub_update_race", "active", 1_700_000_000 + n, "price_#{n}"),
+            @sync_opts
+          )
+        end)
+      end
+
+    assert Task.await_many(tasks, 10000) |> Enum.all?(&match?({:ok, _}, &1))
+    [persisted] = Ash.read!(PostgresSubscription, @opts)
+    assert persisted.price_id == "price_10"
+
+    assert DateTime.compare(persisted.last_event_created_at, DateTime.from_unix!(1_700_000_010)) ==
+             :eq
+  end
+
+  test "a create conflict cannot bypass terminal precedence" do
+    tasks =
+      for status <- ["active", "canceled", "active", "canceled", "active"] do
+        Task.async(fn ->
+          WebhookSync.sync_event(
+            event("sub_terminal_creation_race", status, 1_700_000_001),
+            @sync_opts
+          )
+        end)
+      end
+
+    assert Task.await_many(tasks, 10000) |> Enum.all?(&match?({:ok, _}, &1))
+    [persisted] = Ash.read!(PostgresSubscription, @opts)
+    assert persisted.status == :canceled
+    refute AshBilling.subscribed?(%{subscriptions: [persisted]})
+  end
+
+  test "unrelated create failures remain errors" do
+    assert {:error, %Ash.Error.Invalid{}} =
+             WebhookSync.sync_event(
+               event("sub_invalid_status", :invalid_status, 1_700_000_001),
+               @sync_opts
+             )
+
+    assert Ash.read!(PostgresSubscription, @opts) == []
   end
 end

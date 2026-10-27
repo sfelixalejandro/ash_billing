@@ -89,9 +89,25 @@ defmodule AshBilling.WebhookSync do
     end)
   end
 
-  defp sync_subscription(nil, _cust_res, _sub_res, _domain, _opts), do: {:ok, :ignored}
+  defp sync_subscription(
+         object,
+         customer_resource,
+         subscription_resource,
+         domain,
+         opts,
+         retry_create? \\ true
+       )
 
-  defp sync_subscription(object, customer_resource, subscription_resource, domain, opts) do
+  defp sync_subscription(nil, _cust_res, _sub_res, _domain, _opts, _retry), do: {:ok, :ignored}
+
+  defp sync_subscription(
+         object,
+         customer_resource,
+         subscription_resource,
+         domain,
+         opts,
+         retry_create?
+       ) do
     if is_nil(subscription_resource) do
       {:ok, :no_subscription_resource}
     else
@@ -238,27 +254,37 @@ defmodule AshBilling.WebhookSync do
                 {:ok, created}
 
               {:error, error} ->
-                # Concurrency race resolution:
-                # If another concurrent process just inserted this provider_subscription_id,
-                # retry as an update to guarantee idempotency across nodes.
-                case fetch_existing_subscription(subscription_resource, sub_id, ash_opts) do
-                  {:ok, newly_created} when not is_nil(newly_created) ->
-                    update_subscription_safely(
-                      subscription_resource,
-                      newly_created,
-                      attrs,
-                      event_dt,
-                      ash_opts
-                    )
-
-                  _ ->
-                    {:error, error}
+                # Only a real identity conflict is retried. Re-read through the normal
+                # lifecycle and ownership guards; never update blindly after a failed create.
+                if retry_create? and subscription_identity_conflict?(error) do
+                  sync_subscription(
+                    object,
+                    customer_resource,
+                    subscription_resource,
+                    domain,
+                    opts,
+                    false
+                  )
+                else
+                  {:error, error}
                 end
             end
         end
       end
     end
   end
+
+  defp subscription_identity_conflict?(%Ash.Error.Invalid{errors: errors}),
+    do: Enum.any?(errors, &subscription_identity_conflict?/1)
+
+  defp subscription_identity_conflict?(%Ash.Error.Changes.InvalidAttribute{
+         field: :provider_subscription_id,
+         private_vars: vars
+       })
+       when is_list(vars),
+       do: Keyword.get(vars, :constraint_type) == :unique
+
+  defp subscription_identity_conflict?(_), do: false
 
   defp sync_checkout_session(session, customer_resource, domain, opts) do
     if is_nil(customer_resource) do

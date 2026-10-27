@@ -6,6 +6,7 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
   alias Spark.Dsl.Transformer
 
   @impl true
+  def before?(Resource.Transformers.CacheUniqueKeys), do: true
   def before?(Resource.Transformers.DefaultAccept), do: true
   def before?(Resource.Transformers.ValidateRelationshipAttributes), do: true
   def before?(Resource.Transformers.AttributesByName), do: true
@@ -44,10 +45,34 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
     ]
 
     with {:ok, state} <- add_attributes(dsl_state, attributes),
+         {:ok, state} <- maybe_add_subscription_identity(state),
          {:ok, state} <- maybe_add_on_trial_calculation(state),
          {:ok, state} <- maybe_add_canceling_calculation(state),
          {:ok, state} <- maybe_add_active_calculation(state) do
       {:ok, state}
+    end
+  end
+
+  defp maybe_add_subscription_identity(state) do
+    if Enum.any?(
+         Resource.Info.identities(state),
+         &(&1.keys == [:provider_subscription_id] and is_nil(&1.where))
+       ) do
+      {:ok, state}
+    else
+      identity =
+        Transformer.build_entity!(Resource.Dsl, [:identities], :identity,
+          name: :unique_provider_subscription,
+          keys: [:provider_subscription_id],
+          all_tenants?: false,
+          pre_check_with:
+            if(Ash.DataLayer.data_layer(state) == Ash.DataLayer.Ets,
+              do: Transformer.get_persisted(state, :domain),
+              else: nil
+            )
+        )
+
+      {:ok, Transformer.add_entity(state, [:identities], identity)}
     end
   end
 

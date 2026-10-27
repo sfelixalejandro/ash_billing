@@ -40,6 +40,24 @@ postgres_available? =
         )
         """)
 
+        Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
+        CREATE UNIQUE INDEX IF NOT EXISTS billing_test_subscriptions_unique_provider_subscription_index
+        ON billing_test_subscriptions (provider_subscription_id)
+        """)
+
+        Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
+        CREATE TABLE IF NOT EXISTS billing_scoped_subscriptions (
+          LIKE billing_test_subscriptions INCLUDING DEFAULTS,
+          tenant_id TEXT NOT NULL,
+          PRIMARY KEY (id)
+        )
+        """)
+
+        Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
+        CREATE UNIQUE INDEX IF NOT EXISTS billing_scoped_subscriptions_unique_provider_subscription_index
+        ON billing_scoped_subscriptions (tenant_id, provider_subscription_id)
+        """)
+
         true
 
       {:error, {:already_started, _}} ->
