@@ -106,7 +106,7 @@ defmodule AshBilling.LiveStripeRunner do
     test_valid_hmac_and_persistence(user)
     test_forged_signature_rejection()
     test_replay_attack_prevention()
-    test_idempotent_deduplication()
+    test_idempotent_deduplication(user)
     test_subscription_status_transitions(user)
     test_http_500_retry_protocol()
     test_live_stripe_api_if_configured(user)
@@ -214,7 +214,7 @@ defmodule AshBilling.LiveStripeRunner do
     pass("Signature outside 300-second tolerance window rejected correctly")
   end
 
-  defp test_idempotent_deduplication do
+  defp test_idempotent_deduplication(user) do
     step("5. Idempotency and Deduplication against Network Retries")
 
     event_id = "evt_live_test_dedup_888"
@@ -223,7 +223,13 @@ defmodule AshBilling.LiveStripeRunner do
       Jason.encode!(%{
         "id" => event_id,
         "type" => "customer.subscription.updated",
-        "data" => %{"object" => %{"id" => "sub_live_test_100", "status" => "active"}}
+        "data" => %{
+          "object" => %{
+            "id" => "sub_live_test_100",
+            "customer" => user.stripe_customer_id,
+            "status" => "active"
+          }
+        }
       })
 
     sig = generate_signature(payload, @secret)
@@ -252,7 +258,7 @@ defmodule AshBilling.LiveStripeRunner do
   end
 
   defp test_subscription_status_transitions(user) do
-    step("6. Real-time Subscription Status Transitions (Active -> Paused -> Canceled)")
+    step("6. Local synchronization of synthetic subscription states")
 
     # 1. Send Pause event
     payload_pause =
@@ -311,7 +317,7 @@ defmodule AshBilling.LiveStripeRunner do
     assert_eq("Status updated to :canceled", sub2["status"], "canceled")
     assert_eq("User is no longer subscribed", state2.body["subscribed"], false)
 
-    pass("Full lifecycle verified: Transition to :paused and subsequent :canceled status")
+    pass("Synthetic paused and canceled states synchronized locally")
   end
 
   defp test_http_500_retry_protocol do
@@ -352,8 +358,8 @@ defmodule AshBilling.LiveStripeRunner do
 
     stripe_key = System.get_env("STRIPE_SECRET_KEY")
 
-    if stripe_key && String.starts_with?(stripe_key, "sk_") do
-      IO.puts("    [INFO] STRIPE_SECRET_KEY authenticated with Stripe API!")
+    if stripe_key && String.starts_with?(stripe_key, "sk_test_") do
+      IO.puts("    [INFO] Running the optional Stripe test-mode API smoke check.")
 
       # 1. Create a real customer in Stripe
       {:ok, live_user} =
@@ -411,16 +417,18 @@ defmodule AshBilling.LiveStripeRunner do
           pass("Real Stripe checkout created successfully on Stripe API")
 
         {:error, reason} ->
-          IO.puts("    [NOTICE] Stripe API response: #{inspect(reason)}")
+          raise "Stripe test-mode checkout failed: #{inspect(reason)}"
       end
     else
-      IO.puts("    [NOTICE] STRIPE_SECRET_KEY not provided for this run.")
+      IO.puts(
+        "    [SKIPPED] A Stripe test key was not provided. No real Stripe API verification ran."
+      )
 
       IO.puts(
         "    [NOTICE] To run against live Stripe API: STRIPE_SECRET_KEY=sk_test_... mix run examples/live_stripe_checkout.exs"
       )
 
-      pass("Live verification step ready for execution with test key")
+      :skipped
     end
   end
 
@@ -461,7 +469,7 @@ defmodule AshBilling.LiveStripeRunner do
   defp print_footer do
     IO.puts("")
     IO.puts("================================================================================")
-    IO.puts("  ALL LIVE INTEGRATION TESTS COMPLETED SUCCESSFULLY (100%)")
+    IO.puts("  LOCAL WEBHOOK CHECKS FINISHED; REVIEW OPTIONAL STRIPE STEP ABOVE")
     IO.puts("================================================================================")
   end
 end

@@ -2,7 +2,7 @@
 
 Billing webhooks carry real financial state: invoice payments, subscription expirations, trial conversions, and plan changes. An improperly handled webhook can lock legitimate users out or give unauthorized access to non-paying accounts.
 
-`AshBilling` implements a multi-layer defense architecture to ensure zero silent failures, strict idempotency, and high resilience.
+`AshBilling` provides signature verification, event leases, conditional subscription updates and retry handling. Persistent deduplication and database constraints must be configured for the application's deployment scope.
 
 ---
 
@@ -87,6 +87,16 @@ defmodule MyApp.Billing.WebhookEvent do
     domain: MyApp.Billing,
     data_layer: AshPostgres.DataLayer,
     extensions: [AshBilling.WebhookEvent]
+
+  postgres do
+    table "webhook_events"
+    repo MyApp.Repo
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
+  end
 end
 ```
 
@@ -94,6 +104,7 @@ Then configure it in your router options:
 
 ```elixir
 forward "/stripe", AshBilling.Plug,
+  webhook_secret: {System, :get_env, ["STRIPE_WEBHOOK_SECRET"]},
   customer_resource: MyApp.Accounts.User,
   subscription_resource: MyApp.Billing.Subscription,
   deduplication_resource: MyApp.Billing.WebhookEvent

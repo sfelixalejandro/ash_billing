@@ -31,6 +31,7 @@ defmodule MyApp.Accounts.User do
   end
 
   actions do
+    default_accept :*
     defaults [:read, :create, :update]
   end
 
@@ -65,6 +66,7 @@ defmodule MyApp.Billing.Subscription do
   end
 
   actions do
+    default_accept :*
     defaults [:read, :create, :update, :destroy]
   end
 
@@ -90,10 +92,13 @@ defmodule MyApp.Billing.WebhookEvent do
   end
 
   actions do
+    default_accept :*
     defaults [:read, :create, :update, :destroy]
   end
 end
 ```
+
+Register the resources in their domains and generate and apply the PostgreSQL migrations with `mix ash.codegen create_billing_tables` and `mix ash.migrate`. Subscription IDs are unique per resource and tenant; separate provider/account/environment namespaces accordingly. Resolve existing duplicates before migrating the unique index.
 
 ---
 
