@@ -145,6 +145,10 @@ Stripe APIs evolve over time, and webhooks may contain string identifiers (`"cus
 
 ## Concurrent subscription updates
 
+Customer and subscription resources must expose a primary update action that supports
+atomic updates. Custom action names are supported. Missing actions or unsupported atomic
+updates return errors; synchronization never falls back to an unguarded write.
+
 Subscription updates compare the persisted status at commit time with the status read
 by the worker. A pending nonterminal update cannot overwrite a terminal status committed
 while a provider request was in flight, including events with equal timestamps. Older

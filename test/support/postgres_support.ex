@@ -51,7 +51,12 @@ defmodule AshBilling.Test.PostgresCustomer do
 
   actions do
     default_accept :*
-    defaults [:read, :create, :update, :destroy]
+    defaults [:read, :create, :destroy]
+
+    update :revise do
+      primary? true
+      accept :*
+    end
   end
 end
 
@@ -80,7 +85,12 @@ defmodule AshBilling.Test.PostgresSubscription do
 
   actions do
     default_accept :*
-    defaults [:read, :create, :update, :destroy]
+    defaults [:read, :create, :destroy]
+
+    update :revise do
+      primary? true
+      accept :*
+    end
   end
 
   billing_subscription do

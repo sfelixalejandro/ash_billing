@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Use the consumer's primary update action for atomic subscription and customer writes, including actions with custom names. A missing or non-atomic update action produces an error instead of bypassing concurrency guards.
+
 - Correct tutorial resource definitions, authorization-state descriptions, migration steps and diagnostic usage. Align examples with raw-body handling, redact the testbed webhook secret, and distinguish local/API smoke checks from a completed Stripe payment lifecycle.
 
 - Make Igniter register generated resources and domains, configure credentials at runtime, pass the configured webhook secret, and preserve raw webhook bodies through the endpoint parser. Newly generated PostgreSQL subscriptions inherit the customer's explicitly configured repo; existing custom relationships and body readers are preserved.

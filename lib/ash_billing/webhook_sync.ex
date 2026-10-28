@@ -420,9 +420,9 @@ defmodule AshBilling.WebhookSync do
     has_timestamp? =
       Ash.Resource.Info.attribute(subscription_resource, :last_event_created_at) != nil
 
-    has_update? = Ash.Resource.Info.action(subscription_resource, :update) != nil
+    update_action = primary_update_action(subscription_resource)
 
-    if has_update? do
+    if update_action do
       require Ash.Query
 
       # Compare at commit time, including when the provider request was in flight.
@@ -454,7 +454,7 @@ defmodule AshBilling.WebhookSync do
         |> Keyword.put(:return_records?, true)
         |> Keyword.put(:return_errors?, true)
 
-      case Ash.bulk_update(query, :update, attrs, bulk_opts) do
+      case Ash.bulk_update(query, update_action.name, attrs, bulk_opts) do
         %Ash.BulkResult{status: :success, records: [updated | _]} ->
           {:ok, updated}
 
@@ -512,8 +512,13 @@ defmodule AshBilling.WebhookSync do
           {:error, other_error}
       end
     else
-      Ash.update(existing, attrs, ash_opts)
+      {:error, :update_action_required}
     end
+  end
+
+  defp primary_update_action(resource) do
+    Ash.Resource.Info.primary_action(resource, :update) ||
+      Ash.Resource.Info.action(resource, :update)
   end
 
   defp find_customer(nil, _stripe_cust_id, _object, _ash_opts), do: {:ok, nil}
@@ -598,38 +603,44 @@ defmodule AshBilling.WebhookSync do
         query = Ash.Query.filter(resource, id == ^customer.id)
         query = Ash.Query.filter(query, ^[{attr, [is_nil: true]}])
 
-        case Ash.bulk_update(
-               query,
-               :update,
-               %{attr => customer_id},
-               Keyword.merge(ash_opts,
-                 strategy: [:atomic],
-                 return_records?: true,
-                 return_errors?: true
-               )
-             ) do
-          %Ash.BulkResult{status: :success, records: [updated]} ->
-            {:ok, updated}
+        case primary_update_action(resource) do
+          nil ->
+            {:error, :update_action_required}
 
-          %Ash.BulkResult{status: :success, records: []} ->
-            case Ash.get(resource, customer.id, ash_opts) do
-              {:ok, latest} when not is_nil(latest) ->
-                if Map.get(latest, attr) == customer_id,
-                  do: {:ok, latest},
-                  else: {:error, :customer_identity_conflict}
+          update_action ->
+            case Ash.bulk_update(
+                   query,
+                   update_action.name,
+                   %{attr => customer_id},
+                   Keyword.merge(ash_opts,
+                     strategy: [:atomic],
+                     return_records?: true,
+                     return_errors?: true
+                   )
+                 ) do
+              %Ash.BulkResult{status: :success, records: [updated]} ->
+                {:ok, updated}
 
-              {:error, reason} ->
-                {:error, reason}
+              %Ash.BulkResult{status: :success, records: []} ->
+                case Ash.get(resource, customer.id, ash_opts) do
+                  {:ok, latest} when not is_nil(latest) ->
+                    if Map.get(latest, attr) == customer_id,
+                      do: {:ok, latest},
+                      else: {:error, :customer_identity_conflict}
 
-              _ ->
-                {:error, :customer_not_found}
+                  {:error, reason} ->
+                    {:error, reason}
+
+                  _ ->
+                    {:error, :customer_not_found}
+                end
+
+              %Ash.BulkResult{errors: [error | _]} ->
+                {:error, error}
+
+              other ->
+                {:error, other}
             end
-
-          %Ash.BulkResult{errors: [error | _]} ->
-            {:error, error}
-
-          other ->
-            {:error, other}
         end
 
       _ ->
