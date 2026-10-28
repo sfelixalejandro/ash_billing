@@ -25,7 +25,7 @@ Add `ash_billing` to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.3.0"}
+    {:ash_billing, "~> 0.3.1"}
   ]
 end
 ```
