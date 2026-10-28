@@ -27,6 +27,17 @@ defmodule AshBilling.Providers.StripeTest do
       assert query =~ "line_items%5B0%5D%5Bquantity%5D=2"
       assert query =~ "metadata%5Buser_id%5D=user_456"
     end
+
+    test "handles Ash.CiString values without Protocol.UndefinedError" do
+      ci_email = Ash.CiString.new("USER@EXAMPLE.COM")
+      params = %{email: ci_email, metadata: %{role: "admin"}}
+
+      form_params = Stripe.to_form_params(params)
+      query = URI.encode_query(form_params)
+
+      assert query =~ "email=user%40example.com" or query =~ "email=USER%40EXAMPLE.COM"
+      assert List.keyfind(form_params, "email", 0) == {"email", "USER@EXAMPLE.COM"}
+    end
   end
 
   describe "create_customer/2" do

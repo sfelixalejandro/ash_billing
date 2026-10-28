@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Support `Ash.CiString` and Custom Structs in Stripe Payloads**:
+  - Automatically coerce `Ash.CiString` values (commonly used by `AshAuthentication` for `:email` fields) to strings in `AshBilling.Providers.Stripe.to_form_params/2`.
+  - Safely serialize structs implementing `String.Chars` or unwrap them to maps, preventing `Protocol.UndefinedError` when invoking `AshBilling.create_customer/2` or `AshBilling.create_checkout_session/2`.
+
 ## [v0.3.0] - 2026-10-27
 
 Major integrity, security, and developer experience release delivering database-level uniqueness, atomic terminal guards, customer identity validation, Igniter installer fixes, and credential redaction.

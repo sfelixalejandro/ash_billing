@@ -42,6 +42,22 @@ defmodule AshBillingTest do
       assert {:ok, "cus_new_123"} = AshBilling.create_customer(user, opts)
     end
 
+    test "creates customer when email is an Ash.CiString", %{stub_name: stub_name, opts: opts} do
+      Req.Test.stub(stub_name, fn conn ->
+        {:ok, body, _conn} = Plug.Conn.read_body(conn)
+        params = URI.decode_query(body)
+        assert params["email"] == "CI_USER@EXAMPLE.COM"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(%{"id" => "cus_ci_string_123"}))
+      end)
+
+      ci_email = Ash.CiString.new("CI_USER@EXAMPLE.COM")
+      user = %User{id: Ash.UUID.generate(), email: ci_email, name: "Ci User"}
+      assert {:ok, "cus_ci_string_123"} = AshBilling.create_customer(user, opts)
+    end
+
     test "creates customer from raw map params", %{stub_name: stub_name, opts: opts} do
       Req.Test.stub(stub_name, fn conn ->
         conn

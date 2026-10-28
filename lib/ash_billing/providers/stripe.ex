@@ -314,6 +314,20 @@ defmodule AshBilling.Providers.Stripe do
   @doc false
   def to_form_params(data, prefix \\ nil)
 
+  def to_form_params(%Ash.CiString{} = ci_string, prefix) do
+    [{prefix, to_string(ci_string)}]
+  end
+
+  def to_form_params(%_{} = struct, prefix) do
+    if String.Chars.impl_for(struct) do
+      [{prefix, to_string(struct)}]
+    else
+      struct
+      |> Map.from_struct()
+      |> to_form_params(prefix)
+    end
+  end
+
   def to_form_params(map, prefix) when is_map(map) do
     Enum.flat_map(map, fn {key, value} ->
       new_prefix = if prefix, do: "#{prefix}[#{key}]", else: "#{key}"
