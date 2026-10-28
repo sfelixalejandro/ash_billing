@@ -41,16 +41,21 @@ if Code.ensure_loaded?(Igniter) do
       igniter
       |> setup_customer_resource(customer_resource, subscription_resource, domain)
       |> setup_subscription_resource(customer_resource, subscription_resource, domain)
+      |> register_resources(customer_resource, subscription_resource, domain)
       |> configure_runtime()
       |> configure_router(customer_resource, subscription_resource)
       |> Igniter.add_notice("""
-      AshBilling installed successfully!
+      AshBilling resource and webhook configuration prepared.
 
       Next steps:
       1. Ensure STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET are configured in your environment.
-      2. If using a database data layer (e.g., AshPostgres), run:
+      2. Verify resource actions, persistence and authorization policies for your application.
+         New subscriptions inherit the customer's PostgreSQL repo when explicitly configured.
+      3. If using a database data layer (e.g., AshPostgres), run:
          mix ash.codegen create_billing_tables
          mix ash.migrate
+      4. For production, configure an AshBilling.WebhookEvent resource for persistent deduplication.
+         If you use a custom Plug.Parsers body_reader, ensure it assigns the raw body.
       """)
     end
 
@@ -101,16 +106,66 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
+    defp subscription_foreign_key(igniter, subscription) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, subscription)
+
+      if exists?,
+        do: existing_subscription_foreign_key(igniter, subscription),
+        else: {igniter, :user_id}
+    end
+
+    defp existing_subscription_foreign_key(igniter, subscription) do
+      {igniter, configured} =
+        Spark.Igniter.get_option(igniter, subscription, [
+          :billing_subscription,
+          :customer_relationship
+        ])
+
+      relationship =
+        case configured do
+          {:ok, name} when is_atom(name) and not is_nil(name) -> name
+          _ -> :user
+        end
+
+      fallback = String.to_atom("#{relationship}_id")
+
+      case Igniter.Project.Module.find_module(igniter, subscription) do
+        {:ok, {igniter, _, zipper}} ->
+          attribute =
+            with {:ok, call} <-
+                   Igniter.Code.Function.move_to_function_call(
+                     zipper,
+                     :belongs_to,
+                     [2, 3],
+                     &Igniter.Code.Function.argument_equals?(&1, 0, relationship)
+                   ),
+                 {:ok, options} <- Igniter.Code.Function.move_to_nth_argument(call, 2),
+                 {:ok, value} <- Igniter.Code.Keyword.get_key(options, :source_attribute),
+                 {:ok, name} when is_atom(name) <- Igniter.Code.Common.expand_literal(value) do
+              name
+            else
+              _ -> fallback
+            end
+
+          {igniter, attribute}
+
+        {:error, igniter} ->
+          {igniter, fallback}
+      end
+    end
+
     defp setup_customer_resource(igniter, customer, subscription, domain) do
+      {igniter, foreign_key} = subscription_foreign_key(igniter, subscription)
       {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, customer)
 
       if exists? do
         igniter
         |> Spark.Igniter.add_extension(customer, Ash.Resource, :extensions, AshBilling.Resource)
+        |> ensure_use_option(customer, :domain, domain)
         |> Ash.Resource.Igniter.add_new_relationship(
           customer,
           :subscriptions,
-          "has_many :subscriptions, #{inspect(subscription)}"
+          "has_many :subscriptions, #{inspect(subscription)}, destination_attribute: #{inspect(foreign_key)}"
         )
       else
         path = Igniter.Project.Module.proper_location(igniter, customer)
@@ -127,7 +182,7 @@ if Code.ensure_loaded?(Igniter) do
           end
 
           relationships do
-            has_many :subscriptions, #{inspect(subscription)}
+            has_many :subscriptions, #{inspect(subscription)}, destination_attribute: #{inspect(foreign_key)}
           end
 
           actions do
@@ -145,21 +200,70 @@ if Code.ensure_loaded?(Igniter) do
       {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, subscription)
 
       if exists? do
-        igniter
-        |> Spark.Igniter.add_extension(
-          subscription,
-          Ash.Resource,
-          :extensions,
-          AshBilling.Subscription
-        )
+        igniter =
+          igniter
+          |> Spark.Igniter.add_extension(
+            subscription,
+            Ash.Resource,
+            :extensions,
+            AshBilling.Subscription
+          )
+          |> ensure_use_option(subscription, :domain, domain)
+
+        {igniter, relationship} =
+          Spark.Igniter.get_option(igniter, subscription, [
+            :billing_subscription,
+            :customer_relationship
+          ])
+
+        case relationship do
+          {:ok, name} when is_atom(name) and not is_nil(name) ->
+            igniter
+
+          _ ->
+            igniter
+            |> Ash.Resource.Igniter.add_new_attribute(
+              subscription,
+              :user_id,
+              "attribute :user_id, :uuid, public?: true"
+            )
+            |> Ash.Resource.Igniter.add_new_relationship(
+              subscription,
+              :user,
+              "belongs_to :user, #{inspect(customer)}"
+            )
+            |> Spark.Igniter.set_option(
+              subscription,
+              [:billing_subscription, :customer_relationship],
+              :user
+            )
+        end
       else
         path = Igniter.Project.Module.proper_location(igniter, subscription)
+        {igniter, repo_option} = Spark.Igniter.get_option(igniter, customer, [:postgres, :repo])
+
+        {data_layer, postgres} =
+          case repo_option do
+            {:ok, repo} when is_atom(repo) and not is_nil(repo) ->
+              {", data_layer: AshPostgres.DataLayer",
+               """
+               postgres do
+                 table "subscriptions"
+                 repo #{inspect(repo)}
+               end
+               """}
+
+            _ ->
+              {"", ""}
+          end
 
         content = """
         defmodule #{inspect(subscription)} do
           use Ash.Resource,
             domain: #{inspect(domain)},
-            extensions: [AshBilling.Subscription]
+            extensions: [AshBilling.Subscription]#{data_layer}
+
+          #{postgres}
 
           attributes do
             uuid_primary_key :id
@@ -185,13 +289,52 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
-    defp configure_runtime(igniter) do
-      target_file =
-        if Igniter.exists?(igniter, "config/runtime.exs") do
-          "runtime.exs"
-        else
-          "config.exs"
+    defp ensure_use_option(igniter, resource, key, value) do
+      Igniter.Project.Module.find_and_update_module!(igniter, resource, fn zipper ->
+        with {:ok, zipper} <- Igniter.Code.Module.move_to_use(zipper, Ash.Resource) do
+          Igniter.Code.Function.update_nth_argument(zipper, 1, fn options ->
+            Igniter.Code.Keyword.set_keyword_key(options, key, value)
+          end)
         end
+      end)
+    end
+
+    defp register_resources(igniter, customer, subscription, default_domain) do
+      Enum.reduce([customer, subscription], igniter, fn resource, igniter ->
+        {igniter, domain} =
+          case Ash.Resource.Igniter.domain(igniter, resource) do
+            {:ok, igniter, domain} -> {igniter, domain}
+            _ -> {igniter, default_domain}
+          end
+
+        {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, domain)
+        app = Igniter.Project.Application.app_name(igniter)
+
+        igniter =
+          if exists?,
+            do: igniter,
+            else:
+              Igniter.Project.Module.create_module(
+                igniter,
+                domain,
+                "use Ash.Domain, otp_app: #{inspect(app)}"
+              )
+
+        igniter
+        |> Ash.Domain.Igniter.add_resource_reference(domain, resource)
+        |> Igniter.Project.Config.configure("config.exs", app, [:ash_domains], [domain],
+          updater: &Igniter.Code.List.prepend_new_to_list(&1, domain)
+        )
+      end)
+    end
+
+    defp configure_runtime(igniter) do
+      igniter =
+        if Igniter.exists?(igniter, "config/runtime.exs"),
+          do: igniter,
+          else: Igniter.create_new_file(igniter, "config/runtime.exs", "import Config\n")
+
+      target_file = "runtime.exs"
 
       igniter
       |> Igniter.Project.Config.configure(
@@ -215,15 +358,19 @@ if Code.ensure_loaded?(Igniter) do
         scope_code = """
         forward "/stripe", AshBilling.Plug,
           customer_resource: #{inspect(customer)},
-          subscription_resource: #{inspect(subscription)}
+          subscription_resource: #{inspect(subscription)},
+          webhook_secret: {Application, :get_env, [:ash_billing, :stripe_webhook_secret]}
         """
 
-        Igniter.Libs.Phoenix.add_scope(
-          igniter,
-          "/webhooks",
-          scope_code,
-          router: router
-        )
+        igniter =
+          Igniter.Libs.Phoenix.add_scope(
+            igniter,
+            "/webhooks",
+            scope_code,
+            router: router
+          )
+
+        configure_body_reader(igniter, router)
       else
         Igniter.add_notice(igniter, """
         No Phoenix router was detected. If using Phoenix, mount AshBilling.Plug in your router:
@@ -231,9 +378,43 @@ if Code.ensure_loaded?(Igniter) do
             scope "/webhooks" do
               forward "/stripe", AshBilling.Plug,
                 customer_resource: #{inspect(customer)},
-                subscription_resource: #{inspect(subscription)}
+                subscription_resource: #{inspect(subscription)},
+                webhook_secret: {Application, :get_env, [:ash_billing, :stripe_webhook_secret]}
             end
         """)
+      end
+    end
+
+    defp configure_body_reader(igniter, router) do
+      {igniter, endpoint} = Igniter.Libs.Phoenix.select_endpoint(igniter, router)
+
+      if endpoint do
+        Igniter.Project.Module.find_and_update_module!(igniter, endpoint, fn zipper ->
+          with {:ok, zipper} <-
+                 Igniter.Code.Function.move_to_function_call_in_current_scope(
+                   zipper,
+                   :plug,
+                   2,
+                   &Igniter.Code.Function.argument_equals?(&1, 0, Plug.Parsers)
+                 ) do
+            Igniter.Code.Function.update_nth_argument(zipper, 1, fn options ->
+              Igniter.Code.Keyword.set_keyword_key(
+                options,
+                :body_reader,
+                Sourceror.parse_string!("{AshBilling.Plug, :read_body, []}")
+              )
+            end)
+          else
+            _ ->
+              {:warning,
+               "Configure Plug.Parsers body_reader: {AshBilling.Plug, :read_body, []} before using router webhooks."}
+          end
+        end)
+      else
+        Igniter.add_notice(
+          igniter,
+          "Configure your endpoint's Plug.Parsers with body_reader: {AshBilling.Plug, :read_body, []}."
+        )
       end
     end
   end

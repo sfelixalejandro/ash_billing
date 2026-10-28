@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Make Igniter register generated resources and domains, configure credentials at runtime, pass the configured webhook secret, and preserve raw webhook bodies through the endpoint parser. Newly generated PostgreSQL subscriptions inherit the customer's explicitly configured repo; existing custom relationships and body readers are preserved.
+
 - Implement the documented `AshBilling.Plug.read_body/2` parser callback, preserving exact webhook bytes across chunks for signature verification after `Plug.Parsers`.
 
 - Redact API key values from configuration diagnostics and raised verification errors.
