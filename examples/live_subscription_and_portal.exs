@@ -17,7 +17,7 @@ defmodule AshBilling.LiveSubscriptionSuite do
   def run do
     print_banner("STARTING ASH_BILLING LIVE SUBSCRIPTION SUITE")
 
-    if is_nil(@stripe_key) or not String.starts_with?(@stripe_key, "sk_") do
+    if is_nil(@stripe_key) or not String.starts_with?(@stripe_key, "sk_test_") do
       IO.puts("[ERROR] STRIPE_SECRET_KEY environment variable required (sk_test_...)")
       System.halt(1)
     end
@@ -95,7 +95,7 @@ defmodule AshBilling.LiveSubscriptionSuite do
   # TEST B: Webhook Synchronization with Live Stripe Event Payload
   # ============================================================================
   defp test_real_webhook_event_sync(customer_id) do
-    step("Test B: Webhook Synchronization with Live Payload from Stripe API")
+    step("Test B: Webhook parsing smoke check (API event or synthetic fallback)")
 
     IO.puts("    [INFO] Querying recent events from Stripe API...")
 
@@ -158,7 +158,9 @@ defmodule AshBilling.LiveSubscriptionSuite do
     assert_eq("Synchronized User UUID", updated_user.id, user_uuid)
     assert_eq("Persisted Stripe Customer ID", updated_user.stripe_customer_id, cust_id)
 
-    pass("Real Stripe event parsed, validated, and persisted into Ash resource with zero errors")
+    pass(
+      "Payload synchronized directly; this check does not verify webhook signatures or delivery"
+    )
   end
 
   # ============================================================================
@@ -346,7 +348,7 @@ defmodule AshBilling.LiveSubscriptionSuite do
   defp print_summary do
     IO.puts("")
     IO.puts("================================================================================")
-    IO.puts("  ALL LIVE SUBSCRIPTION TESTS (A, B, C, D) PASSED SUCCESSFULLY (100%)")
+    IO.puts("  API SMOKE CHECKS FINISHED; PAYMENT COMPLETION AND WEBHOOK DELIVERY NOT EXERCISED")
     IO.puts("================================================================================")
   end
 end

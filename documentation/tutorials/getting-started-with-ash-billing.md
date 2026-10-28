@@ -16,7 +16,7 @@ If you are using [Igniter](https://hexdocs.pm/igniter), install `ash_billing` wi
 mix igniter.install ash_billing
 ```
 
-Igniter automatically configures your customer and subscription resources, adds the required router scope, and configures runtime environment variables.
+Igniter configures your customer and subscription resources, registers their domains, adds the webhook route, and configures runtime credentials. It adds the raw-body reader when it finds the endpoint parser, preserving existing custom readers. Newly generated subscriptions inherit the customer's explicitly configured PostgreSQL repo. Review its notices, configure persistent webhook deduplication for production, and generate and apply your database migrations.
 
 ### Manual Installation
 
@@ -40,7 +40,8 @@ Configure your credentials in `config/runtime.exs`:
 
 ```elixir
 config :ash_billing,
-  stripe_api_key: System.get_env("STRIPE_SECRET_KEY")
+  stripe_api_key: System.get_env("STRIPE_SECRET_KEY"),
+  stripe_webhook_secret: System.get_env("STRIPE_WEBHOOK_SECRET")
 ```
 
 ---
@@ -57,6 +58,20 @@ defmodule MyApp.Accounts.User do
     domain: MyApp.Accounts,
     data_layer: AshPostgres.DataLayer,
     extensions: [AshBilling.Resource]
+
+  postgres do
+    table "users"
+    repo MyApp.Repo
+  end
+
+  relationships do
+    has_many :subscriptions, MyApp.Billing.Subscription, destination_attribute: :user_id
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update]
+  end
 
   attributes do
     uuid_primary_key :id
@@ -85,8 +100,23 @@ defmodule MyApp.Billing.Subscription do
     data_layer: AshPostgres.DataLayer,
     extensions: [AshBilling.Subscription]
 
+  postgres do
+    table "subscriptions"
+    repo MyApp.Repo
+  end
+
   attributes do
     uuid_primary_key :id
+    attribute :user_id, :uuid, allow_nil?: false, public?: true
+  end
+
+  relationships do
+    belongs_to :user, MyApp.Accounts.User
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
   end
 
   billing_subscription do
@@ -98,7 +128,40 @@ end
 
 `AshBilling.Subscription` automatically manages:
 - **Attributes**: `:provider_subscription_id`, `:status`, `:price_id`, `:current_period_end`, `:trial_ends_at`, `:cancel_at_period_end`, `:cancel_at`.
-- **Calculations**: `:active?` (boolean, true if status is active, trialing, or past_due with remaining period), `:on_trial?`, and `:canceling?` (boolean, true if scheduled to cancel at period end or at a future timestamp).
+- **Calculations**: `:active?` is true for `active`, for `trialing` with no trial end or a future trial end, and for `past_due` with a future `trial_ends_at`. `:on_trial?` follows the trial rules. `:canceling?` is true for nonterminal subscriptions with `cancel_at_period_end: true` or a future `cancel_at`; terminal statuses always return false.
+- **Identity**: provider subscription IDs are unique within the resource and its Ash tenant. Each scope must correspond to one provider/account/environment.
+
+These examples assume an existing `MyApp.Repo` configured for AshPostgres and UUID customer primary keys. Register both resources in their respective domains and register those domains in application configuration. For example:
+
+```elixir
+defmodule MyApp.Accounts do
+  use Ash.Domain, otp_app: :my_app
+  resources do
+    resource MyApp.Accounts.User
+  end
+end
+
+defmodule MyApp.Billing do
+  use Ash.Domain, otp_app: :my_app
+  resources do
+    resource MyApp.Billing.Subscription
+  end
+end
+```
+
+```elixir
+# config/config.exs
+config :my_app, ash_domains: [MyApp.Accounts, MyApp.Billing]
+```
+
+Generate and apply the tables and unique index:
+
+```sh
+mix ash.codegen create_billing_tables
+mix ash.migrate
+```
+
+Existing installations must resolve duplicate provider subscription IDs before applying the new index. See [webhook identity and migration](../topics/webhooks-and-resilience.md#subscription-identity-and-migration).
 
 ---
 
@@ -117,7 +180,20 @@ scope "/webhooks" do
 end
 ```
 
-All incoming webhooks will have their HMAC-SHA256 signature verified and their customer and subscription records updated idempotently in real time.
+If `Plug.Parsers` runs before your router, preserve the signed request bytes:
+
+```elixir
+# In endpoint.ex, update the existing Plug.Parsers configuration.
+plug Plug.Parsers,
+  parsers: [:urlencoded, :multipart, :json],
+  pass: ["*/*"],
+  json_decoder: Phoenix.json_library(),
+  body_reader: {AshBilling.Plug, :read_body, []}
+```
+
+If you already have a custom body reader, preserve it and ensure it assigns the complete raw body to `conn.assigns[:raw_body]`. Configure database-backed webhook deduplication for production as described in the [resilience guide](../topics/webhooks-and-resilience.md).
+
+The handler verifies signatures before synchronization. Initial customer association requires a server-generated local reference; contradictory ownership returns a retryable error.
 
 ---
 
@@ -158,24 +234,16 @@ Generate a link to the self-service Stripe Customer Portal where users can updat
 
 ## 5. Authorizing with Native Ash Policies
 
-Use built-in Ash policy checks to restrict access to paying subscribers:
+Use built-in checks in your existing resource's `policies` block. The example assumes the resource already defines read and export actions:
 
 ```elixir
-defmodule MyApp.Content.Document do
-  use Ash.Resource,
-    domain: MyApp.Content,
-    authorizers: [Ash.Policy.Authorizer]
+policies do
+  policy action_type(:read) do
+    authorize_if AshBilling.Checks.Subscribed
+  end
 
-  policies do
-    # Only active subscribers or trialing users can read premium documents
-    policy action_type(:read) do
-      authorize_if AshBilling.Checks.Subscribed
-    end
-
-    # Only users subscribed to the Enterprise price tier can export
-    policy action(:export) do
-      authorize_if {AshBilling.Checks.HasPrice, price: "price_enterprise_annual"}
-    end
+  policy action(:export) do
+    authorize_if {AshBilling.Checks.HasPrice, price: "price_enterprise_annual"}
   end
 end
 ```
@@ -184,9 +252,13 @@ end
 
 ## 6. Pre-flight Diagnostics
 
-Before booting your application, you can verify that all API credentials, webhook secrets, and registered resources are properly configured:
+Validate the supplied resource contracts and credential formats before booting your application. This diagnostic does not contact Stripe, verify database migrations, or require absent credentials:
 
 ```elixir
-# Raises an informative error if configuration is incomplete
-AshBilling.verify_configuration!(MyApp.Accounts.User)
+AshBilling.verify_configuration!(
+  customer_resource: MyApp.Accounts.User,
+  subscription_resource: MyApp.Billing.Subscription,
+  api_key: System.get_env("STRIPE_SECRET_KEY"),
+  webhook_secret: System.get_env("STRIPE_WEBHOOK_SECRET")
+)
 ```

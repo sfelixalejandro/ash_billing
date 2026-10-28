@@ -89,14 +89,30 @@ defmodule AshBilling.WebhookSync do
     end)
   end
 
-  defp sync_subscription(nil, _cust_res, _sub_res, _domain, _opts), do: {:ok, :ignored}
+  defp sync_subscription(
+         object,
+         customer_resource,
+         subscription_resource,
+         domain,
+         opts,
+         retry_create? \\ true
+       )
 
-  defp sync_subscription(object, customer_resource, subscription_resource, domain, opts) do
+  defp sync_subscription(nil, _cust_res, _sub_res, _domain, _opts, _retry), do: {:ok, :ignored}
+
+  defp sync_subscription(
+         object,
+         customer_resource,
+         subscription_resource,
+         domain,
+         opts,
+         retry_create?
+       ) do
     if is_nil(subscription_resource) do
       {:ok, :no_subscription_resource}
     else
       sub_id = object["id"]
-      stripe_cust_id = extract_customer_id(object)
+      stripe_cust_id = extract_customer_id(Map.take(object, ["customer"]))
       status = normalize_status(object["status"])
       price_id = extract_price_id(object)
       current_period_end = extract_current_period_end(object)
@@ -123,7 +139,9 @@ defmodule AshBilling.WebhookSync do
       ash_opts = ash_options(domain, opts)
 
       with {:ok, customer} <- find_customer(customer_resource, stripe_cust_id, object, ash_opts),
-           {:ok, existing} <- fetch_existing_subscription(subscription_resource, sub_id, ash_opts) do
+           {:ok, existing} <-
+             fetch_existing_subscription(subscription_resource, sub_id, ash_opts),
+           :ok <- validate_subscription_customer(existing, customer, subscription_resource) do
         attrs =
           %{
             provider_subscription_id: sub_id,
@@ -159,7 +177,9 @@ defmodule AshBilling.WebhookSync do
           # Out-of-order event protection:
           # Terminal states in Stripe (canceled, incomplete_expired) can never legitimately
           # transition back to active/past_due. If a delayed webhook arrives out of order, ignore it.
-          existing && terminal_status?(existing.status) && !terminal_status?(status) ->
+          existing && terminal_status?(existing.status) && !terminal_status?(status) &&
+              Keyword.get(opts, :provider, SubscriptionInfo.provider(subscription_resource)) ==
+                AshBilling.Providers.Stripe ->
             require Logger
 
             Logger.warning(
@@ -178,6 +198,10 @@ defmodule AshBilling.WebhookSync do
             )
 
             {:ok, existing}
+
+          # A terminal notification must not be replaced by a same-second live snapshot.
+          existing && terminal_status?(status) ->
+            update_subscription_safely(subscription_resource, existing, attrs, event_dt, ash_opts)
 
           # Conflicting status transition protection:
           # If transitioning backwards from :past_due / :unpaid to :active, reconcile with provider.
@@ -231,21 +255,19 @@ defmodule AshBilling.WebhookSync do
                 {:ok, created}
 
               {:error, error} ->
-                # Concurrency race resolution:
-                # If another concurrent process just inserted this provider_subscription_id,
-                # retry as an update to guarantee idempotency across nodes.
-                case fetch_existing_subscription(subscription_resource, sub_id, ash_opts) do
-                  {:ok, newly_created} when not is_nil(newly_created) ->
-                    update_subscription_safely(
-                      subscription_resource,
-                      newly_created,
-                      attrs,
-                      event_dt,
-                      ash_opts
-                    )
-
-                  _ ->
-                    {:error, error}
+                # Only a real identity conflict is retried. Re-read through the normal
+                # lifecycle and ownership guards; never update blindly after a failed create.
+                if retry_create? and subscription_identity_conflict?(error) do
+                  sync_subscription(
+                    object,
+                    customer_resource,
+                    subscription_resource,
+                    domain,
+                    opts,
+                    false
+                  )
+                else
+                  {:error, error}
                 end
             end
         end
@@ -253,51 +275,29 @@ defmodule AshBilling.WebhookSync do
     end
   end
 
+  defp subscription_identity_conflict?(%Ash.Error.Invalid{errors: errors}),
+    do: Enum.any?(errors, &subscription_identity_conflict?/1)
+
+  defp subscription_identity_conflict?(%Ash.Error.Changes.InvalidAttribute{
+         field: :provider_subscription_id,
+         private_vars: vars
+       })
+       when is_list(vars),
+       do: Keyword.get(vars, :constraint_type) == :unique
+
+  defp subscription_identity_conflict?(_), do: false
+
   defp sync_checkout_session(session, customer_resource, domain, opts) do
     if is_nil(customer_resource) do
       {:ok, :no_customer_resource}
     else
       ash_opts = ash_options(domain, opts)
-      stripe_customer_id = extract_customer_id(session)
+      stripe_customer_id = extract_customer_id(Map.take(session, ["customer"]))
 
-      resource_id =
-        get_in(session, ["metadata", "resource_id"]) ||
-          session["client_reference_id"]
-
-      email =
-        session["customer_email"] ||
-          get_in(session, ["customer_details", "email"])
-
-      customer_result =
-        cond do
-          stripe_customer_id && resource_id ->
-            Ash.get(customer_resource, resource_id, ash_opts)
-
-          stripe_customer_id && email && Ash.Resource.Info.attribute(customer_resource, :email) ->
-            customer_resource
-            |> Ash.Query.new()
-            |> Ash.Query.filter(email == ^email)
-            |> Ash.read_one(ash_opts)
-
-          true ->
-            {:ok, nil}
-        end
-
-      case customer_result do
-        {:ok, user} when not is_nil(user) ->
-          attr = ResourceInfo.customer_id_attribute(customer_resource)
-
-          if is_nil(Map.get(user, attr)) do
-            Ash.update(user, %{attr => stripe_customer_id}, ash_opts)
-          else
-            {:ok, user}
-          end
-
-        {:ok, nil} ->
-          {:ok, :ignored}
-
-        {:error, reason} ->
-          {:error, reason}
+      if stripe_customer_id do
+        find_customer(customer_resource, stripe_customer_id, session, ash_opts)
+      else
+        {:ok, :ignored}
       end
     end
   end
@@ -421,19 +421,33 @@ defmodule AshBilling.WebhookSync do
     has_timestamp? =
       Ash.Resource.Info.attribute(subscription_resource, :last_event_created_at) != nil
 
-    has_update? = Ash.Resource.Info.action(subscription_resource, :update) != nil
+    update_action = primary_update_action(subscription_resource)
 
-    if has_timestamp? and has_update? and not is_nil(event_dt) do
+    if update_action do
       require Ash.Query
 
-      # Atomic condition: only update if record currently has NULL timestamp
-      # or a timestamp less than or equal to incoming event_dt
+      # Compare at commit time, including when the provider request was in flight.
+      # Nonterminal writes may only replace the status that this worker actually read.
+      # This still permits an intentional transition from an already-read terminal state
+      # for providers whose lifecycle supports it; Stripe rejects those earlier.
+      query = Ash.Query.filter(subscription_resource, id == ^existing.id)
+
       query =
-        subscription_resource
-        |> Ash.Query.filter(
-          id == ^existing.id and
-            (is_nil(last_event_created_at) or last_event_created_at <= ^event_dt)
-        )
+        if has_timestamp? and not is_nil(event_dt) do
+          Ash.Query.filter(
+            query,
+            is_nil(last_event_created_at) or last_event_created_at <= ^event_dt
+          )
+        else
+          query
+        end
+
+      query =
+        if terminal_status?(attrs[:status]) do
+          query
+        else
+          Ash.Query.filter(query, status == ^existing.status)
+        end
 
       bulk_opts =
         ash_opts
@@ -441,7 +455,7 @@ defmodule AshBilling.WebhookSync do
         |> Keyword.put(:return_records?, true)
         |> Keyword.put(:return_errors?, true)
 
-      case Ash.bulk_update(query, :update, attrs, bulk_opts) do
+      case Ash.bulk_update(query, update_action.name, attrs, bulk_opts) do
         %Ash.BulkResult{status: :success, records: [updated | _]} ->
           {:ok, updated}
 
@@ -449,7 +463,7 @@ defmodule AshBilling.WebhookSync do
           require Logger
 
           Logger.warning(
-            "AshBilling.WebhookSync: Atomic conditional update matched 0 records for subscription #{inspect(existing.provider_subscription_id)}. A newer event was already applied. Discarding out-of-order write."
+            "AshBilling.WebhookSync: Atomic conditional update matched 0 records for subscription #{inspect(existing.provider_subscription_id)}. The subscription changed concurrently or a newer event was applied."
           )
 
           case fetch_existing_subscription(
@@ -457,8 +471,18 @@ defmodule AshBilling.WebhookSync do
                  existing.provider_subscription_id,
                  ash_opts
                ) do
-            {:ok, latest} when not is_nil(latest) -> {:ok, latest}
-            _ -> {:ok, existing}
+            {:ok, latest} when not is_nil(latest) ->
+              if terminal_status?(latest.status) or existing_event_newer?(latest, event_dt) do
+                {:ok, latest}
+              else
+                {:error, :subscription_changed_concurrently}
+              end
+
+            {:error, reason} ->
+              {:error, reason}
+
+            _ ->
+              {:error, :subscription_not_found}
           end
 
         %Ash.BulkResult{errors: [err | _]} ->
@@ -489,85 +513,163 @@ defmodule AshBilling.WebhookSync do
           {:error, other_error}
       end
     else
-      Ash.update(existing, attrs, ash_opts)
+      {:error, :update_action_required}
     end
+  end
+
+  defp primary_update_action(resource) do
+    Ash.Resource.Info.primary_action(resource, :update) ||
+      Ash.Resource.Info.action(resource, :update)
   end
 
   defp find_customer(nil, _stripe_cust_id, _object, _ash_opts), do: {:ok, nil}
 
+  defp find_customer(_resource, nil, _object, _ash_opts), do: {:error, :missing_customer_id}
+
   defp find_customer(customer_resource, stripe_cust_id, object, ash_opts) do
     attr = ResourceInfo.customer_id_attribute(customer_resource)
 
-    lookup_result =
-      if stripe_cust_id do
-        customer_resource
-        |> Ash.Query.new()
-        |> Ash.Query.filter(^[{attr, stripe_cust_id}])
-        |> Ash.read_one(ash_opts)
-      else
-        {:ok, nil}
-      end
+    result =
+      customer_resource
+      |> Ash.Query.filter(^[{attr, stripe_cust_id}])
+      |> Ash.read_one(ash_opts)
 
-    case lookup_result do
-      {:ok, cust} when not is_nil(cust) ->
-        {:ok, cust}
+    case result do
+      {:ok, customer} when not is_nil(customer) ->
+        {:ok, customer}
 
       {:error, reason} ->
         {:error, reason}
 
       {:ok, nil} ->
-        resource_id =
-          get_in(object, ["metadata", "resource_id"]) ||
-            object["client_reference_id"]
+        find_unassociated_customer(customer_resource, stripe_cust_id, object, ash_opts)
+    end
+  end
 
-        if resource_id do
-          case Ash.get(customer_resource, resource_id, ash_opts) do
-            {:ok, cust} ->
-              if stripe_cust_id && is_nil(Map.get(cust, attr)) do
-                case Ash.update(cust, %{attr => stripe_cust_id}, ash_opts) do
-                  {:ok, updated} -> {:ok, updated}
-                  {:error, reason} -> {:error, reason}
-                end
-              else
-                {:ok, cust}
-              end
+  defp find_unassociated_customer(resource, customer_id, object, ash_opts) do
+    resource_id = get_in(object, ["metadata", "resource_id"]) || object["client_reference_id"]
+
+    metadata_id = get_in(object, ["metadata", "resource_id"])
+    reference_id = object["client_reference_id"]
+
+    cond do
+      metadata_id && reference_id && metadata_id != reference_id ->
+        {:error, :customer_identity_conflict}
+
+      resource_id ->
+        case Ash.get(resource, resource_id, ash_opts) do
+          {:ok, customer} when not is_nil(customer) ->
+            associate_customer(customer, customer_id, ash_opts)
+
+          {:ok, nil} ->
+            {:error, :customer_not_found}
+
+          {:error, reason} ->
+            if not_found_error?(reason), do: {:error, :customer_not_found}, else: {:error, reason}
+        end
+
+      true ->
+        # Email is not proof of ownership. It may identify a conflict, but cannot
+        # establish a new billing association or grant subscription access.
+        email = object["customer_email"] || get_in(object, ["customer_details", "email"])
+
+        if email && Ash.Resource.Info.attribute(resource, :email) do
+          case resource |> Ash.Query.filter(email == ^email) |> Ash.read_one(ash_opts) do
+            {:ok, nil} ->
+              {:error, :customer_not_found}
+
+            {:ok, customer} ->
+              if is_nil(Map.get(customer, ResourceInfo.customer_id_attribute(resource))),
+                do: {:error, :customer_identity_unverified},
+                else: {:error, :customer_identity_conflict}
 
             {:error, reason} ->
-              if not_found_error?(reason) do
-                find_customer_by_email(customer_resource, object, ash_opts)
-              else
-                {:error, reason}
-              end
+              {:error, reason}
           end
         else
-          find_customer_by_email(customer_resource, object, ash_opts)
+          {:error, :customer_not_found}
         end
     end
   end
 
-  defp not_found_error?(%Ash.Error.Query.NotFound{}), do: true
+  defp associate_customer(%resource{} = customer, customer_id, ash_opts) do
+    attr = ResourceInfo.customer_id_attribute(resource)
 
-  defp not_found_error?(%Ash.Error.Invalid{errors: errors}) do
-    Enum.any?(errors, &not_found_error?/1)
-  end
+    case Map.get(customer, attr) do
+      ^customer_id ->
+        {:ok, customer}
 
-  defp not_found_error?(error) do
-    error_str = inspect(error)
-    String.contains?(error_str, "NotFound") or String.contains?(error_str, "not found")
-  end
+      nil ->
+        # Only the first successful writer may establish the association.
+        query = Ash.Query.filter(resource, id == ^customer.id)
+        query = Ash.Query.filter(query, ^[{attr, [is_nil: true]}])
 
-  defp find_customer_by_email(customer_resource, object, ash_opts) do
-    email = object["customer_email"] || get_in(object, ["customer_details", "email"])
+        case primary_update_action(resource) do
+          nil ->
+            {:error, :update_action_required}
 
-    if email && Ash.Resource.Info.attribute(customer_resource, :email) do
-      customer_resource
-      |> Ash.Query.new()
-      |> Ash.Query.filter(email == ^email)
-      |> Ash.read_one(ash_opts)
-    else
-      {:ok, nil}
+          update_action ->
+            case Ash.bulk_update(
+                   query,
+                   update_action.name,
+                   %{attr => customer_id},
+                   Keyword.merge(ash_opts,
+                     strategy: [:atomic],
+                     return_records?: true,
+                     return_errors?: true
+                   )
+                 ) do
+              %Ash.BulkResult{status: :success, records: [updated]} ->
+                {:ok, updated}
+
+              %Ash.BulkResult{status: :success, records: []} ->
+                case Ash.get(resource, customer.id, ash_opts) do
+                  {:ok, latest} when not is_nil(latest) ->
+                    if Map.get(latest, attr) == customer_id,
+                      do: {:ok, latest},
+                      else: {:error, :customer_identity_conflict}
+
+                  {:error, reason} ->
+                    {:error, reason}
+
+                  _ ->
+                    {:error, :customer_not_found}
+                end
+
+              %Ash.BulkResult{errors: [error | _]} ->
+                {:error, error}
+
+              other ->
+                {:error, other}
+            end
+        end
+
+      _ ->
+        {:error, :customer_identity_conflict}
     end
   end
+
+  defp validate_subscription_customer(nil, _customer, _resource), do: :ok
+  defp validate_subscription_customer(_existing, nil, _resource), do: :ok
+
+  defp validate_subscription_customer(existing, customer, resource) do
+    attr =
+      find_relationship_source_attribute(
+        resource,
+        SubscriptionInfo.customer_relationship(resource)
+      )
+
+    if Map.get(existing, attr) == customer.id,
+      do: :ok,
+      else: {:error, :subscription_customer_conflict}
+  end
+
+  defp not_found_error?(%Ash.Error.Query.NotFound{}), do: true
+
+  defp not_found_error?(%Ash.Error.Invalid{errors: errors}),
+    do: Enum.any?(errors, &not_found_error?/1)
+
+  defp not_found_error?(_), do: false
 
   defp extract_current_period_end(object) do
     ts =

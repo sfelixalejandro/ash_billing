@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Use the consumer's primary update action for atomic subscription and customer writes, including actions with custom names. A missing or non-atomic update action produces an error instead of bypassing concurrency guards.
+
+- Correct tutorial resource definitions, authorization-state descriptions, migration steps and diagnostic usage. Align examples with raw-body handling, redact the testbed webhook secret, and distinguish local/API smoke checks from a completed Stripe payment lifecycle.
+
+- Make Igniter register generated resources and domains, configure credentials at runtime, pass the configured webhook secret, and preserve raw webhook bodies through the endpoint parser. Newly generated PostgreSQL subscriptions inherit the customer's explicitly configured repo; existing custom relationships and body readers are preserved.
+
+- Implement the documented `AshBilling.Plug.read_body/2` parser callback, preserving exact webhook bytes across chunks for signature verification after `Plug.Parsers`.
+
+- Redact API key values from configuration diagnostics and raised verification errors.
+
+- Add a tenant-scoped subscription identity backed by a PostgreSQL unique index after migration. Concurrent create conflicts retry through the normal ownership and lifecycle checks; unrelated persistence errors are preserved. Existing applications must generate and apply the index migration after resolving any duplicate provider subscription IDs.
+
+- Reject contradictory customer and subscription ownership, establish initial metadata-based customer associations atomically, and keep identity failures retryable. Email alone no longer establishes a billing identity; missing customers cannot be replaced by subscription or Checkout session IDs.
+
+- Guard subscription writes atomically against concurrent status changes, including same-second terminal commits during provider reconciliation. Stripe terminal notifications take precedence over same-second snapshots; custom providers may explicitly transition an already-read terminal state. Missing or concurrently changed records return controlled retryable errors.
+
 - Terminal subscriptions (`canceled` and `incomplete_expired`) now return `false` from both the `:canceling?` calculation and `AshBilling.canceling?/1`, even when cancellation fields remain set. The helper accepts both atom and string statuses.
 
 ---

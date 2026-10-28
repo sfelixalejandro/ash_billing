@@ -17,6 +17,47 @@ postgres_available? =
         );
         """)
 
+        Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
+        CREATE TABLE IF NOT EXISTS billing_test_customers (
+          id UUID PRIMARY KEY,
+          email TEXT,
+          stripe_customer_id TEXT
+        )
+        """)
+
+        Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
+        CREATE TABLE IF NOT EXISTS billing_test_subscriptions (
+          id UUID PRIMARY KEY,
+          user_id UUID REFERENCES billing_test_customers(id),
+          provider_subscription_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          price_id TEXT,
+          current_period_end TIMESTAMP(6),
+          trial_ends_at TIMESTAMP(6),
+          cancel_at_period_end BOOLEAN DEFAULT FALSE,
+          cancel_at TIMESTAMP(6),
+          last_event_created_at TIMESTAMP(6)
+        )
+        """)
+
+        Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
+        CREATE UNIQUE INDEX IF NOT EXISTS billing_test_subscriptions_unique_provider_subscription_index
+        ON billing_test_subscriptions (provider_subscription_id)
+        """)
+
+        Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
+        CREATE TABLE IF NOT EXISTS billing_scoped_subscriptions (
+          LIKE billing_test_subscriptions INCLUDING DEFAULTS,
+          tenant_id TEXT NOT NULL,
+          PRIMARY KEY (id)
+        )
+        """)
+
+        Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
+        CREATE UNIQUE INDEX IF NOT EXISTS billing_scoped_subscriptions_unique_provider_subscription_index
+        ON billing_scoped_subscriptions (tenant_id, provider_subscription_id)
+        """)
+
         true
 
       {:error, {:already_started, _}} ->

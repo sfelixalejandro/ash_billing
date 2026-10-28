@@ -566,7 +566,7 @@ defmodule AshBilling do
           errors
         else
           [
-            "Stripe API key #{inspect(k)} does not start with standard prefix 'sk_' or 'rk_'"
+            "Stripe API key does not start with standard prefix 'sk_' or 'rk_'"
             | errors
           ]
         end

@@ -2,7 +2,7 @@
 
 Billing webhooks carry real financial state: invoice payments, subscription expirations, trial conversions, and plan changes. An improperly handled webhook can lock legitimate users out or give unauthorized access to non-paying accounts.
 
-`AshBilling` implements a multi-layer defense architecture to ensure zero silent failures, strict idempotency, and high resilience.
+`AshBilling` provides signature verification, event leases, conditional subscription updates and retry handling. Persistent deduplication and database constraints must be configured for the application's deployment scope.
 
 ---
 
@@ -87,6 +87,16 @@ defmodule MyApp.Billing.WebhookEvent do
     domain: MyApp.Billing,
     data_layer: AshPostgres.DataLayer,
     extensions: [AshBilling.WebhookEvent]
+
+  postgres do
+    table "webhook_events"
+    repo MyApp.Repo
+  end
+
+  actions do
+    default_accept :*
+    defaults [:read, :create, :update, :destroy]
+  end
 end
 ```
 
@@ -94,6 +104,7 @@ Then configure it in your router options:
 
 ```elixir
 forward "/stripe", AshBilling.Plug,
+  webhook_secret: {System, :get_env, ["STRIPE_WEBHOOK_SECRET"]},
   customer_resource: MyApp.Accounts.User,
   subscription_resource: MyApp.Billing.Subscription,
   deduplication_resource: MyApp.Billing.WebhookEvent
@@ -131,3 +142,52 @@ Stripe APIs evolve over time, and webhooks may contain string identifiers (`"cus
   nil
 )
 ```
+
+## Concurrent subscription updates
+
+Customer and subscription resources must expose a primary update action that supports
+atomic updates. Custom action names are supported. Missing actions or unsupported atomic
+updates return errors; synchronization never falls back to an unguarded write.
+
+Subscription updates compare the persisted status at commit time with the status read
+by the worker. A pending nonterminal update cannot overwrite a terminal status committed
+while a provider request was in flight, including events with equal timestamps. Older
+event timestamps are also rejected. A conflicting nonterminal status change returns
+`{:error, :subscription_changed_concurrently}` so the webhook can be retried.
+
+For Stripe, `canceled` and `incomplete_expired` are terminal for the same subscription ID.
+A new subscription uses a new ID; resuming a scheduled cancellation before it becomes
+terminal remains supported. Custom providers can transition a terminal state that the
+worker actually read, subject to the same timestamp and atomic concurrency guards.
+
+## Customer identity and recovery
+
+A persisted customer ID is authoritative. Initial association is allowed only when the
+local customer has no provider ID and the event supplies its local ID in trusted
+`metadata.resource_id` or `client_reference_id`. Conflicting references are rejected.
+The initial write is conditional on the provider ID still being empty, so competing
+customers cannot claim the same user. Email alone cannot establish ownership.
+
+Contradictions return `:customer_identity_conflict` or `:subscription_customer_conflict`;
+unresolved owners return `:customer_not_found` or `:customer_identity_unverified`.
+The Plug returns HTTP 500 and releases the event lease by default. These events are
+not permanently discarded: repair the association or configuration and retry the same
+event. Applications must generate local references on the server and must not accept
+arbitrary ownership metadata from clients.
+
+## Subscription identity and migration
+
+`AshBilling.Subscription` adds the `:unique_provider_subscription` identity on
+`:provider_subscription_id`, unless an equivalent unconditional identity already exists.
+Its scope is the subscription resource and the Ash tenant, when configured. Each scope
+must represent one provider, billing account and environment (for example, one Stripe
+account in test mode). Use separate resources/tables or tenants for separate account
+namespaces. This is not a claim that IDs from arbitrary providers or accounts are
+globally unique. Webhook routing and provider credentials must use the same scope.
+
+On PostgreSQL, generate and apply the unique index using `mix ash.codegen` and
+`mix ash.migrate`. Audit and resolve existing duplicate IDs in each scope before applying
+the migration; the library does not delete or merge records automatically. The database
+constraint, rather than a preflight lookup, prevents concurrent duplicates. A conflicting
+creation re-enters the regular synchronization checks once, including terminal precedence
+and customer ownership. Other create failures remain errors and can be retried.

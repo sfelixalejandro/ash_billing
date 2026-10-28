@@ -69,7 +69,6 @@ defmodule AshBilling.Testbed do
 
   def start do
     port = String.to_integer(System.get_env("PORT") || "4000")
-    secret = System.get_env("STRIPE_WEBHOOK_SECRET") || "whsec_test_cli_secret"
 
     # Pre-seed a test user to test subscription events
     {:ok, user} =
@@ -90,7 +89,7 @@ defmodule AshBilling.Testbed do
     IO.puts("  Listening on:          http://localhost:#{port}")
     IO.puts("  Webhook endpoint:      http://localhost:#{port}/webhooks/stripe")
     IO.puts("  Live state inspector:  http://localhost:#{port}/state")
-    IO.puts("  Webhook Secret:        #{secret}")
+    IO.puts("  Webhook Secret:        [redacted]")
     IO.puts("  Pre-seeded Test User:  ID=#{user.id}, CustomerID=#{user.stripe_customer_id}")
     IO.puts("================================================================================")
     IO.puts("  Ready to receive webhooks from Stripe CLI or network requests.")

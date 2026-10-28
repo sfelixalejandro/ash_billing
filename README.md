@@ -74,7 +74,7 @@ The recommended way to install `ash_billing` is using Igniter:
 mix igniter.install ash_billing
 ```
 
-Igniter automatically adds the dependency to `mix.exs`, configures your customer and subscription resources, mounts the webhook route in your Phoenix router, and sets up runtime configuration.
+Igniter adds the dependency, configures resources and domain registration, mounts the webhook route, and sets up runtime credentials and raw-body handling. New subscriptions inherit an explicitly configured customer PostgreSQL repo. Review its notices, generate and apply migrations, and configure persistent webhook deduplication for production.
 
 Alternatively, you can install it manually by adding `ash_billing` to your `mix.exs`:
 

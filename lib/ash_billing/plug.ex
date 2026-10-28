@@ -12,7 +12,7 @@ defmodule AshBilling.Plug do
 
   @behaviour Plug
 
-  import Plug.Conn
+  import Plug.Conn, except: [read_body: 2]
 
   @impl true
   def init(opts) do
@@ -314,6 +314,26 @@ defmodule AshBilling.Plug do
     end
   end
 
+  @doc """
+  A `Plug.Parsers` body reader that preserves the exact signed request bytes in
+  `conn.assigns[:raw_body]`, including bodies delivered in multiple chunks.
+
+      plug Plug.Parsers,
+        parsers: [:json],
+        json_decoder: Jason,
+        body_reader: {AshBilling.Plug, :read_body, []}
+  """
+  def read_body(conn, opts) do
+    case Plug.Conn.read_body(conn, opts) do
+      {status, body, conn} when status in [:ok, :more] ->
+        raw_body = Map.get(conn.assigns, :raw_body, "") <> body
+        {status, body, assign(conn, :raw_body, raw_body)}
+
+      error ->
+        error
+    end
+  end
+
   defp read_raw_body(%{assigns: %{raw_body: body}} = conn, _opts) when is_binary(body) do
     {:ok, body, conn}
   end
@@ -321,7 +341,7 @@ defmodule AshBilling.Plug do
   defp read_raw_body(conn, opts) do
     read_opts = Keyword.get(opts, :read_body_opts, [])
 
-    case read_body(conn, read_opts) do
+    case Plug.Conn.read_body(conn, read_opts) do
       {:ok, body, conn} -> {:ok, body, conn}
       {:more, _partial, _conn} -> {:error, :body_too_large}
       {:error, reason} -> {:error, reason}

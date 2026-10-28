@@ -179,7 +179,7 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
         }
       }
 
-      assert {:ok, sub} = WebhookSync.sync_event(event, @opts)
+      assert {:ok, sub} = WebhookSync.sync_event(event, Keyword.delete(@opts, :customer_resource))
       assert sub.provider_subscription_id == "sub_stripe_basil_2025"
       assert DateTime.compare(sub.current_period_end, expected_dt) == :eq
       assert sub.price_id == "price_modern_tier"
@@ -335,7 +335,6 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
           provider: AshBilling.Providers.Stripe,
           webhook_secret: secret,
           deduplication_resource: AshBilling.Test.FailingUpdateEvent,
-          customer_resource: User,
           subscription_resource: Subscription,
           domain: Domain,
           req_opts: [plug: {Req.Test, stub_name}]
@@ -655,7 +654,7 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
         }
       }
 
-      assert {:ok, :ignored} = WebhookSync.sync_event(payload, @opts)
+      assert {:error, :customer_not_found} = WebhookSync.sync_event(payload, @opts)
     end
   end
 
@@ -1054,7 +1053,8 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
         }
       }
 
-      assert {:ok, _} = WebhookSync.sync_event(dt_event, @opts)
+      assert {:ok, _} =
+               WebhookSync.sync_event(dt_event, Keyword.delete(@opts, :customer_resource))
     end
 
     test "AshBilling.create_customer/1 supports default opts" do
