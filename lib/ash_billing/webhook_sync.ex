@@ -139,7 +139,8 @@ defmodule AshBilling.WebhookSync do
       ash_opts = ash_options(domain, opts)
 
       with {:ok, customer} <- find_customer(customer_resource, stripe_cust_id, object, ash_opts),
-           {:ok, existing} <- fetch_existing_subscription(subscription_resource, sub_id, ash_opts),
+           {:ok, existing} <-
+             fetch_existing_subscription(subscription_resource, sub_id, ash_opts),
            :ok <- validate_subscription_customer(existing, customer, subscription_resource) do
         attrs =
           %{
