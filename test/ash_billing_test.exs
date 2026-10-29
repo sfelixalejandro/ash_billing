@@ -9,6 +9,27 @@ defmodule AshBillingTest do
     {:ok, stub_name: stub_name, opts: opts}
   end
 
+  test "persists a provider customer using the supplied authorized actor", %{
+    stub_name: stub_name,
+    opts: opts
+  } do
+    user =
+      Ash.create!(AshBilling.Test.PolicyUser, %{email: "actor@example.com"}, authorize?: false)
+
+    Req.Test.stub(stub_name, fn conn ->
+      Req.Test.json(conn, %{id: "cus_authorized"})
+    end)
+
+    assert {:ok, "cus_authorized"} =
+             AshBilling.create_customer(
+               user,
+               Keyword.merge(opts, persist: true, authorize?: true, actor: user)
+             )
+
+    assert Ash.get!(AshBilling.Test.PolicyUser, user.id, actor: user).stripe_customer_id ==
+             "cus_authorized"
+  end
+
   test "updates the requested subscription item and rejects an absent item", %{
     stub_name: stub_name,
     opts: opts
