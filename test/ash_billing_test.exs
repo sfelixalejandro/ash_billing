@@ -9,6 +9,47 @@ defmodule AshBillingTest do
     {:ok, stub_name: stub_name, opts: opts}
   end
 
+  test "updates the requested subscription item and rejects an absent item", %{
+    stub_name: stub_name,
+    opts: opts
+  } do
+    Req.Test.stub(stub_name, fn conn ->
+      case conn.method do
+        "GET" ->
+          Req.Test.json(conn, %{
+            items: %{
+              data: [
+                %{id: "si_first", price: %{id: "price_first"}},
+                %{id: "si_target", price: %{id: "price_target"}}
+              ]
+            }
+          })
+
+        "POST" ->
+          {:ok, body, conn} = Plug.Conn.read_body(conn)
+          params = URI.decode_query(body)
+          assert params["items[0][id]"] == "si_target"
+          assert params["items[0][price]"] == "price_target"
+          assert params["items[0][quantity]"] == "5"
+          Req.Test.json(conn, %{id: "sub_multi"})
+      end
+    end)
+
+    assert {:ok, %{"id" => "sub_multi"}} =
+             AshBilling.update_quantity(
+               "sub_multi",
+               5,
+               Keyword.put(opts, :subscription_item_id, "si_target")
+             )
+
+    assert {:error, {:missing_subscription_item, _}} =
+             AshBilling.update_quantity(
+               "sub_multi",
+               5,
+               Keyword.put(opts, :subscription_item_id, "si_absent")
+             )
+  end
+
   describe "customer_id/1" do
     test "extracts customer id from Ash record" do
       user = %User{id: Ash.UUID.generate(), stripe_customer_id: "cus_xyz123"}
