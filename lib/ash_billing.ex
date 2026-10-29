@@ -70,7 +70,11 @@ defmodule AshBilling do
              has_update_action?(resource) do
           attr = ResourceInfo.customer_id_attribute(resource)
           domain = Keyword.get(opts, :domain, Ash.Resource.Info.domain(resource))
-          ash_opts = [domain: domain, authorize?: Keyword.get(opts, :authorize?, false)]
+
+          ash_opts =
+            opts
+            |> Keyword.take([:actor, :tenant])
+            |> Keyword.merge(domain: domain, authorize?: Keyword.get(opts, :authorize?, false))
 
           case Ash.update(record, %{attr => customer_id}, ash_opts) do
             {:ok, _updated} ->
