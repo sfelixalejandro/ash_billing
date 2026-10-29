@@ -327,15 +327,29 @@ defmodule AshBilling do
 
       _ ->
         case get_subscription(sub_id, opts) do
-          {:ok,
-           %{"items" => %{"data" => [%{"id" => item_id, "price" => %{"id" => price_id}} | _]}}} ->
-            swap_plan(
-              sub_id,
-              price_id,
-              opts
-              |> Keyword.put(:subscription_item_id, item_id)
-              |> Keyword.put(:quantity, quantity)
-            )
+          {:ok, %{"items" => %{"data" => items}} = body} when is_list(items) ->
+            requested_item_id = Keyword.get(opts, :subscription_item_id)
+
+            item =
+              if requested_item_id do
+                Enum.find(items, &(&1["id"] == requested_item_id))
+              else
+                List.first(items)
+              end
+
+            case item do
+              %{"id" => item_id, "price" => %{"id" => price_id}} ->
+                swap_plan(
+                  sub_id,
+                  price_id,
+                  opts
+                  |> Keyword.put(:subscription_item_id, item_id)
+                  |> Keyword.put(:quantity, quantity)
+                )
+
+              _ ->
+                {:error, {:missing_subscription_item, body}}
+            end
 
           {:ok, body} ->
             {:error, {:missing_subscription_item, body}}
