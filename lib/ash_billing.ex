@@ -160,7 +160,7 @@ defmodule AshBilling do
       end)
       |> then(fn p -> if map_size(metadata) > 0, do: Map.put(p, :metadata, metadata), else: p end)
       |> then(fn p ->
-        if to_string(p.mode) == "subscription" and map_size(metadata) > 0 do
+        if to_string(p.mode) == "subscription" do
           existing_sub_data = Keyword.get(opts, :subscription_data, %{}) |> Enum.into(%{})
           sub_metadata = Map.get(existing_sub_data, :metadata, %{}) |> Map.merge(metadata)
           sub_data = Map.put(existing_sub_data, :metadata, sub_metadata)
