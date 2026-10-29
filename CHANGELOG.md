@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Customer Persistence Authorization**: Forward the supplied actor and tenant when persisting provider customer IDs through Ash.
+- **Checkout Subscription Options**: Preserve `subscription_data`, including trial settings and subscription metadata, when checkout metadata is empty.
+- **Subscription Item Quantities**: Respect the requested `subscription_item_id` when resolving its price for quantity updates, and return an error if the item is missing instead of updating another item.
+
 ## [v0.3.1] - 2026-10-28
 
 ### Fixed
