@@ -279,8 +279,11 @@ defmodule AshBilling.Plug do
             require Logger
 
             status_code =
-              if match?({:invalid_webhook_handler, _}, handler_reason) or
-                   return_500?, do: 500, else: 200
+              if match?({:invalid_webhook_handler, _}, handler_reason) or return_500? do
+                500
+              else
+                200
+              end
 
             Logger.error(
               "AshBilling.Plug: Custom handler #{inspect(handler)} failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(handler_reason)}. Releasing lease and " <>
