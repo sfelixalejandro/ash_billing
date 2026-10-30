@@ -57,7 +57,19 @@ defmodule AshBilling.Test.CrossRepoSubscription do
   end
 
   actions do
-    default_accept :*
+    default_accept [
+      :*,
+      :provider_subscription_id,
+      :status,
+      :price_id,
+      :current_period_end,
+      :cancel_at_period_end,
+      :cancel_at,
+      :trial_ends_at,
+      :last_event_created_at,
+      :user_id
+    ]
+
     defaults [:read, :create, :update, :destroy]
   end
 end

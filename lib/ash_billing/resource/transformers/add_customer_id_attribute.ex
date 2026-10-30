@@ -37,18 +37,27 @@ defmodule AshBilling.Resource.Transformers.AddCustomerIdAttribute do
         Transformer.add_entity(dsl_state, [:attributes], tombstone)
       end
 
-    if Resource.Info.attribute(dsl_state, attr_name) do
-      {:ok, dsl_state}
-    else
-      attribute =
-        Transformer.build_entity!(Resource.Dsl, [:attributes], :attribute,
-          name: attr_name,
-          type: Ash.Type.String,
-          allow_nil?: true,
-          public?: true
-        )
+    result =
+      if Resource.Info.attribute(dsl_state, attr_name) do
+        {:ok, dsl_state}
+      else
+        attribute =
+          Transformer.build_entity!(Resource.Dsl, [:attributes], :attribute,
+            name: attr_name,
+            type: Ash.Type.String,
+            allow_nil?: true,
+            public?: true
+          )
 
-      {:ok, Transformer.add_entity(dsl_state, [:attributes], attribute)}
+        {:ok, Transformer.add_entity(dsl_state, [:attributes], attribute)}
+      end
+
+    with {:ok, state} <- result do
+      {:ok,
+       AshBilling.Transformers.ProtectBillingAttributes.exclude_from_wildcards(state, [
+         attr_name,
+         :billing_deleted_at
+       ])}
     end
   end
 end

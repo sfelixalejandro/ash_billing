@@ -1,6 +1,14 @@
 defmodule AshBilling.Providers.Stripe do
   @moduledoc """
   Stripe implementation of `AshBilling.Provider`.
+
+  Webhook verification defaults to platform events (no top-level `account`).
+  `:stripe_account` binds a Connect account and also sets the outbound
+  `Stripe-Account` header. `:expected_livemode` accepts a boolean; otherwise the
+  mode is inferred from configured live/test API credentials. Connect requires
+  a bound mode. Platform endpoints without mode information retain legacy
+  unrestricted mode behavior; set the boolean explicitly in production.
+  Snapshot events are supported; non-nil v2 `context` envelopes are rejected.
   """
 
   @behaviour AshBilling.Provider
@@ -187,10 +195,68 @@ defmodule AshBilling.Providers.Stripe do
          {:ok, timestamp, signatures} <- parse_header(header),
          :ok <- verify_timestamp(timestamp, tolerance),
          :ok <- verify_signature(payload, timestamp, signatures, secret),
-         {:ok, event} <- Jason.decode(payload) do
+         {:ok, event} <- Jason.decode(payload),
+         :ok <- validate_event_scope(event, opts) do
       {:ok, event}
     else
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # A valid signature authenticates the endpoint's delivery, not the local
+  # billing account/environment. Never select credentials or tenants from input.
+  defp validate_event_scope(event, opts) when is_map(event) do
+    account = Keyword.get(opts, :stripe_account)
+
+    mode =
+      case Keyword.fetch(opts, :expected_livemode) do
+        {:ok, configured} -> configured
+        :error -> infer_livemode(opts)
+      end
+
+    cond do
+      not (is_nil(account) or (is_binary(account) and account != "")) ->
+        {:error, :invalid_stripe_account_configuration}
+
+      mode not in [nil, true, false] ->
+        {:error, :invalid_livemode_configuration}
+
+      not is_nil(account) and is_nil(mode) ->
+        {:error, :missing_livemode_configuration}
+
+      not is_nil(event["context"]) ->
+        {:error, :unsupported_event_context}
+
+      event["account"] !== account ->
+        {:error, :unauthorized_stripe_account}
+
+      not is_nil(mode) and event["livemode"] !== mode ->
+        {:error, :unexpected_livemode}
+
+      Map.has_key?(event, "livemode") and not is_boolean(event["livemode"]) ->
+        {:error, :invalid_livemode}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_event_scope(_, _), do: {:error, :invalid_event}
+
+  defp infer_livemode(opts) do
+    key =
+      Keyword.get(
+        opts,
+        :api_key,
+        Application.get_env(:ash_billing, :stripe_api_key) || System.get_env("STRIPE_SECRET_KEY")
+      )
+
+    case resolve_key(key) do
+      "sk_live_" <> _ -> true
+      "rk_live_" <> _ -> true
+      "sk_test_" <> _ -> false
+      "rk_test_" <> _ -> false
+      _ -> nil
     end
   end
 
@@ -298,6 +364,21 @@ defmodule AshBilling.Providers.Stripe do
     base_opts
     |> Keyword.merge(req_opts)
     |> Req.new()
+    |> then(fn req ->
+      case Keyword.get(opts, :stripe_account) do
+        nil ->
+          req
+
+        account when is_binary(account) and account != "" ->
+          Req.Request.put_header(req, "stripe-account", account)
+      end
+    end)
+    |> then(fn req ->
+      case Keyword.get(opts, :idempotency_key) do
+        nil -> req
+        key when is_binary(key) -> Req.Request.put_header(req, "idempotency-key", key)
+      end
+    end)
   end
 
   defp resolve_key({module, function, args}) when is_atom(module) and is_atom(function) do

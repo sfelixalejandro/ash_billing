@@ -264,7 +264,11 @@ defmodule AshBilling.WebhookSync do
                 attrs
               end
 
-            case Ash.create(subscription_resource, attrs, ash_opts) do
+            case AshBilling.Transformers.ProtectBillingAttributes.create(
+                   subscription_resource,
+                   attrs,
+                   ash_opts
+                 ) do
               {:ok, created} ->
                 {:ok, created}
 
@@ -427,7 +431,7 @@ defmodule AshBilling.WebhookSync do
          opts,
          ash_opts
        ) do
-    provider = Keyword.get(opts, :provider, AshBilling.Providers.Stripe)
+    provider = Keyword.get(opts, :provider, SubscriptionInfo.provider(subscription_resource))
 
     case provider.get_subscription(sub_id, opts) do
       {:ok, live_sub} when is_map(live_sub) ->
@@ -561,7 +565,12 @@ defmodule AshBilling.WebhookSync do
         |> Keyword.put(:return_records?, true)
         |> Keyword.put(:return_errors?, true)
 
-      case Ash.bulk_update(query, update_action.name, attrs, bulk_opts) do
+      case Ash.bulk_update(
+             query,
+             update_action.name,
+             %{},
+             Keyword.put(bulk_opts, :atomic_update, attrs)
+           ) do
         %Ash.BulkResult{status: :success, records: [updated | _]} ->
           {:ok, updated}
 
@@ -738,8 +747,9 @@ defmodule AshBilling.WebhookSync do
             case Ash.bulk_update(
                    query,
                    update_action.name,
-                   %{attr => customer_id},
+                   %{},
                    Keyword.merge(ash_opts,
+                     atomic_update: %{attr => customer_id},
                      strategy: [:atomic],
                      return_records?: true,
                      return_errors?: true

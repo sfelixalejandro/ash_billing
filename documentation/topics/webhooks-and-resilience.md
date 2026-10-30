@@ -298,8 +298,111 @@ and deliver it idempotently. `acquire/2` alone grants only a retryable lease; cu
 consumers must use `with_lease/4` and still make external effects idempotent. Existing
 `:memory` retention/restart limitations and the opt-out `deduplicate?: false` remain.
 
-### Separate integration reviews
+## Billing inputs, tenants, and Stripe scope
 
-This upgrade does not automatically change U1–U4 from the audit: user-facing action
-accept lists, tenant-required deduplication resources, Connect/account/environment
-scoping, and custom-provider routing still require separate application review.
+Customer identity, billing tombstones, subscription identity/status/price,
+trial/period/cancellation fields, event-order markers, and the configured
+subscription customer foreign key are excluded from implicit `accept :*` and
+`default_accept :*`. These attributes remain readable. Calculated entitlements
+are not action inputs. The same rule applies to custom customer ID attributes
+and manually declared billing fields.
+
+Explicitly naming an attribute in `accept` remains an application decision:
+protect such actions with ownership/system policies and do not expose maintenance
+actions as ordinary user mutations. Relationships managed by custom action changes,
+raw provider-ID APIs, and arbitrary server-side Ash changes still require
+application authorization. The library does not make a permissive policy safe.
+Internal webhook writes use explicit system mutations through the existing actions,
+including policy checks, constraints and validations; they do not broaden the
+resource's public input cache.
+
+### Tenant-required event storage
+
+Pass the trusted `tenant:` option to the Plug and every raw deduplication call.
+It is propagated through acquisition, reclaim, row reads, execution, completion,
+release (including destroy fallback), retry, and processed checks. Resource-backed
+calls canonicalize through `Ash.ToTenant` before both database filtering and fence
+selection. Memory keys encode tenants as literal data, including atom tenants.
+Memory remains single-node and non-durable.
+
+For equal event IDs in different attribute tenants, the event resource/database
+must have tenant-aware uniqueness, for example:
+
+```elixir
+attributes do
+  attribute :tenant_id, :string, primary_key?: true, allow_nil?: false
+end
+
+multitenancy do
+  strategy :attribute
+  attribute :tenant_id
+end
+```
+
+`AshBilling.WebhookEvent` supplies the other primary key, `event_id`. Generate,
+review and apply the consumer migration to make `(tenant_id, event_id)` the primary
+key, removing any unwanted global event-ID uniqueness constraint. Do not blindly
+backfill historical events into a tenant. Schema/context tenancy requires its own
+migration/layout review; the integration tests cover attribute tenancy. Supplying
+`tenant:` to a resource without Ash multitenancy does not create database isolation.
+
+### Stripe endpoint and API context
+
+Use a fixed account/environment per resource and tenant. A valid signature alone
+does not select the tenant or establish the intended account/environment. For a
+Connect snapshot endpoint, configure:
+
+```elixir
+forward "/webhooks/stripe/account-a", AshBilling.Plug,
+  webhook_secret: {System, :get_env, ["STRIPE_ACCOUNT_A_WEBHOOK_SECRET"]},
+  stripe_account: "acct_account_a",
+  expected_livemode: true,
+  tenant: "account-a-live",
+  customer_resource: MyApp.Customer,
+  subscription_resource: MyApp.Subscription,
+  deduplication_resource: MyApp.WebhookEvent,
+  domain: MyApp.Billing
+```
+
+The default accepts only platform events with no top-level `account`. For Connect,
+`stripe_account:` must match exactly; it also supplies the outbound `Stripe-Account`
+header, including reconciliation. `expected_livemode:` is strictly boolean. When
+omitted, the mode is inferred from live/test `sk_` or `rk_` API credentials. Connect
+without either a boolean or recognizable credentials is rejected. Platform
+endpoints without mode information retain the legacy unrestricted mode; explicitly
+bind a boolean in production. An explicit nil is only a platform compatibility
+opt-out, not an environment guarantee.
+
+Scope rejection occurs after signature verification but before deduplication,
+handlers, or billing writes, including duplicate deliveries. Non-nil v2 `context`
+envelopes are rejected; this is snapshot webhook support, not thin-event support.
+Use the corresponding endpoint secret, account and API credentials together.
+For API calls outside the webhook, pass the same trusted account/credentials.
+The library cannot infer the platform account from an opaque signing secret.
+Request options cannot replace explicitly configured account/idempotency headers.
+
+Multi-account aggregation into one tenant/resource is not provided. Use separate
+trusted scopes or a separately reviewed account-to-tenant router; do not accept
+arbitrary tenant/account/credential options from request parameters. A consumer's
+incorrect scope mapping or mismatched secret/API key is still a configuration risk.
+
+### Providers and customer creation retries
+
+Subscription records resolve their configured provider for get/cancel/resume/plan
+changes, quantity lookup/update and reconciliation. Explicit `provider:` overrides
+win; raw IDs without a resource default to Stripe. Customer/checkout/portal APIs
+retain that same precedence for their customer resource. Custom providers own their
+verification/scope semantics; Stripe-specific options do not harden an unrelated
+custom verifier automatically.
+
+Automatic customer idempotency keys now include the resource module, canonical
+tenant (including loaded-record metadata), and local ID. Two entity types or tenants
+with the same ID no longer share a key. Explicit caller keys are preserved. During
+a rolling deployment, drain old creators and reconcile in-flight create requests;
+if necessary replay with their original explicit idempotency key. A new automatic
+key can create an orphan provider customer when retrying an old, unpersisted request.
+The persistent customer association CAS remains authoritative and is not weakened.
+
+See the [final hardening evidence and release assessment](final-security-hardening.md).
+Earlier F1–F6 and commit-remediation reports are historical evidence, not the final
+status of U1–U4 or the Bandit dependency audit.

@@ -49,7 +49,16 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
          {:ok, state} <- maybe_add_on_trial_calculation(state),
          {:ok, state} <- maybe_add_canceling_calculation(state),
          {:ok, state} <- maybe_add_active_calculation(state) do
-      {:ok, state}
+      relationship =
+        Transformer.get_option(state, [:billing_subscription], :customer_relationship)
+
+      owner = if relationship, do: Resource.Info.relationship(state, relationship)
+
+      protected =
+        Enum.map(attributes, &elem(&1, 0)) ++ if(owner, do: [owner.source_attribute], else: [])
+
+      {:ok,
+       AshBilling.Transformers.ProtectBillingAttributes.exclude_from_wildcards(state, protected)}
     end
   end
 

@@ -1,5 +1,9 @@
 # Security remediation F1–F6
 
+> Historical report. See [final security hardening](final-security-hardening.md) for
+> the subsequent U1–U4 changes, dependency audit, and current release assessment.
+
+
 ## Scope and preserved work
 
 The remediation started at local HEAD `3dc78a1f0d1a86662a1a162d2799fb15153260f8`.

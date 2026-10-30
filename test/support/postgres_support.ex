@@ -50,12 +50,12 @@ defmodule AshBilling.Test.PostgresCustomer do
   end
 
   actions do
-    default_accept :*
+    default_accept [:*, :stripe_customer_id]
     defaults [:read, :create, :destroy]
 
     update :revise do
       primary? true
-      accept :*
+      accept [:*, :stripe_customer_id]
     end
   end
 end
@@ -84,12 +84,36 @@ defmodule AshBilling.Test.PostgresSubscription do
   end
 
   actions do
-    default_accept :*
+    default_accept [
+      :*,
+      :provider_subscription_id,
+      :status,
+      :price_id,
+      :current_period_end,
+      :cancel_at_period_end,
+      :cancel_at,
+      :trial_ends_at,
+      :last_event_created_at,
+      :user_id
+    ]
+
     defaults [:read, :create, :destroy]
 
     update :revise do
       primary? true
-      accept :*
+
+      accept [
+        :*,
+        :provider_subscription_id,
+        :status,
+        :price_id,
+        :current_period_end,
+        :cancel_at_period_end,
+        :cancel_at,
+        :trial_ends_at,
+        :last_event_created_at,
+        :user_id
+      ]
     end
   end
 
@@ -120,7 +144,18 @@ defmodule AshBilling.Test.PostgresScopedSubscription do
   end
 
   actions do
-    default_accept :*
+    default_accept [
+      :*,
+      :provider_subscription_id,
+      :status,
+      :price_id,
+      :current_period_end,
+      :cancel_at_period_end,
+      :cancel_at,
+      :trial_ends_at,
+      :last_event_created_at
+    ]
+
     defaults [:read, :create, :update, :destroy]
   end
 end
@@ -161,7 +196,7 @@ defmodule AshBilling.Test.PostgresScopedCustomer do
   end
 
   actions do
-    default_accept :*
+    default_accept [:*, :stripe_customer_id]
     defaults [:read, :create, :update, :destroy]
   end
 end
@@ -197,7 +232,19 @@ defmodule AshBilling.Test.PostgresOwnedScopedSubscription do
   end
 
   actions do
-    default_accept :*
+    default_accept [
+      :*,
+      :provider_subscription_id,
+      :status,
+      :price_id,
+      :current_period_end,
+      :cancel_at_period_end,
+      :cancel_at,
+      :trial_ends_at,
+      :last_event_created_at,
+      :user_id
+    ]
+
     defaults [:read, :create, :update, :destroy]
   end
 end

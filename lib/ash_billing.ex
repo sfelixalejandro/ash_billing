@@ -3,11 +3,14 @@ defmodule AshBilling do
   Top-level API for `AshBilling`.
 
   Provides functions for managing billing customers, checkout sessions,
-  customer portals, and subscriptions.
+  customer portals, and subscriptions. Customer and subscription records use
+  their resource's configured provider; explicit `:provider` takes precedence.
+  Raw IDs/maps without resource configuration default to Stripe.
   """
 
   alias AshBilling.Providers.Stripe
   alias AshBilling.Resource.Info, as: ResourceInfo
+  alias AshBilling.Subscription.Info, as: SubscriptionInfo
 
   @doc """
   Extracts the customer ID from a record configured with `AshBilling.Resource`.
@@ -24,6 +27,9 @@ defmodule AshBilling do
   Creates a billing customer in the configured provider.
 
   If the record already has a customer ID, returns `{:ok, existing_customer_id}` without calling the provider.
+  Automatic idempotency keys include the resource, canonical tenant and record ID.
+  An explicit `:idempotency_key` is preserved. Callers must authorize the record
+  and supply tenant/actor options for persistence as appropriate to their application.
   """
   @spec create_customer(struct() | map(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
@@ -55,7 +61,7 @@ defmodule AshBilling do
 
         opts =
           if Map.get(record, :id) && !Keyword.has_key?(opts, :idempotency_key) do
-            Keyword.put(opts, :idempotency_key, "ash_cust_#{record.id}")
+            Keyword.put(opts, :idempotency_key, customer_idempotency_key(resource, record, opts))
           else
             opts
           end
@@ -245,7 +251,7 @@ defmodule AshBilling do
           {:ok, map()} | {:error, term()}
   def get_subscription(subscription_or_id, opts \\ []) do
     sub_id = resolve_subscription_id(subscription_or_id)
-    provider = Keyword.get(opts, :provider, Stripe)
+    provider = resolve_subscription_provider(subscription_or_id, opts)
     provider.get_subscription(sub_id, opts)
   end
 
@@ -261,7 +267,7 @@ defmodule AshBilling do
           {:ok, map()} | {:error, term()}
   def cancel_subscription(subscription_or_id, opts \\ []) do
     sub_id = resolve_subscription_id(subscription_or_id)
-    provider = Keyword.get(opts, :provider, Stripe)
+    provider = resolve_subscription_provider(subscription_or_id, opts)
     provider.cancel_subscription(sub_id, opts)
   end
 
@@ -274,7 +280,7 @@ defmodule AshBilling do
           {:ok, map()} | {:error, term()}
   def resume_subscription(subscription_or_id, opts \\ []) do
     sub_id = resolve_subscription_id(subscription_or_id)
-    provider = Keyword.get(opts, :provider, Stripe)
+    provider = resolve_subscription_provider(subscription_or_id, opts)
     provider.resume_subscription(sub_id, opts)
   end
 
@@ -293,7 +299,7 @@ defmodule AshBilling do
           {:ok, map()} | {:error, term()}
   def swap_plan(subscription_or_id, new_price_id, opts \\ []) do
     sub_id = resolve_subscription_id(subscription_or_id)
-    provider = Keyword.get(opts, :provider, Stripe)
+    provider = resolve_subscription_provider(subscription_or_id, opts)
 
     :telemetry.span(
       [:ash_billing, :swap_plan],
@@ -323,6 +329,9 @@ defmodule AshBilling do
   @spec update_quantity(struct() | String.t(), pos_integer(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def update_quantity(subscription_or_id, quantity, opts \\ []) do
+    opts =
+      Keyword.put_new(opts, :provider, resolve_subscription_provider(subscription_or_id, opts))
+
     sub_id = resolve_subscription_id(subscription_or_id)
 
     case Keyword.get(opts, :price_id) do
@@ -447,6 +456,14 @@ defmodule AshBilling do
 
   defp on_trial?(_), do: false
 
+  defp customer_idempotency_key(resource, record, opts) do
+    metadata = Map.get(record, :__metadata__) || %{}
+    tenant = Keyword.get(opts, :tenant, metadata[:tenant])
+    tenant = Ash.ToTenant.to_tenant(tenant, resource)
+    digest = :crypto.hash(:sha256, :erlang.term_to_binary({resource, tenant, record.id}))
+    "ash_cust_" <> Base.encode16(digest, case: :lower)
+  end
+
   defp persisted_record?(%_resource{__meta__: %{state: :loaded}}), do: true
   defp persisted_record?(_), do: false
 
@@ -458,6 +475,11 @@ defmodule AshBilling do
   defp resolve_subscription_id(%{stripe_subscription_id: id}) when is_binary(id), do: id
   defp resolve_subscription_id(%{id: id}) when is_binary(id), do: id
   defp resolve_subscription_id(id) when is_binary(id), do: id
+
+  defp resolve_subscription_provider(%resource{}, opts),
+    do: Keyword.get(opts, :provider, SubscriptionInfo.provider(resource))
+
+  defp resolve_subscription_provider(_id, opts), do: Keyword.get(opts, :provider, Stripe)
 
   defp resolve_provider(%resource{}, opts),
     do: Keyword.get(opts, :provider, ResourceInfo.provider(resource))

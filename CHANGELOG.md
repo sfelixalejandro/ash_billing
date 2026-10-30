@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Final billing hardening (U1–U4)**:
+  - Exclude customer identity/tombstones and subscription state/ownership from wildcard action inputs; preserve explicit trusted accepts and internal action validation/authorization.
+  - Propagate canonical tenants through all deduplication operations and scope memory/database fences by tenant, including composite event primary keys.
+  - Validate Stripe account and live/test scope before recording events; require a bound mode for Connect, reject unsupported context envelopes, and preserve configured account/idempotency headers over request header overrides.
+  - Resolve subscription API/reconciliation providers from the resource, preserving explicit overrides and Stripe defaults for raw IDs.
+  - Namespace automatic customer idempotency keys by resource, tenant and local ID. Existing explicit keys remain unchanged; review pending retries when deploying this key format change.
+  - Update the development/test Bandit lock from 1.14.0 to 1.14.1; the final Hex audit reports no advisories.
+  - **Compatibility:** review explicit billing write actions, Connect options and tenant-aware event schema before deployment. See `documentation/topics/final-security-hardening.md`.
+
 - **Webhook commit acknowledgment and contention**: Send successful HTTP responses only after the execution transaction commits; failed commits and lease persistence errors remain retryable even with the legacy error acknowledgment opt-out. Reject missing/empty event IDs when deduplication is enabled. Reject caller-owned HTTP transactions and different primary Repo pools before processing. Use PostgreSQL transaction-scoped try advisory locks plus `FOR UPDATE NOWAIT` and persistent token CAS so duplicates do not wait on an active handler while occupying pool connections. Different Repo modules may explicitly share one primary pool; separate primary pools now fail closed with HTTP 503.
 
 - **Billing Security and Recovery (F1–F6)**:

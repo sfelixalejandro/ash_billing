@@ -1,5 +1,9 @@
 # Remediación de confirmación HTTP y contención de webhooks
 
+> Historical report. See [final security hardening](final-security-hardening.md) for
+> the subsequent U1–U4 changes, dependency audit, and current release assessment.
+
+
 ## Alcance y estado inicial
 
 Trabajo sobre `fix/billing-security`, HEAD

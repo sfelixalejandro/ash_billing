@@ -36,7 +36,7 @@ defmodule AshBilling.Test.User do
   end
 
   actions do
-    default_accept :*
+    default_accept [:*, :stripe_customer_id]
     defaults [:read, :create, :update, :destroy]
   end
 
@@ -57,7 +57,7 @@ defmodule AshBilling.Test.CustomUser do
   end
 
   actions do
-    default_accept :*
+    default_accept [:*, :custom_stripe_id]
     defaults [:read, :create, :update, :destroy]
   end
 
@@ -82,7 +82,19 @@ defmodule AshBilling.Test.Subscription do
   end
 
   actions do
-    default_accept :*
+    default_accept [
+      :*,
+      :provider_subscription_id,
+      :status,
+      :price_id,
+      :current_period_end,
+      :cancel_at_period_end,
+      :cancel_at,
+      :trial_ends_at,
+      :last_event_created_at,
+      :user_id
+    ]
+
     defaults [:read, :create, :update, :destroy]
   end
 
@@ -114,7 +126,7 @@ defmodule AshBilling.Test.PolicyUser do
   end
 
   actions do
-    default_accept :*
+    default_accept [:*, :stripe_customer_id]
     defaults [:read, :create, :update, :destroy]
   end
 end
@@ -142,7 +154,19 @@ defmodule AshBilling.Test.PolicySubscription do
   end
 
   actions do
-    default_accept :*
+    default_accept [
+      :*,
+      :provider_subscription_id,
+      :status,
+      :price_id,
+      :current_period_end,
+      :cancel_at_period_end,
+      :cancel_at,
+      :trial_ends_at,
+      :last_event_created_at,
+      :user_id
+    ]
+
     defaults [:read, :create, :update, :destroy]
   end
 
