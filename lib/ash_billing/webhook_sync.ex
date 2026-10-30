@@ -45,36 +45,47 @@ defmodule AshBilling.WebhookSync do
 
     :telemetry.span([:ash_billing, :sync], start_meta, fn ->
       result =
-        case event_type do
-          type
-          when type in [
-                 "customer.subscription.created",
-                 "customer.subscription.updated",
-                 "customer.subscription.deleted"
-               ] ->
-            sync_subscription(
-              event["data"]["object"],
-              customer_resource,
-              subscription_resource,
-              domain,
-              event_opts
-            )
+        AshBilling.ResourceLock.run(
+          [customer_resource, subscription_resource],
+          {customer_resource || subscription_resource, Keyword.get(opts, :tenant)},
+          fn ->
+            case event_type do
+              type
+              when type in [
+                     "customer.subscription.created",
+                     "customer.subscription.updated",
+                     "customer.subscription.deleted"
+                   ] ->
+                sync_subscription(
+                  event["data"]["object"],
+                  customer_resource,
+                  subscription_resource,
+                  domain,
+                  event_opts
+                )
 
-          "checkout.session.completed" ->
-            sync_checkout_session(event["data"]["object"], customer_resource, domain, event_opts)
+              "checkout.session.completed" ->
+                sync_checkout_session(
+                  event["data"]["object"],
+                  customer_resource,
+                  domain,
+                  event_opts
+                )
 
-          "customer.deleted" ->
-            sync_customer_deleted(
-              event["data"]["object"],
-              customer_resource,
-              subscription_resource,
-              domain,
-              event_opts
-            )
+              "customer.deleted" ->
+                sync_customer_deleted(
+                  event["data"]["object"],
+                  customer_resource,
+                  subscription_resource,
+                  domain,
+                  event_opts
+                )
 
-          _ ->
-            {:ok, :ignored}
-        end
+              _ ->
+                {:ok, :ignored}
+            end
+          end
+        )
 
       case result do
         {:ok, record} when is_struct(record) ->
@@ -174,6 +185,9 @@ defmodule AshBilling.WebhookSync do
           end)
 
         cond do
+          customer && Map.get(customer, :billing_deleted_at) && not terminal_status?(status) ->
+            {:ok, :customer_deleted}
+
           # Out-of-order event protection:
           # Terminal states in Stripe (canceled, incomplete_expired) can never legitimately
           # transition back to active/past_due. If a delayed webhook arrives out of order, ignore it.
@@ -304,7 +318,7 @@ defmodule AshBilling.WebhookSync do
 
   defp sync_customer_deleted(nil, _cust_res, _sub_res, _domain, _opts), do: {:ok, :ignored}
 
-  defp sync_customer_deleted(object, customer_resource, _subscription_resource, domain, opts) do
+  defp sync_customer_deleted(object, customer_resource, subscription_resource, domain, opts) do
     if is_nil(customer_resource) do
       {:ok, :no_customer_resource}
     else
@@ -317,10 +331,14 @@ defmodule AshBilling.WebhookSync do
         customer_resource
         |> Ash.Query.new()
         |> Ash.Query.filter(^[{attr, stripe_cust_id}])
+        |> AshBilling.ResourceLock.query()
         |> Ash.read_one(ash_opts)
         |> case do
           {:ok, cust} when not is_nil(cust) ->
-            Ash.update(cust, %{attr => nil}, ash_opts)
+            with {:ok, deleted} <- mark_customer_deleted(cust, stripe_cust_id, attr, ash_opts),
+                 :ok <- revoke_customer_subscriptions(deleted, subscription_resource, ash_opts) do
+              {:ok, deleted}
+            end
 
           {:ok, nil} ->
             {:ok, :not_found}
@@ -331,6 +349,72 @@ defmodule AshBilling.WebhookSync do
       else
         {:ok, :ignored}
       end
+    end
+  end
+
+  defp mark_customer_deleted(%resource{} = customer, customer_id, attr, ash_opts) do
+    AshBilling.ResourceLock.run([resource], {resource, Keyword.get(ash_opts, :tenant)}, fn ->
+      do_mark_customer_deleted(customer, customer_id, attr, ash_opts)
+    end)
+  end
+
+  defp do_mark_customer_deleted(%resource{} = customer, customer_id, attr, ash_opts) do
+    action = primary_update_action(resource)
+    query = Ash.Query.filter(resource, id == ^customer.id)
+    query = Ash.Query.filter(query, ^[{attr, customer_id}])
+
+    if action do
+      case Ash.bulk_update(
+             query,
+             action.name,
+             %{},
+             Keyword.merge(ash_opts,
+               atomic_update: %{
+                 billing_deleted_at: Map.get(customer, :billing_deleted_at) || DateTime.utc_now()
+               },
+               strategy: [:atomic],
+               return_records?: true,
+               return_errors?: true
+             )
+           ) do
+        %Ash.BulkResult{status: :success, records: [deleted]} -> {:ok, deleted}
+        %Ash.BulkResult{status: :success, records: []} -> {:error, :customer_identity_conflict}
+        %Ash.BulkResult{errors: [error | _]} -> {:error, error}
+        other -> {:error, other}
+      end
+    else
+      {:error, :update_action_required}
+    end
+  end
+
+  defp revoke_customer_subscriptions(_customer, nil, _ash_opts), do: :ok
+
+  defp revoke_customer_subscriptions(customer, resource, ash_opts) do
+    attr =
+      find_relationship_source_attribute(
+        resource,
+        SubscriptionInfo.customer_relationship(resource)
+      )
+
+    query = Ash.Query.filter(resource, ^[{attr, customer.id}]) |> AshBilling.ResourceLock.query()
+
+    with {:ok, subscriptions} <- Ash.read(query, ash_opts) do
+      Enum.reduce_while(subscriptions, :ok, fn subscription, :ok ->
+        if terminal_status?(subscription.status) do
+          {:cont, :ok}
+        else
+          case update_subscription_safely(
+                 resource,
+                 subscription,
+                 %{status: :canceled},
+                 nil,
+                 ash_opts
+               ) do
+            {:ok, _} -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end
+      end)
     end
   end
 
@@ -413,6 +497,7 @@ defmodule AshBilling.WebhookSync do
     subscription_resource
     |> Ash.Query.new()
     |> Ash.Query.filter(provider_subscription_id == ^sub_id)
+    |> AshBilling.ResourceLock.query()
     |> Ash.read_one(ash_opts)
   end
 
@@ -446,7 +531,28 @@ defmodule AshBilling.WebhookSync do
         if terminal_status?(attrs[:status]) do
           query
         else
-          Ash.Query.filter(query, status == ^existing.status)
+          Enum.reduce(
+            [
+              :status,
+              :price_id,
+              :trial_ends_at,
+              :current_period_end,
+              :cancel_at_period_end,
+              :cancel_at,
+              :last_event_created_at
+            ],
+            query,
+            fn field, query ->
+              if Ash.Resource.Info.attribute(subscription_resource, field) do
+                case Map.get(existing, field) do
+                  nil -> Ash.Query.filter(query, ^[{field, [is_nil: true]}])
+                  value -> Ash.Query.filter(query, ^[{field, value}])
+                end
+              else
+                query
+              end
+            end
+          )
         end
 
       bulk_opts =
@@ -532,6 +638,7 @@ defmodule AshBilling.WebhookSync do
     result =
       customer_resource
       |> Ash.Query.filter(^[{attr, stripe_cust_id}])
+      |> AshBilling.ResourceLock.query()
       |> Ash.read_one(ash_opts)
 
     case result do
@@ -557,7 +664,10 @@ defmodule AshBilling.WebhookSync do
         {:error, :customer_identity_conflict}
 
       resource_id ->
-        case Ash.get(resource, resource_id, ash_opts) do
+        query =
+          resource |> Ash.Query.filter(id == ^resource_id) |> AshBilling.ResourceLock.query()
+
+        case Ash.read_one(query, ash_opts) do
           {:ok, customer} when not is_nil(customer) ->
             associate_customer(customer, customer_id, ash_opts)
 
@@ -592,7 +702,18 @@ defmodule AshBilling.WebhookSync do
     end
   end
 
-  defp associate_customer(%resource{} = customer, customer_id, ash_opts) do
+  @doc false
+  def associate_customer(%resource{} = customer, customer_id, ash_opts) do
+    AshBilling.ResourceLock.run([resource], {resource, Keyword.get(ash_opts, :tenant)}, fn ->
+      if Map.get(customer, :billing_deleted_at) do
+        {:error, :customer_deleted}
+      else
+        do_associate_customer(customer, customer_id, ash_opts)
+      end
+    end)
+  end
+
+  defp do_associate_customer(%resource{} = customer, customer_id, ash_opts) do
     attr = ResourceInfo.customer_id_attribute(resource)
 
     case Map.get(customer, attr) do
@@ -603,6 +724,11 @@ defmodule AshBilling.WebhookSync do
         # Only the first successful writer may establish the association.
         query = Ash.Query.filter(resource, id == ^customer.id)
         query = Ash.Query.filter(query, ^[{attr, [is_nil: true]}])
+
+        query =
+          if Ash.Resource.Info.attribute(resource, :billing_deleted_at),
+            do: Ash.Query.filter(query, is_nil(billing_deleted_at)),
+            else: query
 
         case primary_update_action(resource) do
           nil ->
@@ -625,9 +751,11 @@ defmodule AshBilling.WebhookSync do
               %Ash.BulkResult{status: :success, records: []} ->
                 case Ash.get(resource, customer.id, ash_opts) do
                   {:ok, latest} when not is_nil(latest) ->
-                    if Map.get(latest, attr) == customer_id,
-                      do: {:ok, latest},
-                      else: {:error, :customer_identity_conflict}
+                    cond do
+                      Map.get(latest, :billing_deleted_at) -> {:error, :customer_deleted}
+                      Map.get(latest, attr) == customer_id -> {:ok, latest}
+                      true -> {:error, :customer_identity_conflict}
+                    end
 
                   {:error, reason} ->
                     {:error, reason}
@@ -730,37 +858,29 @@ defmodule AshBilling.WebhookSync do
   defp same_second_conflict?(existing, incoming_dt, attrs) do
     case {Map.get(existing, :last_event_created_at), incoming_dt} do
       {%DateTime{} = recorded_dt, %DateTime{} = inc_dt} ->
-        if DateTime.compare(recorded_dt, inc_dt) == :eq do
-          status_diff? =
-            attrs[:status] != nil and to_string(existing.status) != to_string(attrs[:status])
-
-          price_diff? =
-            attrs[:price_id] != nil and
-              existing.price_id != nil and
-              to_string(existing.price_id) != to_string(attrs[:price_id])
-
-          cancel_diff? =
-            attrs[:cancel_at_period_end] != nil and
-              Map.get(existing, :cancel_at_period_end) != nil and
-              existing.cancel_at_period_end != attrs[:cancel_at_period_end]
-
-          cancel_at_diff? =
-            case {Map.get(existing, :cancel_at), attrs[:cancel_at]} do
-              {%DateTime{} = d1, %DateTime{} = d2} -> DateTime.compare(d1, d2) != :eq
-              {nil, %DateTime{}} -> true
-              {%DateTime{}, nil} -> true
-              _ -> false
+        DateTime.compare(recorded_dt, inc_dt) == :eq and
+          Enum.any?(
+            [
+              :status,
+              :price_id,
+              :trial_ends_at,
+              :current_period_end,
+              :cancel_at_period_end,
+              :cancel_at
+            ],
+            fn field ->
+              Map.has_key?(existing, field) and Map.has_key?(attrs, field) and
+                not same_value?(Map.get(existing, field), Map.get(attrs, field))
             end
-
-          status_diff? or price_diff? or cancel_diff? or cancel_at_diff?
-        else
-          false
-        end
+          )
 
       _ ->
         false
     end
   end
+
+  defp same_value?(%DateTime{} = a, %DateTime{} = b), do: DateTime.compare(a, b) == :eq
+  defp same_value?(a, b), do: a == b
 
   defp ash_options(domain, opts) do
     base = [domain: domain, authorize?: Keyword.get(opts, :authorize?, false)]

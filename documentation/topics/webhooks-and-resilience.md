@@ -191,3 +191,76 @@ the migration; the library does not delete or merge records automatically. The d
 constraint, rather than a preflight lookup, prevents concurrent duplicates. A conflicting
 creation re-enters the regular synchronization checks once, including terminal precedence
 and customer ownership. Other create failures remain errors and can be retried.
+
+
+## Security upgrade: deletion, ordering, and execution fences
+
+### Required customer migration
+
+`AshBilling.Resource` now injects a private, nullable `billing_deleted_at` timestamp.
+Generate and review the migration in the consuming application, then apply it before
+running the upgraded code:
+
+```sh
+mix ash.codegen preserve_deleted_billing_customers
+mix ash.migrate
+```
+
+The library does not run production migrations. `customer.deleted` retains the stored
+provider ID, sets this tombstone, and cancels associated nonterminal subscriptions in
+the configured tenant. Retaining the historical ID lets later cancellation events
+resolve the original owner. Late nonterminal subscription events for that customer
+are ignored. A loaded tombstoned customer has no active entitlement and its public
+`customer_id/1` returns nil; `create_customer/2` returns `{:error, :customer_deleted}`.
+Creating a replacement billing identity requires an explicit application recovery
+workflow, not automatic clearing or reassociation of this tombstone. Already-lost
+historical mappings from earlier versions need application-specific reconciliation.
+Unknown customer deletion events without a local association cannot identify a local
+owner; do not assume this marker is a global history of all Stripe customer IDs.
+
+### PostgreSQL ordering
+
+Synchronization holds customer and subscription row locks, in that order, while
+reading provider state and applying updates. All same-second entitlement changes,
+including trial expiry and billing periods, trigger reconciliation. An equal Stripe
+timestamp does not establish which snapshot is newer. Direct conditional updates
+also compare the previously read entitlement fields.
+
+Keep reads and writes on the same primary database/Repo; a read replica is not a
+substitute for the transaction holding these locks. Locking is per row across BEAM
+nodes and does not depend on distributed Erlang membership. Transactions can hold a
+connection during a provider request: configure bounded provider/Repo timeouts and
+size the pool accordingly. Across different Repos this is not a distributed commit;
+failures must be retried and reconciled. Other data layers have a single-node OTP
+fallback, not a claim of distributed isolation.
+
+### Event execution fences and handler contract
+
+`AshBilling.Plug` runs synchronization, the configured handler, and lease completion
+inside `AshBilling.Deduplication.with_lease/4`. PostgreSQL holds the event row's
+`FOR UPDATE` lock until execution finishes; a retry cannot reclaim that row while
+its handler is alive in the transaction. Nontransactional resources and memory mode
+use a node-local OTP lock whose ownership is monitored by OTP. A killed process
+cannot leave the old unmonitored `reclaim_lock` behind. Database locks are released
+when a connection/transaction dies; an expired durable lease can then be reclaimed.
+Do not change lease timestamps or tokens in application code.
+
+Handlers must do bounded, synchronous work. Required modules are loaded before
+invocation. A configured unavailable handler produces HTTP 500 even when
+`return_500_on_sync_error: false`; it is never silently omitted. Nil still means no
+custom handler. Work spawned independently by a handler is outside the execution
+fence and must not be relied on for transactional ordering.
+
+A database transaction cannot make remote HTTP calls, emails, or other external
+effects exactly-once. A handler can perform an effect and die before completion is
+recorded. Use the stable Stripe event ID (plus an effect name where needed) as the
+external idempotency key, or write a unique event/effect outbox record transactionally
+and deliver it idempotently. `acquire/2` alone grants only a retryable lease; custom
+consumers must use `with_lease/4` and still make external effects idempotent. Existing
+`:memory` retention/restart limitations and the opt-out `deduplicate?: false` remain.
+
+### Separate integration reviews
+
+This upgrade does not automatically change U1–U4 from the audit: user-facing action
+accept lists, tenant-required deduplication resources, Connect/account/environment
+scoping, and custom-provider routing still require separate application review.

@@ -36,10 +36,13 @@ defmodule AshBilling.Deduplication do
   end
 
   @doc """
-  Atomically acquires an exclusive processing lease for an event ID.
+  Atomically acquires a retryable processing lease for an event ID.
+
+  Use `with_lease/4` to fence execution. A token alone cannot prevent work from
+  overlapping after expiry, and external effects still require idempotency.
 
   Returns:
-  * `{:ok, lease_token}` - Lease secured; this process is the exclusive worker for the event.
+  * `{:ok, lease_token}` - Lease acquired; execute work through `with_lease/4`.
   * `{:error, :already_processed}` - The event was already processed.
   * `{:error, :already_processing}` - The event is currently being processed by another worker.
   * `{:error, reason}` - Persistence error during acquisition.
@@ -60,14 +63,65 @@ defmodule AshBilling.Deduplication do
             {:error, :deduplication_resource_not_configured}
 
           resource ->
-            acquire_resource(resource, event_id, opts)
+            if Ash.DataLayer.data_layer_can?(resource, {:lock, :for_update}) and
+                 Ash.DataLayer.data_layer_can?(resource, :transact) do
+              acquire_resource(resource, event_id, opts)
+            else
+              local_execution_lock({resource, event_id}, fn ->
+                acquire_resource(resource, event_id, opts)
+              end)
+            end
         end
 
       :memory ->
-        acquire_memory(event_id)
+        local_execution_lock({:memory, event_id}, fn -> acquire_memory(event_id) end)
     end
   rescue
     e -> {:error, e}
+  end
+
+  @doc """
+  Runs webhook work while holding the event's execution fence.
+
+  PostgreSQL holds a row lock in a transaction until work and lease completion
+  finish. Other data layers use a monitored, node-local OTP lock. External effects
+  remain at-least-once: handlers must use the event ID as an idempotency key.
+  """
+  def with_lease(event_id, token, opts, fun)
+  def with_lease(nil, _token, _opts, fun), do: {:ok, fun.()}
+
+  def with_lease(event_id, token, opts, fun) do
+    case resolve_strategy(opts) do
+      :resource ->
+        resource = resolve_resource(opts)
+
+        AshBilling.ResourceLock.run([resource], {resource, event_id}, fn ->
+          require Ash.Query
+
+          query =
+            resource |> Ash.Query.filter(event_id == ^event_id) |> AshBilling.ResourceLock.query()
+
+          case Ash.read_one(query, domain: Keyword.get(opts, :domain), authorize?: false) do
+            {:ok, %{status: :processing, lease_token: ^token}} -> {:ok, fun.()}
+            {:ok, %{status: :processed}} -> {:error, :already_processed}
+            {:ok, _} -> {:error, :lease_token_mismatch}
+            {:error, reason} -> {:error, reason}
+          end
+        end)
+
+      :memory ->
+        local_execution_lock({:memory, event_id}, fn ->
+          case :ets.lookup(@table, event_id) do
+            [{^event_id, :processing, _, ^token}] -> {:ok, fun.()}
+            [{^event_id, :processed, _, _}] -> {:error, :already_processed}
+            _ -> {:error, :lease_token_mismatch}
+          end
+        end)
+    end
+  end
+
+  defp local_execution_lock(key, fun) do
+    AshBilling.ResourceLock.local(key, fun)
   end
 
   defp acquire_resource(resource, event_id, opts) do
@@ -109,30 +163,10 @@ defmodule AshBilling.Deduplication do
     end
   end
 
+  # The persistent conditional update is the authority. A process-owned ETS
+  # lock cannot survive an untrappable exit safely and is unnecessary here.
   defp reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token) do
-    lock_key = {:reclaim_lock, event_id}
-
-    if try_acquire_lock(lock_key) do
-      try do
-        do_reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token)
-      after
-        release_lock(lock_key)
-      end
-    else
-      {:error, :already_processing}
-    end
-  end
-
-  defp try_acquire_lock(lock_key) do
-    :ets.insert_new(@table, {lock_key, self()})
-  rescue
-    _ -> true
-  end
-
-  defp release_lock(lock_key) do
-    :ets.delete(@table, lock_key)
-  rescue
-    _ -> :ok
+    do_reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token)
   end
 
   defp do_reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token) do

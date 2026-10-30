@@ -9,6 +9,100 @@ defmodule AshBillingTest do
     {:ok, stub_name: stub_name, opts: opts}
   end
 
+  test "persists a provider customer using the supplied authorized actor", %{
+    stub_name: stub_name,
+    opts: opts
+  } do
+    user =
+      Ash.create!(AshBilling.Test.PolicyUser, %{email: "actor@example.com"}, authorize?: false)
+
+    Req.Test.stub(stub_name, fn conn ->
+      Req.Test.json(conn, %{id: "cus_authorized"})
+    end)
+
+    assert {:ok, "cus_authorized"} =
+             AshBilling.create_customer(
+               user,
+               Keyword.merge(opts, persist: true, authorize?: true, actor: user)
+             )
+
+    assert Ash.get!(AshBilling.Test.PolicyUser, user.id, actor: user).stripe_customer_id ==
+             "cus_authorized"
+  end
+
+  test "preserves subscription options with and without checkout metadata", %{
+    stub_name: stub_name,
+    opts: opts
+  } do
+    for metadata <- [%{}, %{team: "core"}] do
+      Req.Test.stub(stub_name, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        params = URI.decode_query(body)
+        assert params["subscription_data[trial_period_days]"] == "14"
+        assert params["subscription_data[metadata][source]"] == "campaign"
+
+        if map_size(metadata) > 0 do
+          assert params["subscription_data[metadata][team]"] == "core"
+        end
+
+        Req.Test.json(conn, %{id: "cs_trial", url: "https://checkout.test/trial"})
+      end)
+
+      assert {:ok, %{id: "cs_trial"}} =
+               AshBilling.create_checkout_session(
+                 "cus_trial",
+                 Keyword.merge(opts,
+                   price: "price_trial",
+                   success_url: "https://example.com/success",
+                   cancel_url: "https://example.com/cancel",
+                   metadata: metadata,
+                   subscription_data: %{trial_period_days: 14, metadata: %{source: "campaign"}}
+                 )
+               )
+    end
+  end
+
+  test "updates the requested subscription item and rejects an absent item", %{
+    stub_name: stub_name,
+    opts: opts
+  } do
+    Req.Test.stub(stub_name, fn conn ->
+      case conn.method do
+        "GET" ->
+          Req.Test.json(conn, %{
+            items: %{
+              data: [
+                %{id: "si_first", price: %{id: "price_first"}},
+                %{id: "si_target", price: %{id: "price_target"}}
+              ]
+            }
+          })
+
+        "POST" ->
+          {:ok, body, conn} = Plug.Conn.read_body(conn)
+          params = URI.decode_query(body)
+          assert params["items[0][id]"] == "si_target"
+          assert params["items[0][price]"] == "price_target"
+          assert params["items[0][quantity]"] == "5"
+          Req.Test.json(conn, %{id: "sub_multi"})
+      end
+    end)
+
+    assert {:ok, %{"id" => "sub_multi"}} =
+             AshBilling.update_quantity(
+               "sub_multi",
+               5,
+               Keyword.put(opts, :subscription_item_id, "si_target")
+             )
+
+    assert {:error, {:missing_subscription_item, _}} =
+             AshBilling.update_quantity(
+               "sub_multi",
+               5,
+               Keyword.put(opts, :subscription_item_id, "si_absent")
+             )
+  end
+
   describe "customer_id/1" do
     test "extracts customer id from Ash record" do
       user = %User{id: Ash.UUID.generate(), stripe_customer_id: "cus_xyz123"}

@@ -418,7 +418,7 @@ defmodule AshBilling.WebhookSyncTest do
       assert {:error, :customer_not_found} = WebhookSync.sync_event(event, @opts)
     end
 
-    test "handles customer.deleted and clears stripe_customer_id from user" do
+    test "handles customer.deleted and retains the historical customer association" do
       {:ok, user} =
         Ash.create(
           User,
@@ -438,11 +438,13 @@ defmodule AshBilling.WebhookSyncTest do
       }
 
       assert {:ok, updated_user} = WebhookSync.sync_event(event, @opts)
-      assert updated_user.stripe_customer_id == nil
+      assert updated_user.stripe_customer_id == "cus_to_delete_999"
+      assert updated_user.billing_deleted_at
 
       # Refresh from DB
       reloaded_user = Ash.get!(User, user.id, domain: Domain)
-      assert reloaded_user.stripe_customer_id == nil
+      assert reloaded_user.stripe_customer_id == "cus_to_delete_999"
+      assert reloaded_user.billing_deleted_at
     end
 
     test "handles customer.deleted when customer does not exist in local database" do

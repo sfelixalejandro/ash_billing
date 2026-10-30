@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Billing Security and Recovery (F1–F6)**:
+  - Retain customer IDs with a persistent `billing_deleted_at` tombstone, revoke their subscriptions, and reject late nonterminal events.
+  - Serialize PostgreSQL customer/subscription synchronization with row locks, reconcile all same-second entitlement changes, and guard direct writes against stale snapshots.
+  - Atomically associate public API customer IDs without overwriting a competing identity; load required handlers and reject invalid handler configuration.
+  - Replace orphanable reclaim locks with monitored local serialization where needed, and fence Plug execution through database row locks or single-node OTP locks.
+  - **Migration required:** generate and apply a migration adding `billing_deleted_at` to customer resources before deploying. Deleted customer IDs are now retained rather than cleared. Handler work runs inside the event-resource transaction; external effects remain at-least-once and require idempotency.
+
+- **Customer Persistence Authorization**: Forward the supplied actor and tenant when persisting provider customer IDs through Ash.
+- **Checkout Subscription Options**: Preserve `subscription_data`, including trial settings and subscription metadata, when checkout metadata is empty.
+- **Subscription Item Quantities**: Respect the requested `subscription_item_id` when resolving its price for quantity updates, and return an error if the item is missing instead of updating another item.
+
 ## [v0.3.1] - 2026-10-28
 
 ### Fixed

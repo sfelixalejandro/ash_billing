@@ -80,15 +80,22 @@ defmodule AshBilling.PostgresSubscriptionTest do
 
       assert_receive {:reconciling, worker, ^id}, 2000
 
-      Ash.update!(
-        sub,
-        %{status: terminal, last_event_created_at: DateTime.from_unix!(1_700_000_001)},
-        @opts
-      )
+      writer =
+        Task.async(fn ->
+          send(owner, :terminal_writer_started)
 
+          Ash.update!(
+            sub,
+            %{status: terminal, last_event_created_at: DateTime.from_unix!(1_700_000_001)},
+            @opts
+          )
+        end)
+
+      assert_receive :terminal_writer_started
+      # The row lock must delay the competing commit until the provider snapshot is applied.
       send(worker, {:provider_reply, {:ok, event(id, "active", 1_700_000_001)["data"]["object"]}})
-      assert {:ok, result} = Task.await(task)
-      assert result.status == terminal
+      assert {:ok, _} = Task.await(task)
+      assert Task.await(writer).status == terminal
       persisted = Ash.get!(PostgresSubscription, sub.id, @opts)
       assert persisted.status == terminal
       refute AshBilling.subscribed?(%{subscriptions: [persisted]})

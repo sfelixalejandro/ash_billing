@@ -15,7 +15,7 @@ defmodule AshBilling do
   @spec customer_id(struct()) :: String.t() | nil
   def customer_id(%resource{} = record) do
     attr = ResourceInfo.customer_id_attribute(resource)
-    Map.get(record, attr)
+    if Map.get(record, :billing_deleted_at), do: nil, else: Map.get(record, attr)
   end
 
   def customer_id(_), do: nil
@@ -33,56 +33,64 @@ defmodule AshBilling do
     provider = Keyword.get(opts, :provider, ResourceInfo.provider(resource))
     existing_id = customer_id(record)
 
-    if existing_id do
-      {:ok, existing_id}
-    else
-      params =
-        opts
-        |> Keyword.get(:params, %{})
-        |> Map.merge(%{
-          email: Map.get(record, :email),
-          name: Map.get(record, :name),
-          metadata: %{
-            resource_id: to_string(Map.get(record, :id))
-          }
-        })
-        |> remove_nil_values()
+    cond do
+      Map.get(record, :billing_deleted_at) ->
+        {:error, :customer_deleted}
 
-      opts =
-        if Map.get(record, :id) && !Keyword.has_key?(opts, :idempotency_key) do
-          Keyword.put(opts, :idempotency_key, "ash_cust_#{record.id}")
-        else
+      existing_id ->
+        {:ok, existing_id}
+
+      true ->
+        params =
           opts
-        end
+          |> Keyword.get(:params, %{})
+          |> Map.merge(%{
+            email: Map.get(record, :email),
+            name: Map.get(record, :name),
+            metadata: %{
+              resource_id: to_string(Map.get(record, :id))
+            }
+          })
+          |> remove_nil_values()
 
-      with {:ok, customer_id} <- provider.create_customer(params, opts) do
-        persist_opt = Keyword.get(opts, :persist, Keyword.get(opts, :persist?))
-
-        should_persist? =
-          cond do
-            persist_opt == false -> false
-            persist_opt == true -> true
-            persisted_record?(record) -> true
-            true -> false
+        opts =
+          if Map.get(record, :id) && !Keyword.has_key?(opts, :idempotency_key) do
+            Keyword.put(opts, :idempotency_key, "ash_cust_#{record.id}")
+          else
+            opts
           end
 
-        if should_persist? and Ash.Resource.Info.resource?(resource) and
-             has_update_action?(resource) do
-          attr = ResourceInfo.customer_id_attribute(resource)
-          domain = Keyword.get(opts, :domain, Ash.Resource.Info.domain(resource))
-          ash_opts = [domain: domain, authorize?: Keyword.get(opts, :authorize?, false)]
+        with {:ok, customer_id} <- provider.create_customer(params, opts) do
+          persist_opt = Keyword.get(opts, :persist, Keyword.get(opts, :persist?))
 
-          case Ash.update(record, %{attr => customer_id}, ash_opts) do
-            {:ok, _updated} ->
-              {:ok, customer_id}
+          should_persist? =
+            cond do
+              persist_opt == false -> false
+              persist_opt == true -> true
+              persisted_record?(record) -> true
+              true -> false
+            end
 
-            {:error, reason} ->
-              {:error, {:persistence_failed, customer_id, reason}}
+          if should_persist? and Ash.Resource.Info.resource?(resource) and
+               has_update_action?(resource) do
+            domain = Keyword.get(opts, :domain, Ash.Resource.Info.domain(resource))
+
+            ash_opts =
+              opts
+              |> Keyword.take([:actor, :tenant])
+              |> Keyword.merge(domain: domain, authorize?: Keyword.get(opts, :authorize?, false))
+
+            case AshBilling.WebhookSync.associate_customer(record, customer_id, ash_opts) do
+              {:ok, _updated} ->
+                {:ok, customer_id}
+
+              {:error, reason} ->
+                {:error, {:persistence_failed, customer_id, reason}}
+            end
+          else
+            {:ok, customer_id}
           end
-        else
-          {:ok, customer_id}
         end
-      end
     end
   end
 
@@ -160,7 +168,7 @@ defmodule AshBilling do
       end)
       |> then(fn p -> if map_size(metadata) > 0, do: Map.put(p, :metadata, metadata), else: p end)
       |> then(fn p ->
-        if to_string(p.mode) == "subscription" and map_size(metadata) > 0 do
+        if to_string(p.mode) == "subscription" do
           existing_sub_data = Keyword.get(opts, :subscription_data, %{}) |> Enum.into(%{})
           sub_metadata = Map.get(existing_sub_data, :metadata, %{}) |> Map.merge(metadata)
           sub_data = Map.put(existing_sub_data, :metadata, sub_metadata)
@@ -323,15 +331,29 @@ defmodule AshBilling do
 
       _ ->
         case get_subscription(sub_id, opts) do
-          {:ok,
-           %{"items" => %{"data" => [%{"id" => item_id, "price" => %{"id" => price_id}} | _]}}} ->
-            swap_plan(
-              sub_id,
-              price_id,
-              opts
-              |> Keyword.put(:subscription_item_id, item_id)
-              |> Keyword.put(:quantity, quantity)
-            )
+          {:ok, %{"items" => %{"data" => items}} = body} when is_list(items) ->
+            requested_item_id = Keyword.get(opts, :subscription_item_id)
+
+            item =
+              if requested_item_id do
+                Enum.find(items, &(&1["id"] == requested_item_id))
+              else
+                List.first(items)
+              end
+
+            case item do
+              %{"id" => item_id, "price" => %{"id" => price_id}} ->
+                swap_plan(
+                  sub_id,
+                  price_id,
+                  opts
+                  |> Keyword.put(:subscription_item_id, item_id)
+                  |> Keyword.put(:quantity, quantity)
+                )
+
+              _ ->
+                {:error, {:missing_subscription_item, body}}
+            end
 
           {:ok, body} ->
             {:error, {:missing_subscription_item, body}}
@@ -350,6 +372,9 @@ defmodule AshBilling do
   """
   @spec subscription(struct(), String.t() | nil) :: struct() | nil
   def subscription(record, price_id \\ nil)
+
+  def subscription(%{billing_deleted_at: deleted_at}, _price_id) when not is_nil(deleted_at),
+    do: nil
 
   def subscription(%{subscriptions: subscriptions}, price_id) when is_list(subscriptions) do
     Enum.find(subscriptions, fn sub ->

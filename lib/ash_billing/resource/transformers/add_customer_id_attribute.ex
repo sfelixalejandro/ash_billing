@@ -22,6 +22,21 @@ defmodule AshBilling.Resource.Transformers.AddCustomerIdAttribute do
         :stripe_customer_id
       )
 
+    dsl_state =
+      if Resource.Info.attribute(dsl_state, :billing_deleted_at) do
+        dsl_state
+      else
+        tombstone =
+          Transformer.build_entity!(Resource.Dsl, [:attributes], :attribute,
+            name: :billing_deleted_at,
+            type: Ash.Type.UtcDatetimeUsec,
+            allow_nil?: true,
+            public?: false
+          )
+
+        Transformer.add_entity(dsl_state, [:attributes], tombstone)
+      end
+
     if Resource.Info.attribute(dsl_state, attr_name) do
       {:ok, dsl_state}
     else
