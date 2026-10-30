@@ -6,6 +6,10 @@ defmodule AshBilling.Subscription do
   Each scope must use one provider/account/environment. PostgreSQL consumers must
   generate and apply a migration for the injected identity, resolving existing duplicates first.
 
+  Billing state is not implicitly accepted by wildcard create/update actions.
+  Explicitly named inputs remain an application authorization decision. Internal
+  webhook writes retain actions, policies, validations and tenant scope.
+
   ## Usage
 
       defmodule MyApp.Billing.Subscription do
@@ -38,6 +42,9 @@ defmodule AshBilling.Subscription do
 
   use Spark.Dsl.Extension,
     sections: [@billing_subscription],
-    transformers: [AshBilling.Subscription.Transformers.AddSubscriptionAttributes],
+    transformers: [
+      AshBilling.Subscription.Transformers.AddSubscriptionAttributes,
+      AshBilling.Transformers.ProtectBillingAttributes
+    ],
     verifiers: [AshBilling.Subscription.Verifiers.VerifyCustomerRelationship]
 end

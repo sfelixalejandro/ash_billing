@@ -25,6 +25,11 @@ postgres_available? =
         )
         """)
 
+        Ecto.Adapters.SQL.query!(
+          AshBilling.Test.Repo,
+          "ALTER TABLE billing_test_customers ADD COLUMN IF NOT EXISTS billing_deleted_at TIMESTAMP(6)"
+        )
+
         Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
         CREATE TABLE IF NOT EXISTS billing_test_subscriptions (
           id UUID PRIMARY KEY,
@@ -56,6 +61,15 @@ postgres_available? =
         Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
         CREATE UNIQUE INDEX IF NOT EXISTS billing_scoped_subscriptions_unique_provider_subscription_index
         ON billing_scoped_subscriptions (tenant_id, provider_subscription_id)
+        """)
+
+        Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
+        CREATE TABLE IF NOT EXISTS billing_scoped_customers (
+          id UUID PRIMARY KEY,
+          tenant_id TEXT NOT NULL,
+          stripe_customer_id TEXT,
+          billing_deleted_at TIMESTAMP(6)
+        )
         """)
 
         true

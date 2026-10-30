@@ -36,10 +36,13 @@ defmodule AshBilling.Deduplication do
   end
 
   @doc """
-  Atomically acquires an exclusive processing lease for an event ID.
+  Atomically acquires a retryable processing lease for an event ID.
+
+  Use `with_lease/4` to fence execution. A token alone cannot prevent work from
+  overlapping after expiry, and external effects still require idempotency.
 
   Returns:
-  * `{:ok, lease_token}` - Lease secured; this process is the exclusive worker for the event.
+  * `{:ok, lease_token}` - Lease acquired; execute work through `with_lease/4`.
   * `{:error, :already_processed}` - The event was already processed.
   * `{:error, :already_processing}` - The event is currently being processed by another worker.
   * `{:error, reason}` - Persistence error during acquisition.
@@ -60,32 +63,217 @@ defmodule AshBilling.Deduplication do
             {:error, :deduplication_resource_not_configured}
 
           resource ->
-            acquire_resource(resource, event_id, opts)
+            opts = normalize_tenant(resource, opts)
+
+            if postgres?(resource) do
+              postgres_event(resource, event_id, opts, fn record ->
+                if is_nil(record) do
+                  acquire_resource(resource, event_id, opts)
+                else
+                  reclaim_atomic_resource_lease(
+                    resource,
+                    event_id,
+                    event_options(opts),
+                    DateTime.utc_now(),
+                    Keyword.get(opts, :lease_ttl_seconds, 60),
+                    generate_lease_token()
+                  )
+                end
+              end)
+            else
+              local_execution_lock(resource_key(resource, event_id, opts), fn ->
+                acquire_resource(resource, event_id, opts)
+              end)
+            end
         end
 
       :memory ->
-        acquire_memory(event_id)
+        local_execution_lock(resource_key(:memory, event_id, opts), fn ->
+          acquire_memory(memory_key(event_id, opts))
+        end)
     end
   rescue
     e -> {:error, e}
   end
+
+  @doc """
+  Runs webhook work while holding the event's execution fence.
+
+  PostgreSQL holds a row lock in a transaction until work and lease completion
+  finish. Other data layers use a monitored, node-local OTP lock. External effects
+  remain at-least-once: handlers must use the event ID as an idempotency key.
+  """
+  def with_lease(event_id, token, opts, fun)
+  def with_lease(nil, _token, _opts, fun), do: {:ok, fun.()}
+
+  def with_lease(event_id, token, opts, fun) do
+    case resolve_strategy(opts) do
+      :resource ->
+        resource = resolve_resource(opts)
+        opts = normalize_tenant(resource, opts)
+
+        execute = fn record ->
+          case record do
+            %{status: :processing, lease_token: ^token} -> {:ok, fun.()}
+            %{status: :processed} -> {:error, :already_processed}
+            _ -> {:error, :lease_token_mismatch}
+          end
+        end
+
+        if postgres?(resource) do
+          postgres_event(resource, event_id, opts, execute)
+        else
+          local_execution_lock(resource_key(resource, event_id, opts), fn ->
+            require Ash.Query
+            query = Ash.Query.filter(resource, event_id == ^event_id)
+
+            case Ash.read_one(query, event_options(opts)) do
+              {:ok, record} -> execute.(record)
+              {:error, reason} -> {:error, reason}
+            end
+          end)
+        end
+
+      :memory ->
+        local_execution_lock(resource_key(:memory, event_id, opts), fn ->
+          key = memory_key(event_id, opts)
+
+          case :ets.lookup(@table, key) do
+            [{^key, :processing, _, ^token}] -> {:ok, fun.()}
+            [{^key, :processed, _, _}] -> {:error, :already_processed}
+            _ -> {:error, :lease_token_mismatch}
+          end
+        end)
+    end
+  end
+
+  @doc false
+  def transaction_resources(opts) do
+    if Keyword.get(opts, :deduplicate?, true) and resolve_strategy(opts) == :resource,
+      do: [resolve_resource(opts)],
+      else: []
+  end
+
+  defp normalize_tenant(resource, opts) do
+    case Keyword.fetch(opts, :tenant) do
+      {:ok, tenant} -> Keyword.put(opts, :tenant, Ash.ToTenant.to_tenant(tenant, resource))
+      :error -> opts
+    end
+  end
+
+  defp event_options(opts), do: Keyword.take(opts, [:domain, :tenant]) ++ [authorize?: false]
+
+  defp read_event(resource, event_id, opts) do
+    require Ash.Query
+    Ash.read_one(Ash.Query.filter(resource, event_id == ^event_id), opts)
+  end
+
+  defp resource_key(resource, event_id, opts) do
+    tenant =
+      if resource == :memory,
+        do: Ash.ToTenant.to_tenant(Keyword.get(opts, :tenant), nil),
+        else: Keyword.get(opts, :tenant)
+
+    case tenant do
+      nil -> {resource, event_id}
+      tenant -> {resource, tenant, event_id}
+    end
+  end
+
+  defp memory_key(event_id, opts) do
+    case Ash.ToTenant.to_tenant(Keyword.get(opts, :tenant), nil) do
+      nil -> event_id
+      # Tenant atoms such as :_ and :"$1" must remain data in ETS match specs.
+      tenant -> {:tenant_event, :erlang.term_to_binary({tenant, event_id})}
+    end
+  end
+
+  defp advisory_key(table, event_id, opts) do
+    case Keyword.get(opts, :tenant) do
+      nil -> {__MODULE__, table, event_id}
+      tenant -> {__MODULE__, table, tenant, event_id}
+    end
+  end
+
+  defp local_execution_lock(key, fun) do
+    AshBilling.ResourceLock.try_local(key, fun)
+  end
+
+  defp postgres?(resource), do: Ash.DataLayer.data_layer(resource) == AshPostgres.DataLayer
+
+  # Transaction-scoped database arbitration covers the absent-row/INSERT race,
+  # while NOWAIT protects against row writers that do not use this protocol.
+  # The persistent row/token CAS remains the ownership authority.
+  defp postgres_event(resource, event_id, opts, fun) do
+    result =
+      AshBilling.ResourceLock.run(
+        [resource],
+        {resource, event_id},
+        fn ->
+          repo = apply(AshPostgres.DataLayer.Info, :repo, [resource, :mutate])
+          table = apply(AshPostgres.DataLayer.Info, :table, [resource])
+
+          <<key::signed-64, _::binary>> =
+            :crypto.hash(:sha256, :erlang.term_to_binary(advisory_key(table, event_id, opts)))
+
+          case apply(repo, :query, ["SELECT pg_try_advisory_xact_lock($1)", [key]]) do
+            {:ok, %{rows: [[true]]}} ->
+              require Ash.Query
+
+              query =
+                resource
+                |> Ash.Query.filter(event_id == ^event_id)
+                |> Ash.Query.lock("FOR UPDATE NOWAIT")
+
+              with {:ok, record} <-
+                     Ash.read_one(query, event_options(opts)) do
+                fun.(record)
+              end
+
+            {:ok, %{rows: [[false]]}} ->
+              {:error, :already_processing}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        end,
+        rollback_on_error?: true
+      )
+
+    case result do
+      {:error, reason} ->
+        if unavailable?(reason), do: {:error, :already_processing}, else: result
+
+      _ ->
+        result
+    end
+  end
+
+  defp unavailable?(%Ash.Error.Invalid.Unavailable{}), do: true
+  defp unavailable?(%{postgres: %{code: :lock_not_available}}), do: true
+
+  defp unavailable?(%{errors: errors}) when is_list(errors),
+    do: Enum.any?(errors, &unavailable?/1)
+
+  defp unavailable?({:transaction_failed, error}), do: unavailable?(error)
+  defp unavailable?(_), do: false
 
   defp acquire_resource(resource, event_id, opts) do
     has_status? = Ash.Resource.Info.attribute(resource, :status) != nil
     has_update? = Ash.Resource.Info.action(resource, :update) != nil
 
     if has_status? and has_update? do
-      domain = Keyword.get(opts, :domain)
+      ash_opts = event_options(opts)
       now = DateTime.utc_now()
       lease_ttl = Keyword.get(opts, :lease_ttl_seconds, 60)
 
-      create_resource_lease(resource, event_id, domain, now, lease_ttl)
+      create_resource_lease(resource, event_id, ash_opts, now, lease_ttl)
     else
       {:error, :resource_lacks_update_action}
     end
   end
 
-  defp create_resource_lease(resource, event_id, domain, now, lease_ttl) do
+  defp create_resource_lease(resource, event_id, ash_opts, now, lease_ttl) do
     token = generate_lease_token()
 
     attrs =
@@ -96,50 +284,30 @@ defmodule AshBilling.Deduplication do
       |> maybe_put_field(resource, :attempts, 1)
       |> maybe_put_field(resource, :lease_token, token)
 
-    case Ash.create(resource, attrs, domain: domain, authorize?: false) do
+    case Ash.create(resource, attrs, ash_opts) do
       {:ok, _record} ->
         {:ok, token}
 
       {:error, reason} ->
         if duplicate_key_error?(reason) do
-          reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token)
+          reclaim_atomic_resource_lease(resource, event_id, ash_opts, now, lease_ttl, token)
         else
           {:error, reason}
         end
     end
   end
 
-  defp reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token) do
-    lock_key = {:reclaim_lock, event_id}
-
-    if try_acquire_lock(lock_key) do
-      try do
-        do_reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token)
-      after
-        release_lock(lock_key)
-      end
-    else
-      {:error, :already_processing}
-    end
+  # The persistent conditional update is the authority. A process-owned ETS
+  # lock cannot survive an untrappable exit safely and is unnecessary here.
+  defp reclaim_atomic_resource_lease(resource, event_id, ash_opts, now, lease_ttl, token) do
+    do_reclaim_atomic_resource_lease(resource, event_id, ash_opts, now, lease_ttl, token)
   end
 
-  defp try_acquire_lock(lock_key) do
-    :ets.insert_new(@table, {lock_key, self()})
-  rescue
-    _ -> true
-  end
-
-  defp release_lock(lock_key) do
-    :ets.delete(@table, lock_key)
-  rescue
-    _ -> :ok
-  end
-
-  defp do_reclaim_atomic_resource_lease(resource, event_id, domain, now, lease_ttl, token) do
+  defp do_reclaim_atomic_resource_lease(resource, event_id, ash_opts, now, lease_ttl, token) do
     has_status? = Ash.Resource.Info.attribute(resource, :status) != nil
 
     if has_status? do
-      case Ash.get(resource, event_id, domain: domain, authorize?: false) do
+      case read_event(resource, event_id, ash_opts) do
         {:ok, record} when not is_nil(record) ->
           case Map.get(record, :status) do
             :processed ->
@@ -154,7 +322,7 @@ defmodule AshBilling.Deduplication do
                 perform_atomic_reclaim(
                   resource,
                   event_id,
-                  domain,
+                  ash_opts,
                   now,
                   lease_ttl,
                   token,
@@ -163,7 +331,7 @@ defmodule AshBilling.Deduplication do
               end
 
             _failed ->
-              perform_atomic_reclaim(resource, event_id, domain, now, lease_ttl, token, record)
+              perform_atomic_reclaim(resource, event_id, ash_opts, now, lease_ttl, token, record)
           end
 
         _ ->
@@ -174,7 +342,7 @@ defmodule AshBilling.Deduplication do
     end
   end
 
-  defp perform_atomic_reclaim(resource, event_id, domain, now, lease_ttl, token, record) do
+  defp perform_atomic_reclaim(resource, event_id, ash_opts, now, lease_ttl, token, record) do
     if Ash.Resource.Info.action(resource, :update) do
       cutoff = DateTime.add(now, -lease_ttl, :second)
       require Ash.Query
@@ -198,19 +366,22 @@ defmodule AshBilling.Deduplication do
         |> maybe_put_field(resource, :lease_token, token)
         |> maybe_put_field(resource, :attempts, current_attempts + 1)
 
-      case Ash.bulk_update(query, :update, update_attrs,
-             domain: domain,
-             authorize?: false,
-             strategy: [:atomic],
-             return_records?: true,
-             return_errors?: true
+      case Ash.bulk_update(
+             query,
+             :update,
+             update_attrs,
+             Keyword.merge(ash_opts,
+               strategy: [:atomic],
+               return_records?: true,
+               return_errors?: true
+             )
            ) do
         %Ash.BulkResult{status: :success, records: [_updated | _]} ->
           {:ok, token}
 
         %Ash.BulkResult{status: :success, records: []} ->
           # Another concurrent worker acquired it first or marked it processed
-          case Ash.get(resource, event_id, domain: domain, authorize?: false) do
+          case read_event(resource, event_id, ash_opts) do
             {:ok, %{status: :processed}} -> {:error, :already_processed}
             _ -> {:error, :already_processing}
           end
@@ -255,11 +426,23 @@ defmodule AshBilling.Deduplication do
             {:error, :deduplication_resource_not_configured}
 
           resource ->
-            complete_resource(resource, event_id, opts)
+            opts = normalize_tenant(resource, opts)
+
+            if postgres?(resource) do
+              postgres_event(resource, event_id, opts, fn _ ->
+                complete_resource(resource, event_id, opts)
+              end)
+            else
+              local_execution_lock(resource_key(resource, event_id, opts), fn ->
+                complete_resource(resource, event_id, opts)
+              end)
+            end
         end
 
       :memory ->
-        complete_memory(event_id, opts)
+        local_execution_lock(resource_key(:memory, event_id, opts), fn ->
+          complete_memory(memory_key(event_id, opts), opts)
+        end)
     end
   rescue
     e -> {:error, e}
@@ -270,7 +453,7 @@ defmodule AshBilling.Deduplication do
     has_update? = Ash.Resource.Info.action(resource, :update) != nil
 
     if has_status? and has_update? do
-      domain = Keyword.get(opts, :domain)
+      ash_opts = event_options(opts)
       now = DateTime.utc_now()
       lease_token = Keyword.get(opts, :lease_token)
       has_token_attr? = Ash.Resource.Info.attribute(resource, :lease_token) != nil
@@ -300,18 +483,21 @@ defmodule AshBilling.Deduplication do
         |> maybe_put_field(resource, :error, nil)
         |> maybe_put_field(resource, :processed_at, now)
 
-      case Ash.bulk_update(query, :update, update_attrs,
-             domain: domain,
-             authorize?: false,
-             strategy: [:atomic],
-             return_records?: true,
-             return_errors?: true
+      case Ash.bulk_update(
+             query,
+             :update,
+             update_attrs,
+             Keyword.merge(ash_opts,
+               strategy: [:atomic],
+               return_records?: true,
+               return_errors?: true
+             )
            ) do
         %Ash.BulkResult{status: :success, records: [_updated | _]} ->
           :ok
 
         %Ash.BulkResult{status: :success, records: []} ->
-          case Ash.get(resource, event_id, domain: domain, authorize?: false) do
+          case read_event(resource, event_id, ash_opts) do
             {:ok, record} when not is_nil(record) ->
               cond do
                 Map.get(record, :status) == :processed ->
@@ -374,11 +560,23 @@ defmodule AshBilling.Deduplication do
             {:error, :deduplication_resource_not_configured}
 
           resource ->
-            release_resource(resource, event_id, opts)
+            opts = normalize_tenant(resource, opts)
+
+            if postgres?(resource) do
+              postgres_event(resource, event_id, opts, fn _ ->
+                release_resource(resource, event_id, opts)
+              end)
+            else
+              local_execution_lock(resource_key(resource, event_id, opts), fn ->
+                release_resource(resource, event_id, opts)
+              end)
+            end
         end
 
       :memory ->
-        delete_memory(event_id, opts)
+        local_execution_lock(resource_key(:memory, event_id, opts), fn ->
+          delete_memory(memory_key(event_id, opts), opts)
+        end)
     end
   rescue
     e -> {:error, e}
@@ -390,7 +588,7 @@ defmodule AshBilling.Deduplication do
 
     cond do
       has_status? and has_update? ->
-        domain = Keyword.get(opts, :domain)
+        ash_opts = event_options(opts)
         err_msg = Keyword.get(opts, :error)
         lease_token = Keyword.get(opts, :lease_token)
         has_token_attr? = Ash.Resource.Info.attribute(resource, :lease_token) != nil
@@ -423,18 +621,21 @@ defmodule AshBilling.Deduplication do
             if(err_msg, do: String.slice(inspect(err_msg), 0, 500), else: nil)
           )
 
-        case Ash.bulk_update(query, :update, update_attrs,
-               domain: domain,
-               authorize?: false,
-               strategy: [:atomic],
-               return_records?: true,
-               return_errors?: true
+        case Ash.bulk_update(
+               query,
+               :update,
+               update_attrs,
+               Keyword.merge(ash_opts,
+                 strategy: [:atomic],
+                 return_records?: true,
+                 return_errors?: true
+               )
              ) do
           %Ash.BulkResult{status: :success, records: [_updated | _]} ->
             :ok
 
           %Ash.BulkResult{status: :success, records: []} ->
-            case Ash.get(resource, event_id, domain: domain, authorize?: false) do
+            case read_event(resource, event_id, ash_opts) do
               {:ok, record} when not is_nil(record) ->
                 cond do
                   Map.get(record, :status) == :failed ->
@@ -463,23 +664,23 @@ defmodule AshBilling.Deduplication do
             end
 
           %Ash.BulkResult{errors: [err | _]} ->
-            atomic_bulk_destroy(resource, event_id, lease_token, domain, err)
+            atomic_bulk_destroy(resource, event_id, lease_token, ash_opts, err)
 
           {:error, reason} ->
-            atomic_bulk_destroy(resource, event_id, lease_token, domain, reason)
+            atomic_bulk_destroy(resource, event_id, lease_token, ash_opts, reason)
         end
 
       Ash.Resource.Info.action(resource, :destroy) != nil ->
-        domain = Keyword.get(opts, :domain)
+        ash_opts = event_options(opts)
         lease_token = Keyword.get(opts, :lease_token)
-        atomic_bulk_destroy(resource, event_id, lease_token, domain, :cannot_release_lease)
+        atomic_bulk_destroy(resource, event_id, lease_token, ash_opts, :cannot_release_lease)
 
       true ->
         {:error, :cannot_release_lease}
     end
   end
 
-  defp atomic_bulk_destroy(resource, event_id, lease_token, domain, default_err) do
+  defp atomic_bulk_destroy(resource, event_id, lease_token, ash_opts, default_err) do
     if Ash.Resource.Info.action(resource, :destroy) != nil do
       require Ash.Query
       has_status? = Ash.Resource.Info.attribute(resource, :status) != nil
@@ -508,18 +709,21 @@ defmodule AshBilling.Deduplication do
             |> Ash.Query.filter(event_id == ^event_id)
         end
 
-      case Ash.bulk_destroy(query, :destroy, %{},
-             domain: domain,
-             authorize?: false,
-             strategy: [:atomic],
-             return_records?: true,
-             return_errors?: true
+      case Ash.bulk_destroy(
+             query,
+             :destroy,
+             %{},
+             Keyword.merge(ash_opts,
+               strategy: [:atomic],
+               return_records?: true,
+               return_errors?: true
+             )
            ) do
         %Ash.BulkResult{status: :success, records: [_destroyed | _]} ->
           :ok
 
         %Ash.BulkResult{status: :success, records: []} ->
-          case Ash.get(resource, event_id, domain: domain, authorize?: false) do
+          case read_event(resource, event_id, ash_opts) do
             {:ok, record} when not is_nil(record) ->
               cond do
                 Map.get(record, :status) == :processed ->
@@ -572,7 +776,8 @@ defmodule AshBilling.Deduplication do
             false
 
           resource ->
-            domain = Keyword.get(opts, :domain)
+            opts = normalize_tenant(resource, opts)
+            ash_opts = event_options(opts)
             require Ash.Query
 
             query =
@@ -586,11 +791,11 @@ defmodule AshBilling.Deduplication do
                 |> Ash.Query.filter(event_id == ^event_id)
               end
 
-            Ash.exists?(query, domain: domain, authorize?: false)
+            Ash.exists?(query, ash_opts)
         end
 
       :memory ->
-        check_memory(event_id)
+        check_memory(memory_key(event_id, opts))
     end
   rescue
     _ -> false

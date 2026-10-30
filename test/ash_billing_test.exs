@@ -30,6 +30,38 @@ defmodule AshBillingTest do
              "cus_authorized"
   end
 
+  test "preserves subscription options with and without checkout metadata", %{
+    stub_name: stub_name,
+    opts: opts
+  } do
+    for metadata <- [%{}, %{team: "core"}] do
+      Req.Test.stub(stub_name, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        params = URI.decode_query(body)
+        assert params["subscription_data[trial_period_days]"] == "14"
+        assert params["subscription_data[metadata][source]"] == "campaign"
+
+        if map_size(metadata) > 0 do
+          assert params["subscription_data[metadata][team]"] == "core"
+        end
+
+        Req.Test.json(conn, %{id: "cs_trial", url: "https://checkout.test/trial"})
+      end)
+
+      assert {:ok, %{id: "cs_trial"}} =
+               AshBilling.create_checkout_session(
+                 "cus_trial",
+                 Keyword.merge(opts,
+                   price: "price_trial",
+                   success_url: "https://example.com/success",
+                   cancel_url: "https://example.com/cancel",
+                   metadata: metadata,
+                   subscription_data: %{trial_period_days: 14, metadata: %{source: "campaign"}}
+                 )
+               )
+    end
+  end
+
   test "updates the requested subscription item and rejects an absent item", %{
     stub_name: stub_name,
     opts: opts
@@ -69,38 +101,6 @@ defmodule AshBillingTest do
                5,
                Keyword.put(opts, :subscription_item_id, "si_absent")
              )
-  end
-
-  test "preserves subscription options with and without checkout metadata", %{
-    stub_name: stub_name,
-    opts: opts
-  } do
-    for metadata <- [%{}, %{team: "core"}] do
-      Req.Test.stub(stub_name, fn conn ->
-        {:ok, body, conn} = Plug.Conn.read_body(conn)
-        params = URI.decode_query(body)
-        assert params["subscription_data[trial_period_days]"] == "14"
-        assert params["subscription_data[metadata][source]"] == "campaign"
-
-        if map_size(metadata) > 0 do
-          assert params["subscription_data[metadata][team]"] == "core"
-        end
-
-        Req.Test.json(conn, %{id: "cs_trial", url: "https://checkout.test/trial"})
-      end)
-
-      assert {:ok, %{id: "cs_trial"}} =
-               AshBilling.create_checkout_session(
-                 "cus_trial",
-                 Keyword.merge(opts,
-                   price: "price_trial",
-                   success_url: "https://example.com/success",
-                   cancel_url: "https://example.com/cancel",
-                   metadata: metadata,
-                   subscription_data: %{trial_period_days: 14, metadata: %{source: "campaign"}}
-                 )
-               )
-    end
   end
 
   describe "customer_id/1" do

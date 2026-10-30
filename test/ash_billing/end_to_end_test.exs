@@ -78,6 +78,7 @@ defmodule AshBilling.EndToEndTest do
 
       # 3. User finishes checkout -> Stripe sends checkout.session.completed webhook
       checkout_completed_event = %{
+        "id" => "evt_" <> Ash.UUID.generate(),
         "type" => "checkout.session.completed",
         "data" => %{
           "object" => %{
@@ -98,6 +99,7 @@ defmodule AshBilling.EndToEndTest do
 
       # 4. Stripe sends customer.subscription.created webhook
       sub_created_event = %{
+        "id" => "evt_" <> Ash.UUID.generate(),
         "type" => "customer.subscription.created",
         "data" => %{
           "object" => %{
@@ -130,6 +132,7 @@ defmodule AshBilling.EndToEndTest do
 
       # 6. Customer cancels subscription -> Stripe sends customer.subscription.deleted
       sub_deleted_event = %{
+        "id" => "evt_" <> Ash.UUID.generate(),
         "type" => "customer.subscription.deleted",
         "data" => %{
           "object" => %{

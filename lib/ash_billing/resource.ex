@@ -2,6 +2,10 @@ defmodule AshBilling.Resource do
   @moduledoc """
   A Spark DSL extension for Ash resources representing billing customers (e.g., `User` or `Organization`).
 
+  Billing state is not implicitly accepted by wildcard create/update actions.
+  Explicitly named inputs remain an application authorization decision. Internal
+  webhook writes retain actions, policies, validations and tenant scope.
+
   ## Usage
 
       defmodule MyApp.Accounts.User do
@@ -35,6 +39,9 @@ defmodule AshBilling.Resource do
 
   use Spark.Dsl.Extension,
     sections: [@billing],
-    transformers: [AshBilling.Resource.Transformers.AddCustomerIdAttribute],
+    transformers: [
+      AshBilling.Resource.Transformers.AddCustomerIdAttribute,
+      AshBilling.Transformers.ProtectBillingAttributes
+    ],
     verifiers: [AshBilling.Resource.Verifiers.VerifyCustomerIdAttribute]
 end

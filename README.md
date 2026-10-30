@@ -304,13 +304,14 @@ config :ash_billing,
 
 ## Supported Stripe API Baseline
 
-`ash_billing` targets modern Stripe API versions (`2023-10-16` through current releases). Payloads are parsed defensively with polymorphic fallback resolvers for customer objects, plans, prices, and timestamps, ensuring backward and forward compatibility across API upgrades.
+`ash_billing` processes Stripe snapshot billing events using v1 resource shapes. Check your endpoint API version against the customer, subscription, price and timestamp fields your integration uses. Thin events and non-nil v2 `context` envelopes are not supported; they are rejected rather than recorded as processed.
 
 ---
 
 ## Security, Financial Responsibility & Support Scope
 
 - **Financial Compliance**: Tax calculation, invoice finalization, currency conversion rules, and PCI-DSS compliance boundaries remain the architectural responsibility of the implementing application.
+- **Billing Input Boundaries**: Billing state is excluded from wildcard actions. Explicit accepts still require application policies. Configure a fixed Stripe account/environment per tenant; see the [security hardening and deployment contract](documentation/topics/webhooks-and-resilience.md#billing-inputs-tenants-and-stripe-scope).
 - **Webhook Resilience**: In production environments, always pair `AshBilling.Plug` with a database-backed deduplication resource (`AshBilling.WebhookEvent`) to ensure idempotency across multi-node deployments and automatic Stripe exponential retries.
 - **Support & Issues**: The issue tracker is strictly reserved for reproducible bugs and targeted feature enhancements. For architecture questions and implementation advice, please participate in the [Ash Discord](https://discord.gg/HTHRaaVPUc) or [Elixir Forum](https://elixirforum.com/c/ash-framework-forum/).
 
