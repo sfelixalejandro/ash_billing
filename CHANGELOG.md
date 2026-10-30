@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - Unreleased (proposed)
+## [0.4.0] - 2026-10-30
 
 ### Upgrade requirements
 
@@ -17,7 +17,6 @@ This pre-1.0 minor release intentionally changes billing input acceptance, Strip
 Connect scope, transaction boundaries and customer idempotency keys. It is not a
 transparent 0.3.x patch. Apply consumer schema migrations and drain old workers
 before switching versions. See [Upgrading to 0.4](documentation/topics/upgrading-to-0.4.md).
-No tag, release or Hex publication has been created by this preparation.
 
 ### Fixed
 
