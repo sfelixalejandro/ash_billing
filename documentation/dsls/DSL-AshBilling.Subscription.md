@@ -9,6 +9,10 @@ Provider subscription IDs are unique within this resource and its Ash tenant.
 Each scope must use one provider/account/environment. PostgreSQL consumers must
 generate and apply a migration for the injected identity, resolving existing duplicates first.
 
+Billing state is not implicitly accepted by wildcard create/update actions.
+Explicitly named inputs remain an application authorization decision. Internal
+webhook writes retain actions, policies, validations and tenant scope.
+
 ## Usage
 
     defmodule MyApp.Billing.Subscription do

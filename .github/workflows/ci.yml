@@ -73,3 +73,10 @@ jobs:
           POSTGRES_HOST: localhost
           POSTGRES_PORT: 5432
         run: mix test --cover
+
+      - name: Audit dependencies and build release documentation/package
+        if: matrix.elixir == '1.18'
+        run: |
+          mix hex.audit
+          mix docs --warnings-as-errors
+          mix hex.build

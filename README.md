@@ -68,6 +68,11 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 
 ## Installation
 
+This branch prepares **0.4.0**, which is not published yet. See the
+[upgrade guide](documentation/topics/upgrading-to-0.4.md) before moving from 0.3.x.
+Pin a reviewed Git commit until the package is published.
+
+
 The recommended way to install `ash_billing` is using Igniter:
 
 ```bash
@@ -81,7 +86,7 @@ Alternatively, you can install it manually by adding `ash_billing` to your `mix.
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.3.1"}
+    {:ash_billing, "~> 0.4.0"}
   ]
 end
 ```

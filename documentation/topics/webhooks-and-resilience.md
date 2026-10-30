@@ -403,6 +403,6 @@ if necessary replay with their original explicit idempotency key. A new automati
 key can create an orphan provider customer when retrying an old, unpersisted request.
 The persistent customer association CAS remains authoritative and is not weakened.
 
-See the [final hardening evidence and release assessment](final-security-hardening.md).
+See the [final hardening evidence and release assessment](https://github.com/sfelixalejandro/ash_billing/blob/fc5d38c5d131a20ab338ab362e083922dce04ff5/documentation/topics/final-security-hardening.md).
 Earlier F1–F6 and commit-remediation reports are historical evidence, not the final
 status of U1–U4 or the Bandit dependency audit.
