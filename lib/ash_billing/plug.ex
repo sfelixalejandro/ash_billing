@@ -25,6 +25,29 @@ defmodule AshBilling.Plug do
 
   @impl true
   def call(conn, opts) do
+    case AshBilling.ResourceLock.http_boundary(transaction_resources(opts)) do
+      :ok ->
+        call_with_boundary(conn, opts)
+
+      {:error, reason} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          503,
+          Jason.encode!(%{error: "transaction_boundary", details: inspect(reason)})
+        )
+        |> halt()
+    end
+  end
+
+  defp transaction_resources(opts) do
+    [
+      Keyword.get(opts, :customer_resource) || Keyword.get(opts, :resource),
+      Keyword.get(opts, :subscription_resource)
+    ] ++ AshBilling.Deduplication.transaction_resources(opts)
+  end
+
+  defp call_with_boundary(conn, opts) do
     provider = Keyword.get(opts, :provider, AshBilling.Providers.Stripe)
     handler = Keyword.get(opts, :handler)
 
@@ -52,13 +75,17 @@ defmodule AshBilling.Plug do
                   event_id = Map.get(event, "id")
                   event_type = Map.get(event, "type")
                   deduplicate? = Keyword.get(opts, :deduplicate?, true)
-                  return_500? = Keyword.get(opts, :return_500_on_sync_error, true)
 
                   dedup_status =
-                    if deduplicate? do
-                      AshBilling.Deduplication.acquire(event_id, opts)
-                    else
-                      {:ok, nil}
+                    cond do
+                      deduplicate? and (not is_binary(event_id) or event_id == "") ->
+                        {:error, :invalid_event_id}
+
+                      deduplicate? ->
+                        AshBilling.Deduplication.acquire(event_id, opts)
+
+                      true ->
+                        {:ok, nil}
                     end
 
                   case dedup_status do
@@ -96,7 +123,7 @@ defmodule AshBilling.Plug do
                     {:error, dedup_reason} ->
                       require Logger
 
-                      status_code = if return_500?, do: 500, else: 200
+                      status_code = 500
 
                       Logger.error(
                         "AshBilling.Plug: Failed to acquire deduplication lease for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(dedup_reason)}. Returning HTTP #{status_code}."
@@ -129,13 +156,23 @@ defmodule AshBilling.Plug do
                         if deduplicate?,
                           do:
                             AshBilling.Deduplication.with_lease(event_id, lease_token, opts, work),
-                          else: {:ok, work.()}
+                          else:
+                            AshBilling.ResourceLock.run(
+                              transaction_resources(opts),
+                              {:webhook, event_id},
+                              fn -> {:ok, work.()} end
+                            )
 
                       case result do
-                        {:ok, response} ->
-                          response
+                        {:ok, {response, metadata}} ->
+                          {send_resp(response), metadata}
 
                         {:error, reason} ->
+                          if deduplicate? and
+                               reason not in [:already_processed, :already_processing] do
+                            release_after_failure(event_id, lease_token, reason, opts)
+                          end
+
                           status = if reason == :already_processed, do: 200, else: 503
 
                           response =
@@ -191,27 +228,33 @@ defmodule AshBilling.Plug do
       {:error, reason} ->
         require Logger
 
-        status_code = if return_500?, do: 500, else: 200
+        status_code =
+          if return_500? or match?({:transaction_failed, _}, reason), do: 500, else: 200
 
         Logger.error(
           "AshBilling.Plug: Webhook synchronization failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(reason)}. Releasing lease. " <>
-            if(return_500?,
+            if(status_code == 500,
               do: "Returning HTTP 500 to trigger Stripe retry.",
-              else: "Returning HTTP 200."
+              else: "HTTP 200 requires successful failure recording and transaction commit."
             )
         )
 
-        if deduplicate? do
-          AshBilling.Deduplication.release(
-            event_id,
-            [lease_token: lease_token, error: reason] ++ opts
-          )
-        end
+        release_result =
+          if deduplicate? do
+            AshBilling.Deduplication.release(
+              event_id,
+              [lease_token: lease_token, error: reason] ++ opts
+            )
+          else
+            :ok
+          end
+
+        status_code = if release_result == :ok, do: status_code, else: 500
 
         resp_conn =
           conn
           |> put_resp_content_type("application/json")
-          |> send_resp(
+          |> resp(
             status_code,
             Jason.encode!(%{
               error: "synchronization_failed",
@@ -241,20 +284,25 @@ defmodule AshBilling.Plug do
 
             Logger.error(
               "AshBilling.Plug: Custom handler #{inspect(handler)} failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(handler_reason)}. Releasing lease and " <>
-                "returning HTTP #{status_code}."
+                "preparing a response after recording the failure."
             )
 
-            if deduplicate? do
-              AshBilling.Deduplication.release(
-                event_id,
-                [lease_token: lease_token, error: handler_reason] ++ opts
-              )
-            end
+            release_result =
+              if deduplicate? do
+                AshBilling.Deduplication.release(
+                  event_id,
+                  [lease_token: lease_token, error: handler_reason] ++ opts
+                )
+              else
+                :ok
+              end
+
+            status_code = if release_result == :ok, do: status_code, else: 500
 
             resp_conn =
               conn
               |> put_resp_content_type("application/json")
-              |> send_resp(
+              |> resp(
                 status_code,
                 Jason.encode!(%{
                   error: "handler_failed",
@@ -287,7 +335,7 @@ defmodule AshBilling.Plug do
                 resp_conn =
                   conn
                   |> put_resp_content_type("application/json")
-                  |> send_resp(200, ~s({"status":"received"}))
+                  |> resp(200, ~s({"status":"received"}))
                   |> halt()
 
                 {resp_conn,
@@ -300,20 +348,17 @@ defmodule AshBilling.Plug do
               {:error, complete_reason} ->
                 require Logger
 
-                status_code = if return_500?, do: 500, else: 200
+                status_code = 500
 
                 Logger.error(
                   "AshBilling.Plug: Failed to complete deduplication lease for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(complete_reason)}. " <>
-                    if(return_500?,
-                      do: "Returning HTTP 500 to trigger retry.",
-                      else: "Returning HTTP 200."
-                    )
+                    "Returning HTTP 500 to trigger retry."
                 )
 
                 resp_conn =
                   conn
                   |> put_resp_content_type("application/json")
-                  |> send_resp(
+                  |> resp(
                     status_code,
                     Jason.encode!(%{
                       error: "completion_failed",
@@ -331,6 +376,22 @@ defmodule AshBilling.Plug do
                  }}
             end
         end
+    end
+  end
+
+  defp release_after_failure(event_id, token, reason, opts) do
+    case AshBilling.Deduplication.release(event_id, [lease_token: token, error: reason] ++ opts) do
+      :ok ->
+        :ok
+
+      {:error, release_reason} ->
+        require Logger
+
+        Logger.error(
+          "AshBilling.Plug: lease cleanup failed after transaction failure: #{inspect(release_reason)}"
+        )
+
+        {:error, release_reason}
     end
   end
 

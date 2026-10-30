@@ -230,20 +230,59 @@ Keep reads and writes on the same primary database/Repo; a read replica is not a
 substitute for the transaction holding these locks. Locking is per row across BEAM
 nodes and does not depend on distributed Erlang membership. Transactions can hold a
 connection during a provider request: configure bounded provider/Repo timeouts and
-size the pool accordingly. Across different Repos this is not a distributed commit;
-failures must be retried and reconciled. Other data layers have a single-node OTP
-fallback, not a claim of distributed isolation.
+size the pool accordingly. Configured customer, subscription, and durable event
+resources must share one primary Repo pool. Different primary pools are rejected
+before the Plug acquires a lease (HTTP 503), and synchronization returns
+`{:error, {:multiple_transaction_repos, repos}}`. This avoids both foreign-key
+self-blocking between connections and partially committed billing transactions.
+Different Repo modules are supported only when explicitly routed to the same
+`get_dynamic_repo/0` target in the calling process. No distributed commit is
+provided. Other data layers have a single-node OTP fallback, not distributed isolation.
 
 ### Event execution fences and handler contract
 
 `AshBilling.Plug` runs synchronization, the configured handler, and lease completion
 inside `AshBilling.Deduplication.with_lease/4`. PostgreSQL holds the event row's
-`FOR UPDATE` lock until execution finishes; a retry cannot reclaim that row while
-its handler is alive in the transaction. Nontransactional resources and memory mode
+`FOR UPDATE NOWAIT` lock until execution finishes; a retry cannot reclaim that row
+while its handler is alive in the transaction. Transaction-scoped PostgreSQL try
+advisory locks arbitrate the physical event table/event ID even before the row
+exists; persistent row status and token CAS remain the ownership authority.
+Contending calls return `:already_processing` (HTTP 503 for the Plug), without
+waiting on the owner's row lock while occupying another pool connection. A brief
+connection checkout is still needed; this does not eliminate pool limits or
+contention from unrelated billing events. Nontransactional resources and memory mode
 use a node-local OTP lock whose ownership is monitored by OTP. A killed process
 cannot leave the old unmonitored `reclaim_lock` behind. Database locks are released
 when a connection/transaction dies; an expired durable lease can then be reclaimed.
-Do not change lease timestamps or tokens in application code.
+Rollback cleanup is asynchronous after `:kill`; transient 503 responses during it
+are expected. Do not change lease timestamps or tokens in application code.
+Drain old workers before deploying this protocol: older binaries do not acquire
+the new advisory lock, especially during absent-row insertion races.
+
+### HTTP acknowledgment and durable commit
+
+The Plug prepares its response inside the execution fence and sends it only after
+the outer transaction returns successfully. Failed COMMIT, lease acquisition,
+completion, or failure-recording cannot produce HTTP 2xx. A failed execution
+transaction attempts token-guarded lease release in a separate transaction; if
+cleanup also fails, the response remains 5xx and recovery uses the durable lease.
+A lost commit acknowledgment can mean the database committed: retrying then sees
+`processed` and does not repeat the committed cancellation.
+
+Calling the Plug from a caller-owned Ecto/Ash transaction returns HTTP 503 before
+processing, including already-processed shortcuts and configurations without
+billing resources. The Plug cannot send a response contingent on a future outer
+commit. Raw `with_lease/4` consumers inside an external transaction still own that
+outer commit and must not acknowledge delivery before it succeeds.
+
+`return_500_on_sync_error: false` remains a business-error acknowledgment opt-out
+only after failure recording and commit succeed. Acquisition/completion failures
+always return 5xx. With deduplication enabled, missing or empty event IDs are
+rejected rather than bypassing event persistence. Durable replay protection requires a persistent PostgreSQL
+event resource on the shared primary pool. Memory mode, nontransactional data
+layers, and disabled deduplication do not create durable event records or make
+arbitrary handler effects atomic. Handlers must finish their own transactions
+synchronously and must not send a response or change the configured Repo target.
 
 Handlers must do bounded, synchronous work. Required modules are loaded before
 invocation. A configured unavailable handler produces HTTP 500 even when

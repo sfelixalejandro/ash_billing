@@ -358,10 +358,11 @@ defmodule AshBilling.SecurityRegression.SecurityTest do
         end)
 
       assert_receive {:verified, _}, 2000
+      assert Task.await(second).status == 503
       refute_receive {:handled, _, _}
       send(first_worker, :finish)
       assert {:ok, :ok} = Task.await(first)
-      assert Task.await(second).status == 200
+      assert request(ev, opts).status == 200
       refute_receive {:handled, _, _}
       assert AshBilling.Deduplication.processed?(ev["id"], opts)
 
@@ -385,16 +386,22 @@ defmodule AshBilling.SecurityRegression.SecurityTest do
       [DateTime.add(DateTime.utc_now(), -120), ev["id"]]
     )
 
+    owner = self()
+
     {worker, monitor} =
       spawn_monitor(fn ->
         AshBilling.Deduplication.with_lease(ev["id"], token, opts, fn ->
+          [[backend]] = Ecto.Adapters.SQL.query!(Repo, "SELECT pg_backend_pid()", []).rows
+          send(owner, {:fence_backend, backend})
           AshBilling.SecurityRegression.BlockingHandler.handle_event(ev)
         end)
       end)
 
+    assert_receive {:fence_backend, backend}, 2000
     assert_receive {:handled, ^worker, _}, 2000
     Process.exit(worker, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
+    assert_database_fence_released(backend)
 
     recovery =
       Task.async(fn ->
@@ -493,7 +500,7 @@ defmodule AshBilling.SecurityRegression.SecurityTest do
 
       assert_receive {:fenced, fence_owner}, 2000
 
-      {remote_worker, backend} =
+      {remote_worker, _backend} =
         :peer.call(peer, AshBilling.Test.SecurityProvider, :start_call, [
           AshBilling.Deduplication,
           :acquire,
@@ -501,12 +508,15 @@ defmodule AshBilling.SecurityRegression.SecurityTest do
         ])
 
       :peer.call(peer, :erlang, :send, [remote_worker, :go])
-      assert_database_lock_wait(backend)
+
+      assert {:error, :already_processing} =
+               :peer.call(peer, AshBilling.Test.SecurityProvider, :finish_call, [remote_worker])
+
       send(fence_owner, :finish)
       assert {:ok, :ok} = Task.await(fence)
 
       assert {:error, :already_processed} =
-               :peer.call(peer, AshBilling.Test.SecurityProvider, :finish_call, [remote_worker])
+               :peer.call(peer, AshBilling.Deduplication, :acquire, [ev["id"], opts])
 
       Ecto.Adapters.SQL.query!(Repo, "DELETE FROM webhook_events WHERE event_id = $1", [ev["id"]])
     after
@@ -683,6 +693,27 @@ defmodule AshBilling.SecurityRegression.SecurityTest do
     assert :ok = Task.await(first)
     Task.await(second)
     assert_receive :second_entered
+  end
+
+  defp assert_database_fence_released(backend, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 3000
+
+    [[held]] =
+      Ecto.Adapters.SQL.query!(
+        Repo,
+        "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory')",
+        [backend],
+        log: false
+      ).rows
+
+    if held do
+      assert System.monotonic_time(:millisecond) < deadline,
+             "database did not release the dead owner's fence"
+
+      assert_database_fence_released(backend, deadline)
+    else
+      :ok
+    end
   end
 
   defp assert_database_lock_wait(backend, deadline \\ nil) do

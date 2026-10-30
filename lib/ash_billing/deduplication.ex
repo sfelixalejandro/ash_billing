@@ -63,9 +63,21 @@ defmodule AshBilling.Deduplication do
             {:error, :deduplication_resource_not_configured}
 
           resource ->
-            if Ash.DataLayer.data_layer_can?(resource, {:lock, :for_update}) and
-                 Ash.DataLayer.data_layer_can?(resource, :transact) do
-              acquire_resource(resource, event_id, opts)
+            if postgres?(resource) do
+              postgres_event(resource, event_id, opts, fn record ->
+                if is_nil(record) do
+                  acquire_resource(resource, event_id, opts)
+                else
+                  reclaim_atomic_resource_lease(
+                    resource,
+                    event_id,
+                    Keyword.get(opts, :domain),
+                    DateTime.utc_now(),
+                    Keyword.get(opts, :lease_ttl_seconds, 60),
+                    generate_lease_token()
+                  )
+                end
+              end)
             else
               local_execution_lock({resource, event_id}, fn ->
                 acquire_resource(resource, event_id, opts)
@@ -95,19 +107,27 @@ defmodule AshBilling.Deduplication do
       :resource ->
         resource = resolve_resource(opts)
 
-        AshBilling.ResourceLock.run([resource], {resource, event_id}, fn ->
-          require Ash.Query
-
-          query =
-            resource |> Ash.Query.filter(event_id == ^event_id) |> AshBilling.ResourceLock.query()
-
-          case Ash.read_one(query, domain: Keyword.get(opts, :domain), authorize?: false) do
-            {:ok, %{status: :processing, lease_token: ^token}} -> {:ok, fun.()}
-            {:ok, %{status: :processed}} -> {:error, :already_processed}
-            {:ok, _} -> {:error, :lease_token_mismatch}
-            {:error, reason} -> {:error, reason}
+        execute = fn record ->
+          case record do
+            %{status: :processing, lease_token: ^token} -> {:ok, fun.()}
+            %{status: :processed} -> {:error, :already_processed}
+            _ -> {:error, :lease_token_mismatch}
           end
-        end)
+        end
+
+        if postgres?(resource) do
+          postgres_event(resource, event_id, opts, execute)
+        else
+          local_execution_lock({resource, event_id}, fn ->
+            require Ash.Query
+            query = Ash.Query.filter(resource, event_id == ^event_id)
+
+            case Ash.read_one(query, domain: Keyword.get(opts, :domain), authorize?: false) do
+              {:ok, record} -> execute.(record)
+              {:error, reason} -> {:error, reason}
+            end
+          end)
+        end
 
       :memory ->
         local_execution_lock({:memory, event_id}, fn ->
@@ -120,9 +140,75 @@ defmodule AshBilling.Deduplication do
     end
   end
 
-  defp local_execution_lock(key, fun) do
-    AshBilling.ResourceLock.local(key, fun)
+  @doc false
+  def transaction_resources(opts) do
+    if Keyword.get(opts, :deduplicate?, true) and resolve_strategy(opts) == :resource,
+      do: [resolve_resource(opts)],
+      else: []
   end
+
+  defp local_execution_lock(key, fun) do
+    AshBilling.ResourceLock.try_local(key, fun)
+  end
+
+  defp postgres?(resource), do: Ash.DataLayer.data_layer(resource) == AshPostgres.DataLayer
+
+  # Transaction-scoped database arbitration covers the absent-row/INSERT race,
+  # while NOWAIT protects against row writers that do not use this protocol.
+  # The persistent row/token CAS remains the ownership authority.
+  defp postgres_event(resource, event_id, opts, fun) do
+    result =
+      AshBilling.ResourceLock.run(
+        [resource],
+        {resource, event_id},
+        fn ->
+          repo = apply(AshPostgres.DataLayer.Info, :repo, [resource, :mutate])
+          table = apply(AshPostgres.DataLayer.Info, :table, [resource])
+
+          <<key::signed-64, _::binary>> =
+            :crypto.hash(:sha256, :erlang.term_to_binary({__MODULE__, table, event_id}))
+
+          case apply(repo, :query, ["SELECT pg_try_advisory_xact_lock($1)", [key]]) do
+            {:ok, %{rows: [[true]]}} ->
+              require Ash.Query
+
+              query =
+                resource
+                |> Ash.Query.filter(event_id == ^event_id)
+                |> Ash.Query.lock("FOR UPDATE NOWAIT")
+
+              with {:ok, record} <-
+                     Ash.read_one(query, domain: Keyword.get(opts, :domain), authorize?: false) do
+                fun.(record)
+              end
+
+            {:ok, %{rows: [[false]]}} ->
+              {:error, :already_processing}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        end,
+        rollback_on_error?: true
+      )
+
+    case result do
+      {:error, reason} ->
+        if unavailable?(reason), do: {:error, :already_processing}, else: result
+
+      _ ->
+        result
+    end
+  end
+
+  defp unavailable?(%Ash.Error.Invalid.Unavailable{}), do: true
+  defp unavailable?(%{postgres: %{code: :lock_not_available}}), do: true
+
+  defp unavailable?(%{errors: errors}) when is_list(errors),
+    do: Enum.any?(errors, &unavailable?/1)
+
+  defp unavailable?({:transaction_failed, error}), do: unavailable?(error)
+  defp unavailable?(_), do: false
 
   defp acquire_resource(resource, event_id, opts) do
     has_status? = Ash.Resource.Info.attribute(resource, :status) != nil
@@ -289,11 +375,19 @@ defmodule AshBilling.Deduplication do
             {:error, :deduplication_resource_not_configured}
 
           resource ->
-            complete_resource(resource, event_id, opts)
+            if postgres?(resource) do
+              postgres_event(resource, event_id, opts, fn _ ->
+                complete_resource(resource, event_id, opts)
+              end)
+            else
+              local_execution_lock({resource, event_id}, fn ->
+                complete_resource(resource, event_id, opts)
+              end)
+            end
         end
 
       :memory ->
-        complete_memory(event_id, opts)
+        local_execution_lock({:memory, event_id}, fn -> complete_memory(event_id, opts) end)
     end
   rescue
     e -> {:error, e}
@@ -408,11 +502,19 @@ defmodule AshBilling.Deduplication do
             {:error, :deduplication_resource_not_configured}
 
           resource ->
-            release_resource(resource, event_id, opts)
+            if postgres?(resource) do
+              postgres_event(resource, event_id, opts, fn _ ->
+                release_resource(resource, event_id, opts)
+              end)
+            else
+              local_execution_lock({resource, event_id}, fn ->
+                release_resource(resource, event_id, opts)
+              end)
+            end
         end
 
       :memory ->
-        delete_memory(event_id, opts)
+        local_execution_lock({:memory, event_id}, fn -> delete_memory(event_id, opts) end)
     end
   rescue
     e -> {:error, e}

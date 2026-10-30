@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Webhook commit acknowledgment and contention**: Send successful HTTP responses only after the execution transaction commits; failed commits and lease persistence errors remain retryable even with the legacy error acknowledgment opt-out. Reject missing/empty event IDs when deduplication is enabled. Reject caller-owned HTTP transactions and different primary Repo pools before processing. Use PostgreSQL transaction-scoped try advisory locks plus `FOR UPDATE NOWAIT` and persistent token CAS so duplicates do not wait on an active handler while occupying pool connections. Different Repo modules may explicitly share one primary pool; separate primary pools now fail closed with HTTP 503.
+
 - **Billing Security and Recovery (F1–F6)**:
   - Retain customer IDs with a persistent `billing_deleted_at` tombstone, revoke their subscriptions, and reject late nonterminal events.
   - Serialize PostgreSQL customer/subscription synchronization with row locks, reconcile all same-second entitlement changes, and guard direct writes against stale snapshots.
