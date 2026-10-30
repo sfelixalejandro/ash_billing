@@ -1,7 +1,7 @@
 defmodule AshBilling.MixProject do
   use Mix.Project
 
-  @version "0.3.1"
+  @version "0.4.0"
   @description "Declarative billing, subscriptions, and payment providers for the Ash Framework."
   @source_url "https://github.com/sfelixalejandro/ash_billing"
 
@@ -47,7 +47,8 @@ defmodule AshBilling.MixProject do
       name: "ash_billing",
       maintainers: ["Alejandro Felix <SFelixAlejandro@hotmail.com>"],
       licenses: ["MIT"],
-      files: ~w(lib .formatter.exs mix.exs README* LICENSE* CHANGELOG* documentation),
+      files:
+        ~w(lib .formatter.exs mix.exs README* LICENSE* CHANGELOG* SECURITY.md .github/CONTRIBUTING.md documentation),
       links: %{
         "GitHub" => @source_url,
         "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md",
@@ -96,6 +97,7 @@ defmodule AshBilling.MixProject do
       source_ref: "v#{@version}",
       extra_section: "GUIDES",
       extras: [
+        {"documentation/topics/upgrading-to-0.4.md", title: "Upgrading to 0.4"},
         {"README.md", title: "Home"},
         {"documentation/tutorials/getting-started-with-ash-billing.md",
          title: "Getting Started with AshBilling"},

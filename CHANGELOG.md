@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - Unreleased (proposed)
+
+### Upgrade requirements
+
+This pre-1.0 minor release intentionally changes billing input acceptance, Stripe
+Connect scope, transaction boundaries and customer idempotency keys. It is not a
+transparent 0.3.x patch. Apply consumer schema migrations and drain old workers
+before switching versions. See [Upgrading to 0.4](documentation/topics/upgrading-to-0.4.md).
+No tag, release or Hex publication has been created by this preparation.
+
 ### Fixed
 
 - **Final billing hardening (U1–U4)**:
@@ -38,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Support `Ash.CiString` and Custom Structs in Stripe Payloads**:
-  - Automatically coerce `Ash.CiString` values (commonly used by `AshAuthentication` for `:email` fields) to strings in `AshBilling.Providers.Stripe.to_form_params/2`.
+  - Automatically coerce `Ash.CiString` values (commonly used by `AshAuthentication` for `:email` fields) to strings in the Stripe form encoder.
   - Safely serialize structs implementing `String.Chars` or unwrap them to maps, preventing `Protocol.UndefinedError` when invoking `AshBilling.create_customer/2` or `AshBilling.create_checkout_session/2`.
 
 ## [v0.3.0] - 2026-10-27
