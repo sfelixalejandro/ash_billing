@@ -257,13 +257,19 @@ Guarantees deduplication across multi-node clusters (e.g., Fly.io, Kubernetes, A
 > [!IMPORTANT]
 > Distributed cross-node deduplication with atomic transaction-scoped advisory locks (`pg_try_advisory_xact_lock`) and row-level fencing (`FOR UPDATE NOWAIT`) is specifically implemented and verified for **PostgreSQL**. Non-PostgreSQL data layers (such as SQLite, MySQL, or ETS) rely on local node locks and do not provide distributed cross-node concurrency guarantees.
 
-Define a webhook event resource:
+Define a dedicated webhook event resource configured with `AshPostgres`:
 
 ```elixir
 defmodule MyApp.Billing.WebhookEvent do
   use Ash.Resource,
     domain: MyApp.Billing,
+    data_layer: AshPostgres.DataLayer,
     extensions: [AshBilling.WebhookEvent]
+
+  postgres do
+    table "webhook_events"
+    repo MyApp.Repo
+  end
 
   # WebhookEvent is an internal deduplication mechanism.
   # Its actions should remain internal to the system and must NOT be exposed
@@ -274,6 +280,11 @@ defmodule MyApp.Billing.WebhookEvent do
   end
 end
 ```
+
+> [!NOTE]
+> - **Internal resource**: `WebhookEvent` manages internal idempotency state (`event_id`, `status`, `lease_token`, `attempts`, `error`, etc.). Do not expose it to external clients.
+> - **Shared Repo pool**: Configured customer, subscription, and webhook event resources must use the same primary PostgreSQL Repo pool to ensure strict transactional integrity.
+> - **Domain & Migrations**: Register `MyApp.Billing.WebhookEvent` in your domain (e.g., `MyApp.Billing`) and generate and apply the PostgreSQL migration (`mix ash.codegen` / `mix ash.migrate`).
 
 Then configure it in your router:
 
