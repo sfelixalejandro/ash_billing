@@ -68,10 +68,8 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 
 ## Installation
 
-This branch prepares **0.4.0**, which is not published yet. See the
-[upgrade guide](documentation/topics/upgrading-to-0.4.md) before moving from 0.3.x.
-Pin a reviewed Git commit until the package is published.
-
+`ash_billing` is published on [Hex.pm](https://hex.pm/packages/ash_billing). See the
+[upgrade guide](documentation/topics/upgrading-to-0.4.md) when moving from 0.3.x.
 
 The recommended way to install `ash_billing` is using Igniter:
 

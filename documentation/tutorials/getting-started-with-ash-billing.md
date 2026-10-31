@@ -22,8 +22,6 @@ Igniter configures your customer and subscription resources, registers their dom
 
 Add `ash_billing` to your `mix.exs`:
 
-> Release preparation: 0.4.0 is not published yet; use a reviewed Git commit until publication.
-
 ```elixir
 def deps do
   [

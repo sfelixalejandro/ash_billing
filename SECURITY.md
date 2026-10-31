@@ -6,12 +6,12 @@ The `AshBilling` project takes the security of financial transactions, customer 
 
 ## Supported Versions
 
-Only the latest release receives security updates.
+Only the latest minor/patch releases receive security updates.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | Yes                |
-| < 0.1.0 | No                 |
+| 0.4.x   | Yes                |
+| < 0.4.0 | No                 |
 
 ---
 

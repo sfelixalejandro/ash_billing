@@ -2,12 +2,11 @@
 
 ## Release status and version choice
 
-0.4.0 is proposed, not published. Hex and the latest tag are 0.3.1 at preparation
-time. The pre-1.0 minor increment signals required consumer changes: wildcard
-inputs, Connect scope, supported Repo topology, migrations and retry-key semantics.
-Public function names largely remain stable; deployment behavior is not patch-compatible.
-Until publication, pin the reviewed main commit or release-preparation SHA in Git.
-Do not deploy a requirement for an unpublished Hex version.
+`ash_billing` 0.4.0 is published on Hex.pm. The pre-1.0 minor increment signals
+required consumer changes: wildcard inputs, Connect scope, supported Repo topology,
+migrations and retry-key semantics. Public function names largely remain stable;
+deployment behavior is not patch-compatible with 0.3.x. Pin `{:ash_billing, "~> 0.4.0"}`
+in `mix.exs`.
 
 ## Billing inputs and authorization
 
