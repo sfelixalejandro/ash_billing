@@ -252,7 +252,10 @@ end
 Zero-configuration in-memory ETS table with automatic 24-hour TTL cleanup. Ideal for single-server deployments and local development.
 
 ### 2. Database-Backed Resource (`:resource`)
-Guarantees deduplication across multi-node clusters (e.g., Fly.io, Kubernetes, AWS ECS) using an Ash resource backed by your database (PostgreSQL, SQLite, MySQL).
+Guarantees deduplication across multi-node clusters (e.g., Fly.io, Kubernetes, AWS ECS) using an Ash resource backed by PostgreSQL.
+
+> [!IMPORTANT]
+> Distributed cross-node deduplication with atomic transaction-scoped advisory locks (`pg_try_advisory_xact_lock`) and row-level fencing (`FOR UPDATE NOWAIT`) is specifically implemented and verified for **PostgreSQL**. Non-PostgreSQL data layers (such as SQLite, MySQL, or ETS) rely on local node locks and do not provide distributed cross-node concurrency guarantees.
 
 Define a webhook event resource:
 
@@ -262,6 +265,9 @@ defmodule MyApp.Billing.WebhookEvent do
     domain: MyApp.Billing,
     extensions: [AshBilling.WebhookEvent]
 
+  # WebhookEvent is an internal deduplication mechanism.
+  # Its actions should remain internal to the system and must NOT be exposed
+  # to untrusted clients via public APIs (AshJsonApi, AshGraphql, or unrestricted forms).
   actions do
     default_accept :*
     defaults [:read, :create, :update, :destroy]

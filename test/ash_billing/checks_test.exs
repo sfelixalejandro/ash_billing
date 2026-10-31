@@ -237,5 +237,27 @@ defmodule AshBilling.ChecksTest do
       assert {:error, _} = AshBilling.Checks.HasPrice.init(price: "   ")
       assert {:error, _} = AshBilling.Checks.HasPrice.init(price: 123)
     end
+
+    test "Ash resource with HasPrice without price: fails compilation" do
+      defmodule DynamicCompiler do
+        def compile_resource_with_empty_has_price do
+          Code.eval_string("""
+          defmodule AshBilling.Test.ResourceMissingPrice do
+            use Ash.Resource, domain: nil, authorizers: [Ash.Policy.Authorizer]
+
+            policies do
+              policy always() do
+                authorize_if AshBilling.Checks.HasPrice
+              end
+            end
+          end
+          """)
+        end
+      end
+
+      assert_raise Spark.Error.DslError, ~r/:price option is required for AshBilling.Checks.HasPrice/, fn ->
+        DynamicCompiler.compile_resource_with_empty_has_price()
+      end
+    end
   end
 end
