@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-31
+
+### Fixed
+
+- `AshBilling.Checks.HasPrice` now fails closed when `price:` is missing or invalid.
+- Invalid price configurations are rejected during Ash policy compilation.
+- Added authorization and policy-compilation regression tests.
+
+### Documentation
+
+- Clarified that `WebhookEvent` is an internal deduplication resource and must not be exposed through public APIs.
+- Documented PostgreSQL requirements for distributed webhook deduplication.
+- Updated installation and upgrade guidance for the published 0.4.x series.
+
+### Upgrade Notes
+
+- Applications using `HasPrice` without a valid `price:` must supply an explicit price or use `AshBilling.Checks.Subscribed` for any active subscription.
+- No database schema migration is introduced by this maintenance patch.
+
 ## [0.4.0] - 2026-10-30
 
 ### Upgrade requirements
