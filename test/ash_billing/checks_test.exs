@@ -255,9 +255,11 @@ defmodule AshBilling.ChecksTest do
         end
       end
 
-      assert_raise Spark.Error.DslError, ~r/:price option is required for AshBilling.Checks.HasPrice/, fn ->
-        DynamicCompiler.compile_resource_with_empty_has_price()
-      end
+      assert_raise Spark.Error.DslError,
+                   ~r/:price option is required for AshBilling.Checks.HasPrice/,
+                   fn ->
+                     DynamicCompiler.compile_resource_with_empty_has_price()
+                   end
     end
   end
 end
