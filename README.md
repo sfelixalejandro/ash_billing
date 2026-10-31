@@ -68,10 +68,8 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 
 ## Installation
 
-This branch prepares **0.4.0**, which is not published yet. See the
-[upgrade guide](documentation/topics/upgrading-to-0.4.md) before moving from 0.3.x.
-Pin a reviewed Git commit until the package is published.
-
+`ash_billing` is published on [Hex.pm](https://hex.pm/packages/ash_billing). See the
+[upgrade guide](documentation/topics/upgrading-to-0.4.md) when moving from 0.3.x.
 
 The recommended way to install `ash_billing` is using Igniter:
 
@@ -254,22 +252,39 @@ end
 Zero-configuration in-memory ETS table with automatic 24-hour TTL cleanup. Ideal for single-server deployments and local development.
 
 ### 2. Database-Backed Resource (`:resource`)
-Guarantees deduplication across multi-node clusters (e.g., Fly.io, Kubernetes, AWS ECS) using an Ash resource backed by your database (PostgreSQL, SQLite, MySQL).
+Guarantees deduplication across multi-node clusters (e.g., Fly.io, Kubernetes, AWS ECS) using an Ash resource backed by PostgreSQL.
 
-Define a webhook event resource:
+> [!IMPORTANT]
+> Distributed cross-node deduplication with atomic transaction-scoped advisory locks (`pg_try_advisory_xact_lock`) and row-level fencing (`FOR UPDATE NOWAIT`) is specifically implemented and verified for **PostgreSQL**. Non-PostgreSQL data layers (such as SQLite, MySQL, or ETS) rely on local node locks and do not provide distributed cross-node concurrency guarantees.
+
+Define a dedicated webhook event resource configured with `AshPostgres`:
 
 ```elixir
 defmodule MyApp.Billing.WebhookEvent do
   use Ash.Resource,
     domain: MyApp.Billing,
+    data_layer: AshPostgres.DataLayer,
     extensions: [AshBilling.WebhookEvent]
 
+  postgres do
+    table "webhook_events"
+    repo MyApp.Repo
+  end
+
+  # WebhookEvent is an internal deduplication mechanism.
+  # Its actions should remain internal to the system and must NOT be exposed
+  # to untrusted clients via public APIs (AshJsonApi, AshGraphql, or unrestricted forms).
   actions do
     default_accept :*
     defaults [:read, :create, :update, :destroy]
   end
 end
 ```
+
+> [!NOTE]
+> - **Internal resource**: `WebhookEvent` manages internal idempotency state (`event_id`, `status`, `lease_token`, `attempts`, `error`, etc.). Do not expose it to external clients.
+> - **Shared Repo pool**: Configured customer, subscription, and webhook event resources must use the same primary PostgreSQL Repo pool to ensure strict transactional integrity.
+> - **Domain & Migrations**: Register `MyApp.Billing.WebhookEvent` in your domain (e.g., `MyApp.Billing`) and generate and apply the PostgreSQL migration (`mix ash.codegen` / `mix ash.migrate`).
 
 Then configure it in your router:
 
