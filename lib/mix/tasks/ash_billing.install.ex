@@ -56,6 +56,8 @@ if Code.ensure_loaded?(Igniter) do
          mix ash.migrate
       4. For production, configure an AshBilling.WebhookEvent resource for persistent deduplication.
          If you use a custom Plug.Parsers body_reader, ensure it assigns the raw body.
+      5. Before recurring Checkout, create and persist the Customer with create_customer/2
+         and reload the authorized record. Recurring Checkout supports one line item.
       """)
     end
 

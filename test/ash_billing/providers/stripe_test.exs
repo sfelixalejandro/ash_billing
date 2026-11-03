@@ -340,7 +340,7 @@ defmodule AshBilling.Providers.StripeTest do
         )
       end)
 
-      opts = Keyword.merge(opts, subscription_item_id: "si_item_999")
+      opts = Keyword.merge(opts, subscription_item_id: "si_item_999", quantity: 1)
 
       assert {:ok, %{"id" => "sub_swap_123", "status" => "active"}} =
                Stripe.swap_plan("sub_swap_123", "price_enterprise", opts)
@@ -361,7 +361,7 @@ defmodule AshBilling.Providers.StripeTest do
               200,
               Jason.encode!(%{
                 "id" => "sub_auto_item",
-                "items" => %{"data" => [%{"id" => "si_auto_found"}]}
+                "items" => %{"data" => [%{"id" => "si_auto_found", "quantity" => 20}]}
               })
             )
 
@@ -371,6 +371,7 @@ defmodule AshBilling.Providers.StripeTest do
             assert body =~ "items%5B0%5D%5Bid%5D=si_auto_found"
             assert body =~ "items%5B0%5D%5Bprice%5D=price_new_pro"
             assert body =~ "proration_behavior=none"
+            assert body =~ "items%5B0%5D%5Bquantity%5D=20"
 
             conn
             |> Plug.Conn.put_resp_content_type("application/json")

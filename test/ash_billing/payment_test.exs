@@ -12,14 +12,17 @@ defmodule AshBilling.PaymentTest do
   defmodule PaymentFulfillmentHandler do
     def handle_event(%{"type" => "checkout.session.completed"} = event) do
       send(self(), {:fulfill_payment, event})
+      :ok
     end
 
     def handle_event(%{"type" => "invoice.payment_succeeded"} = event) do
       send(self(), {:invoice_paid, event})
+      :ok
     end
 
     def handle_event(%{"type" => "invoice.payment_failed"} = event) do
       send(self(), {:payment_failed_alert, event})
+      :ok
     end
 
     def handle_event(_), do: :ok
