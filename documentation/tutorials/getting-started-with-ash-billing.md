@@ -39,6 +39,8 @@ mix deps.get
 Configure your credentials in `config/runtime.exs`:
 
 ```elixir
+config :ash, default_string_length_count: :codepoints
+
 config :ash_billing,
   stripe_api_key: System.get_env("STRIPE_SECRET_KEY"),
   stripe_webhook_secret: System.get_env("STRIPE_WEBHOOK_SECRET")
@@ -201,7 +203,19 @@ The handler verifies signatures before synchronization. Initial customer associa
 
 ### 4.1 Initiating Checkout
 
-Redirect users to Stripe Checkout to collect payment details:
+First create and persist the Customer on an authorized, loaded user. Resolve tenant,
+account and credentials from server configuration, and pass the same billing scope
+to creation, reload and Checkout. Handle `{:persistence_failed, customer_id, reason}`
+by reconciling that remote identity before retrying; do not generate a new key.
+
+```elixir
+billing_opts = [actor: user, authorize?: true]
+{:ok, _customer_id} = AshBilling.create_customer(user, [persist: true] ++ billing_opts)
+user = Ash.get!(MyApp.Accounts.User, user.id, billing_opts)
+```
+
+Recurring Checkout rejects a missing customer ID and more than one line item before
+calling Stripe. Then redirect users to Checkout to collect payment details:
 
 ```elixir
 {:ok, session} =
@@ -262,3 +276,10 @@ AshBilling.verify_configuration!(
   webhook_secret: System.get_env("STRIPE_WEBHOOK_SECRET")
 )
 ```
+
+## Candidate 0.5.0-rc.1 behavior changes
+
+See [Upgrading to 0.4.2](../topics/upgrading-to-0.5.md) for quantity preservation,
+single-item scope, handler returns, rollback, and actor snapshot freshness. No schema
+migration is added by these changes. The customer and subscription actions must still
+satisfy the atomic-write and authorization contracts described in the resilience guide.

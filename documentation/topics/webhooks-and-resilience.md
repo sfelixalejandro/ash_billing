@@ -403,6 +403,42 @@ if necessary replay with their original explicit idempotency key. A new automati
 key can create an orphan provider customer when retrying an old, unpersisted request.
 The persistent customer association CAS remains authoritative and is not weakened.
 
-See the [final hardening evidence and release assessment](https://github.com/sfelixalejandro/ash_billing/blob/fc5d38c5d131a20ab338ab362e083922dce04ff5/documentation/topics/final-security-hardening.md).
-Earlier F1–F6 and commit-remediation reports are historical evidence, not the final
-status of U1–U4 or the Bandit dependency audit.
+
+## Candidate 0.5.0-rc.1: processing failure and rollback
+
+A returned synchronization error now rolls back its PostgreSQL mutations, including
+an initial customer association made before a later ownership conflict. The Plug
+processes synchronization, synchronous handler SQL and durable completion in the
+configured shared primary Repo transaction. It records/releases a failed lease only
+after rollback. A response is sent after the transaction or failure recording
+completes. Failure-recording COMMIT errors still yield 5xx; cleanup makes one bounded
+additional attempt for a transient transaction failure, without converting that
+request into a success. Raw `sync_event/2` also rolls back returned errors; in a
+caller-owned transaction this rolls back the owning transaction.
+
+Raw `with_lease/4` callbacks returning `{:error, reason}` now propagate the error,
+rather than returning `{:ok, {:error, reason}}`; PostgreSQL mutations roll back.
+The raw caller owns releasing the lease after rollback and acknowledging outer commit.
+The Plug does both. Advisory locks, tokens and row fencing remain in effect.
+
+Handlers must return `:ok` or `{:ok, value}` for success and `{:error, reason}` for a
+business failure. Other returns, raised exceptions and thrown/exited failures are
+errors. Database rollback cannot undo external calls. Keep stable event/effect keys
+or a transactional outbox. Spawned work is not covered by this transaction. For memory
+dedupe with PostgreSQL billing resources, memory completion waits until billing commit;
+it is still not durable and cannot make completion atomic with PostgreSQL.
+
+Multi-item nonterminal snapshots, including live reconciliation responses, return
+`:unsupported_subscription_items` before a partial price is written. New unsupported
+subscriptions have no local entitlement. Existing ones retain their **last supported**
+snapshot, including any previous entitlement. This policy is deliberately not a fresh
+representation of the unsupported subscription: monitor errors and repair/migrate the
+external subscription or apply a separate application access restriction. Terminal
+events still cancel access and store no selected price. Repeated delivery does not
+repair an unsupported model. Full multi-item entitlements require a future model change.
+
+Loaded actor subscriptions and tombstones are snapshots. Refresh the user record and
+load subscriptions at the authenticated request/job boundary if immediate revocation
+is required; reuse the refreshed actor within that operation. The policy checks do
+not perform a new DB query for each invocation. Tenant/ownership authorization of
+target resources remains separate.

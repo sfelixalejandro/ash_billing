@@ -152,16 +152,19 @@ defmodule MyAppWeb.BillingController do
   def subscribe(conn, %{"price_id" => price_id}) do
     user = conn.assigns.current_user
 
-    case AshBilling.create_checkout_session(user,
+    billing_opts = [actor: user, authorize?: true]
+
+    with {:ok, _id} <- AshBilling.create_customer(user, [persist: true] ++ billing_opts),
+         {:ok, user} <- Ash.get(MyApp.Accounts.User, user.id, billing_opts),
+         {:ok, session} <- AshBilling.create_checkout_session(user,
       mode: "subscription",
       line_items: [%{price: price_id, quantity: 1}],
       success_url: url(~p"/dashboard?billing=success"),
       cancel_url: url(~p"/pricing?billing=canceled")
     ) do
-      {:ok, session} ->
-        redirect(conn, external: session.url)
-
-      {:error, reason} ->
+      redirect(conn, external: session.url)
+    else
+      {:error, _reason} ->
         conn
         |> put_flash(:error, "Failed to initiate checkout.")
         |> redirect(to: ~p"/pricing")
@@ -216,3 +219,12 @@ defmodule MyApp.Analytics.Report do
   end
 end
 ```
+
+## Candidate 0.5.0-rc.1 integration contract
+
+The recurring flow persists a Customer before offering Checkout. Resolve price IDs
+from a server-controlled catalog and carry the same trusted tenant/account options
+through creation, reload and Checkout. One recurring line is supported. Handle
+`{:persistence_failed, customer_id, reason}` by reconciling that identity before retry.
+See [the candidate upgrade guide](../../documentation/topics/upgrading-to-0.5.md)
+for quantity preservation, SQL rollback, handler returns and actor freshness.

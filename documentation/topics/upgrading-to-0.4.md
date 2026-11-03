@@ -108,7 +108,6 @@ registered HTTPS test endpoint resend procedure. Do not equate local HMAC replay
 or `stripe listen` with a resend initiated by Stripe to a registered endpoint.
 Never publish test payloads, signing secrets, cookies or Checkout/Portal access URLs.
 
-See [webhook operational guarantees](webhooks-and-resilience.md) and the historical
-[F1–F6](https://github.com/sfelixalejandro/ash_billing/blob/fc5d38c5d131a20ab338ab362e083922dce04ff5/documentation/topics/security-remediation.md), [commit/fencing](https://github.com/sfelixalejandro/ash_billing/blob/fc5d38c5d131a20ab338ab362e083922dce04ff5/documentation/topics/webhook-commit-remediation.md) and
-[final hardening](https://github.com/sfelixalejandro/ash_billing/blob/fc5d38c5d131a20ab338ab362e083922dce04ff5/documentation/topics/final-security-hardening.md) reports. Their past test counts and
-branch status describe their own runs, not this release-preparation CI.
+See [webhook operational guarantees](webhooks-and-resilience.md) for supported
+behavior and operational requirements. Historical validation runs do not certify a
+new release candidate.

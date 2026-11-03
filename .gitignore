@@ -26,3 +26,14 @@ ash_billing-*.tar
 # Editor / OS files
 .elixir_ls/
 .DS_Store
+
+# Private review material and local environment files.
+/audit/
+.env
+.env.*
+!.env.example
+!.env.sample
+/*.log
+
+# Python cache for the optional integration launcher.
+__pycache__/
