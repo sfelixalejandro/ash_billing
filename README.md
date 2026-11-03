@@ -68,6 +68,11 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 
 ## Installation
 
+This branch prepares **0.5.0-rc.1**, which is not published yet. The Hex installation
+below targets the existing 0.4.x release and does not include the candidate's changes.
+To evaluate this working tree locally, use the
+[isolated Stripe Test Mode consumer](documentation/topics/stripe-test-mode.md).
+
 `ash_billing` is published on [Hex.pm](https://hex.pm/packages/ash_billing). See the
 [upgrade guide](documentation/topics/upgrading-to-0.4.md) when moving from 0.3.x.
 
@@ -167,8 +172,18 @@ end
 
 ### Create a Customer
 ```elixir
-{:ok, customer_id} = AshBilling.create_customer(user)
+# user must be an authorized, persisted resource in the trusted billing scope.
+billing_opts = [actor: user, authorize?: true]
+{:ok, customer_id} = AshBilling.create_customer(user, [persist: true] ++ billing_opts)
+user = Ash.get!(MyApp.Accounts.User, user.id, billing_opts)
 ```
+
+Recurring Checkout requires an associated Customer. A missing ID returns
+`{:error, :no_customer_id}` before calling Stripe. Create/persist once as above and
+reload the record; concurrent creation uses the same automatic idempotency key and
+conditional association. Keep tenant/account/environment options server-controlled.
+If persistence fails after remote creation, the returned
+`{:persistence_failed, customer_id, reason}` contains the identity for reconciliation.
 
 ### Start a Checkout Session
 ```elixir
@@ -348,3 +363,30 @@ config :ash_billing,
 ## License
 
 MIT License. Copyright (c) 2026 Alejandro Felix.
+
+## Billing lifecycle hardening (candidate 0.5.0-rc.1)
+
+Recurring subscriptions support exactly one line item. Multiple subscription lines
+are rejected before Checkout; multi-item nonterminal webhooks return an error and
+retain the last supported local snapshot. Terminal events still revoke access.
+Payment-mode Checkout can have multiple lines and does not guarantee Customer
+creation, payment success, or fulfillment.
+
+Plan changes preserve quantity by fetching the selected item when necessary.
+Only an explicit item ID plus a positive integer quantity avoids that GET; ambiguous
+items and unknown quantities fail safely.
+
+Custom webhook handlers must return `:ok`, `{:ok, value}`, or `{:error, reason}`.
+Other values and exceptions fail instead of marking an event processed. Shared-Repo
+PostgreSQL writes roll back on processing failure; remote effects remain at-least-once.
+
+See [the candidate 0.5.0-rc.1 upgrade guide](documentation/topics/upgrading-to-0.5.md)
+for behavior changes, unsupported external subscriptions, actor freshness and retry
+responsibilities. This is an unreleased candidate; it introduces no schema migration.
+
+## Stripe Test Mode validation
+
+The optional [isolated consumer](documentation/topics/stripe-test-mode.md) exercises real
+Stripe test requests, Checkout and signed CLI-forwarded webhooks separately from
+normal tests. Its local replay and PostgreSQL fault-injection scenarios are labeled
+as simulations. Credentials, event payloads and run evidence remain local.

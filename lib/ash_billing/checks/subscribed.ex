@@ -4,6 +4,12 @@ defmodule AshBilling.Checks.Subscribed do
 
   Can be used as a simple check without options, or with a `:price` option to require a specific tier.
 
+  Loaded actors are snapshots: this check does not reload their subscriptions or
+  deletion tombstone. Refresh the actor and its subscriptions at a trusted request
+  or job boundary when revocation freshness matters. Reuse that snapshot for checks
+  within the operation; no extra database query is added to each authorization.
+  This check does not replace ownership or tenant policies on the target resource.
+
   ## Usage
 
       policies do

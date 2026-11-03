@@ -84,7 +84,8 @@ defmodule AshBilling.WebhookSync do
               _ ->
                 {:ok, :ignored}
             end
-          end
+          end,
+          rollback_on_error?: true
         )
 
       case result do
@@ -125,7 +126,7 @@ defmodule AshBilling.WebhookSync do
       sub_id = object["id"]
       stripe_cust_id = extract_customer_id(Map.take(object, ["customer"]))
       status = normalize_status(object["status"])
-      price_id = extract_price_id(object)
+      price_id = if multiple_subscription_items?(object), do: nil, else: extract_price_id(object)
       current_period_end = extract_current_period_end(object)
       trial_ends_at = extract_trial_ends_at(object)
       cancel_at_period_end = Map.get(object, "cancel_at_period_end", false)
@@ -149,7 +150,8 @@ defmodule AshBilling.WebhookSync do
 
       ash_opts = ash_options(domain, opts)
 
-      with {:ok, customer} <- find_customer(customer_resource, stripe_cust_id, object, ash_opts),
+      with :ok <- validate_subscription_items(object),
+           {:ok, customer} <- find_customer(customer_resource, stripe_cust_id, object, ash_opts),
            {:ok, existing} <-
              fetch_existing_subscription(subscription_resource, sub_id, ash_opts),
            :ok <- validate_subscription_customer(existing, customer, subscription_resource) do
@@ -215,7 +217,13 @@ defmodule AshBilling.WebhookSync do
 
           # A terminal notification must not be replaced by a same-second live snapshot.
           existing && terminal_status?(status) ->
-            update_subscription_safely(subscription_resource, existing, attrs, event_dt, ash_opts)
+            update_subscription_safely(
+              subscription_resource,
+              existing,
+              attrs,
+              event_dt,
+              ash_opts
+            )
 
           # Conflicting status transition protection:
           # If transitioning backwards from :past_due / :unpaid to :active, reconcile with provider.
@@ -435,47 +443,54 @@ defmodule AshBilling.WebhookSync do
 
     case provider.get_subscription(sub_id, opts) do
       {:ok, live_sub} when is_map(live_sub) ->
-        live_status = normalize_status(live_sub["status"])
-        live_price_id = extract_price_id(live_sub)
-        live_current_period_end = extract_current_period_end(live_sub)
-        live_trial_ends_at = extract_trial_ends_at(live_sub)
-        live_cancel_at_period_end = Map.get(live_sub, "cancel_at_period_end", false)
-        live_cancel_at = extract_cancel_at(live_sub)
+        if validate_subscription_items(live_sub) != :ok do
+          {:error, :unsupported_subscription_items}
+        else
+          live_status = normalize_status(live_sub["status"])
 
-        require Logger
+          live_price_id =
+            if multiple_subscription_items?(live_sub), do: nil, else: extract_price_id(live_sub)
 
-        Logger.info(
-          "AshBilling.WebhookSync: Reconciled subscription #{inspect(sub_id)} with provider. Authoritative live status: #{inspect(live_status)}"
-        )
+          live_current_period_end = extract_current_period_end(live_sub)
+          live_trial_ends_at = extract_trial_ends_at(live_sub)
+          live_cancel_at_period_end = Map.get(live_sub, "cancel_at_period_end", false)
+          live_cancel_at = extract_cancel_at(live_sub)
 
-        reconciled_attrs =
-          attrs
-          |> Map.put(:status, live_status)
-          |> Map.put(:price_id, live_price_id)
-          |> Map.put(:current_period_end, live_current_period_end)
-          |> Map.put(:cancel_at_period_end, live_cancel_at_period_end)
-          |> then(fn a ->
-            if Ash.Resource.Info.attribute(subscription_resource, :cancel_at) != nil do
-              Map.put(a, :cancel_at, live_cancel_at)
-            else
-              a
-            end
-          end)
-          |> then(fn a ->
-            if Ash.Resource.Info.attribute(subscription_resource, :trial_ends_at) != nil do
-              Map.put(a, :trial_ends_at, live_trial_ends_at)
-            else
-              a
-            end
-          end)
+          require Logger
 
-        update_subscription_safely(
-          subscription_resource,
-          existing,
-          reconciled_attrs,
-          event_dt,
-          ash_opts
-        )
+          Logger.info(
+            "AshBilling.WebhookSync: Reconciled subscription #{inspect(sub_id)} with provider. Authoritative live status: #{inspect(live_status)}"
+          )
+
+          reconciled_attrs =
+            attrs
+            |> Map.put(:status, live_status)
+            |> Map.put(:price_id, live_price_id)
+            |> Map.put(:current_period_end, live_current_period_end)
+            |> Map.put(:cancel_at_period_end, live_cancel_at_period_end)
+            |> then(fn a ->
+              if Ash.Resource.Info.attribute(subscription_resource, :cancel_at) != nil do
+                Map.put(a, :cancel_at, live_cancel_at)
+              else
+                a
+              end
+            end)
+            |> then(fn a ->
+              if Ash.Resource.Info.attribute(subscription_resource, :trial_ends_at) != nil do
+                Map.put(a, :trial_ends_at, live_trial_ends_at)
+              else
+                a
+              end
+            end)
+
+          update_subscription_safely(
+            subscription_resource,
+            existing,
+            reconciled_attrs,
+            event_dt,
+            ash_opts
+          )
+        end
 
       {:error, reconcile_reason} ->
         require Logger
@@ -916,6 +931,21 @@ defmodule AshBilling.WebhookSync do
   defp extract_customer_id(%{"id" => id}) when is_binary(id), do: id
   defp extract_customer_id(id) when is_binary(id), do: id
   defp extract_customer_id(_), do: nil
+
+  # Unsupported active snapshots are rejected, preserving the last supported
+  # snapshot. Terminal events still revoke access without choosing a price.
+  defp validate_subscription_items(object) do
+    if multiple_subscription_items?(object) and not terminal_status?(object["status"]),
+      do: {:error, :unsupported_subscription_items},
+      else: :ok
+  end
+
+  defp multiple_subscription_items?(%{"items" => %{"data" => items} = collection})
+       when is_list(items) do
+    length(items) > 1 or collection["has_more"] == true
+  end
+
+  defp multiple_subscription_items?(_), do: false
 
   defp extract_price_id(%{"items" => %{"data" => [%{"price" => %{"id" => id}} | _]}})
        when is_binary(id),

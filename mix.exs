@@ -1,7 +1,7 @@
 defmodule AshBilling.MixProject do
   use Mix.Project
 
-  @version "0.4.1"
+  @version "0.5.0-rc.1"
   @description "Declarative billing, subscriptions, and payment providers for the Ash Framework."
   @source_url "https://github.com/sfelixalejandro/ash_billing"
 
@@ -94,10 +94,12 @@ defmodule AshBilling.MixProject do
   defp docs do
     [
       main: "readme",
-      source_ref: "v#{@version}",
+      source_ref: "fix/v0.4.2-production-hardening",
       extra_section: "GUIDES",
       extras: [
         {"documentation/topics/upgrading-to-0.4.md", title: "Upgrading to 0.4"},
+        {"documentation/topics/upgrading-to-0.5.md", title: "Upgrading to candidate 0.5.0"},
+        {"documentation/topics/stripe-test-mode.md", title: "Stripe Test Mode validation"},
         {"README.md", title: "Home"},
         {"documentation/tutorials/getting-started-with-ash-billing.md",
          title: "Getting Started with AshBilling"},

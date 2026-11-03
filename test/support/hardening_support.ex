@@ -239,3 +239,26 @@ end
 defimpl Ash.ToTenant, for: AshBilling.Test.TenantRef do
   def to_tenant(%{value: tenant}, _resource), do: tenant
 end
+
+defmodule AshBilling.Test.NoUpdateCustomer do
+  use Ash.Resource,
+    domain: AshBilling.Test.PersistenceDomain,
+    data_layer: Ash.DataLayer.Ets,
+    extensions: [AshBilling.Resource]
+
+  attributes do
+    uuid_primary_key :id
+  end
+
+  actions do
+    defaults [:read, :create]
+  end
+end
+
+defmodule AshBilling.Test.PersistenceDomain do
+  use Ash.Domain, validate_config_inclusion?: false
+
+  resources do
+    resource AshBilling.Test.NoUpdateCustomer
+  end
+end

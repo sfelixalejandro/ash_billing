@@ -52,6 +52,15 @@ defmodule AshBilling.EndToEndTest do
 
       assert user.stripe_customer_id == nil
 
+      # Establish one persisted customer before offering recurring Checkout.
+      Req.Test.stub(stub_name, fn conn ->
+        assert conn.request_path == "/v1/customers"
+        Req.Test.json(conn, %{"id" => "cus_stripe_e2e_founder"})
+      end)
+
+      assert {:ok, "cus_stripe_e2e_founder"} = AshBilling.create_customer(user, opts)
+      user = Ash.get!(User, user.id, domain: Domain)
+
       # 2. User starts checkout
       Req.Test.stub(stub_name, fn conn ->
         conn

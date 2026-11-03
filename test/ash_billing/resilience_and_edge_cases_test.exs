@@ -507,7 +507,9 @@ defmodule AshBilling.ResilienceAndEdgeCasesTest do
               Jason.encode!(%{
                 "id" => "sub_hl_100",
                 "items" => %{
-                  "data" => [%{"id" => "si_hl_item", "price" => %{"id" => "price_old"}}]
+                  "data" => [
+                    %{"id" => "si_hl_item", "quantity" => 1, "price" => %{"id" => "price_old"}}
+                  ]
                 }
               })
 

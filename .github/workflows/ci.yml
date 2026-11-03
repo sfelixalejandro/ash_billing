@@ -65,6 +65,10 @@ jobs:
       - name: Compile with warnings as errors
         run: mix compile --warnings-as-errors
 
+      - name: Compile production library
+        if: matrix.elixir == '1.18'
+        run: MIX_ENV=prod mix compile --warnings-as-errors
+
       - name: Run test suite with coverage
         env:
           POSTGRES_USER: postgres
@@ -80,3 +84,15 @@ jobs:
           mix hex.audit
           mix docs --warnings-as-errors
           mix hex.build
+
+      - name: Compile isolated billing consumer without Stripe credentials
+        if: matrix.elixir == '1.18'
+        working-directory: examples/stripe_test_mode
+        run: |
+          mix deps.get
+          mix compile --warnings-as-errors
+          mix test --no-start
+
+      - name: Verify offline Stripe launcher safety
+        if: matrix.elixir == '1.18'
+        run: python3 -m unittest discover -s examples/stripe_test_mode -p 'test_*.py'

@@ -30,12 +30,34 @@ defmodule AshBilling do
   Automatic idempotency keys include the resource, canonical tenant and record ID.
   An explicit `:idempotency_key` is preserved. Callers must authorize the record
   and supply tenant/actor options for persistence as appropriate to their application.
+
+  `persist: true` requires a loaded Ash record and an update action; missing
+  prerequisites return an error before contacting the provider. A later write
+  failure returns `{:error, {:persistence_failed, customer_id, reason}}` so the
+  remote identity can be reconciled. `persist: false` only creates remotely.
+  Reload the record before using it for recurring Checkout. Existing IDs are
+  returned without a provider call; callers remain responsible for authorization.
   """
   @spec create_customer(struct() | map(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
   def create_customer(record_or_params, opts \\ [])
 
   def create_customer(%resource{} = record, opts) do
+    with :ok <- validate_customer_tenant(record, opts) do
+      do_create_customer(resource, record, opts)
+    end
+  end
+
+  def create_customer(params, opts) when is_map(params) do
+    if Keyword.get(opts, :persist, Keyword.get(opts, :persist?)) == true do
+      {:error, :invalid_customer_resource}
+    else
+      provider = Keyword.get(opts, :provider, Stripe)
+      provider.create_customer(params, opts)
+    end
+  end
+
+  defp do_create_customer(resource, record, opts) do
     provider = Keyword.get(opts, :provider, ResourceInfo.provider(resource))
     existing_id = customer_id(record)
 
@@ -66,32 +88,26 @@ defmodule AshBilling do
             opts
           end
 
-        with {:ok, customer_id} <- provider.create_customer(params, opts) do
-          persist_opt = Keyword.get(opts, :persist, Keyword.get(opts, :persist?))
+        persist_opt = Keyword.get(opts, :persist, Keyword.get(opts, :persist?))
 
-          should_persist? =
-            cond do
-              persist_opt == false -> false
-              persist_opt == true -> true
-              persisted_record?(record) -> true
-              true -> false
-            end
+        should_persist? =
+          persist_opt == true or (persist_opt != false and persisted_record?(record))
 
-          if should_persist? and Ash.Resource.Info.resource?(resource) and
-               has_update_action?(resource) do
-            domain = Keyword.get(opts, :domain, Ash.Resource.Info.domain(resource))
-
+        with :ok <- validate_customer_persistence(resource, record, should_persist?),
+             {:ok, customer_id} <- provider.create_customer(params, opts) do
+          if should_persist? do
             ash_opts =
               opts
               |> Keyword.take([:actor, :tenant])
-              |> Keyword.merge(domain: domain, authorize?: Keyword.get(opts, :authorize?, false))
+              |> Keyword.put(:tenant, customer_tenant(record, opts))
+              |> Keyword.merge(
+                domain: Keyword.get(opts, :domain, Ash.Resource.Info.domain(resource)),
+                authorize?: Keyword.get(opts, :authorize?, false)
+              )
 
             case AshBilling.WebhookSync.associate_customer(record, customer_id, ash_opts) do
-              {:ok, _updated} ->
-                {:ok, customer_id}
-
-              {:error, reason} ->
-                {:error, {:persistence_failed, customer_id, reason}}
+              {:ok, _updated} -> {:ok, customer_id}
+              {:error, reason} -> {:error, {:persistence_failed, customer_id, reason}}
             end
           else
             {:ok, customer_id}
@@ -100,13 +116,17 @@ defmodule AshBilling do
     end
   end
 
-  def create_customer(params, opts) when is_map(params) do
-    provider = Keyword.get(opts, :provider, Stripe)
-    provider.create_customer(params, opts)
-  end
-
   @doc """
   Creates a checkout session for a customer.
+
+  Recurring Checkout requires an existing customer ID and exactly one line item.
+  Create and persist the customer first with `create_customer/2`, then reload
+  the record (or pass the returned ID with trusted ownership metadata). Missing
+  customer IDs return `{:error, :no_customer_id}` before any provider call.
+  Multiple subscription lines return `{:error, :unsupported_subscription_items}`.
+  Payment Checkout can have several lines and no Customer; it does not itself
+  confirm payment or fulfill an order. Record ownership metadata and client
+  references are bound to that record and cannot be replaced by options.
 
   ## Options
 
@@ -121,19 +141,64 @@ defmodule AshBilling do
   @spec create_checkout_session(struct() | String.t(), keyword()) ::
           {:ok, %{url: String.t(), id: String.t()}} | {:error, term()}
   def create_checkout_session(record_or_customer_id, opts) do
+    mode = Keyword.get(opts, :mode, "subscription")
+
+    with :ok <- validate_customer_tenant(record_or_customer_id, opts),
+         {:ok, line_items} <- checkout_line_items(opts),
+         :ok <- validate_checkout(mode, line_items, record_or_customer_id, opts) do
+      do_create_checkout_session(
+        record_or_customer_id,
+        Keyword.put(opts, :line_items, line_items)
+      )
+    end
+  end
+
+  defp checkout_line_items(opts) do
+    case Keyword.get(opts, :line_items) do
+      nil ->
+        case Keyword.get(opts, :price) do
+          price when is_binary(price) and price != "" ->
+            {:ok, [%{price: price, quantity: Keyword.get(opts, :quantity, 1)}]}
+
+          _ ->
+            {:error, :invalid_price}
+        end
+
+      [_ | _] = items ->
+        {:ok, items}
+
+      _ ->
+        {:error, :invalid_line_items}
+    end
+  end
+
+  defp validate_checkout(mode, items, record, opts) do
+    cond do
+      mode not in [:subscription, "subscription", :payment, "payment"] ->
+        {:error, :invalid_mode}
+
+      not is_binary(Keyword.get(opts, :success_url)) or Keyword.get(opts, :success_url) == "" ->
+        {:error, :invalid_success_url}
+
+      not is_binary(Keyword.get(opts, :cancel_url)) or Keyword.get(opts, :cancel_url) == "" ->
+        {:error, :invalid_cancel_url}
+
+      mode in [:subscription, "subscription"] and length(items) != 1 ->
+        {:error, :unsupported_subscription_items}
+
+      mode in [:subscription, "subscription"] and resolve_customer_id(record) in [nil, ""] ->
+        {:error, :no_customer_id}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp do_create_checkout_session(record_or_customer_id, opts) do
     cust_id = resolve_customer_id(record_or_customer_id)
     provider = resolve_provider(record_or_customer_id, opts)
 
-    line_items =
-      case Keyword.get(opts, :line_items) do
-        items when is_list(items) ->
-          items
-
-        nil ->
-          price = Keyword.fetch!(opts, :price)
-          quantity = Keyword.get(opts, :quantity, 1)
-          [%{price: price, quantity: quantity}]
-      end
+    line_items = Keyword.fetch!(opts, :line_items)
 
     resource_id =
       case record_or_customer_id do
@@ -151,12 +216,12 @@ defmodule AshBilling do
 
     metadata =
       if resource_id do
-        Map.put_new(custom_metadata, "resource_id", resource_id)
+        custom_metadata |> Map.delete(:resource_id) |> Map.put("resource_id", resource_id)
       else
         custom_metadata
       end
 
-    client_ref_id = Keyword.get(opts, :client_reference_id, resource_id)
+    client_ref_id = resource_id || Keyword.get(opts, :client_reference_id)
 
     params =
       %{
@@ -176,8 +241,19 @@ defmodule AshBilling do
       |> then(fn p ->
         if to_string(p.mode) == "subscription" do
           existing_sub_data = Keyword.get(opts, :subscription_data, %{}) |> Enum.into(%{})
-          sub_metadata = Map.get(existing_sub_data, :metadata, %{}) |> Map.merge(metadata)
-          sub_data = Map.put(existing_sub_data, :metadata, sub_metadata)
+
+          sub_metadata =
+            existing_sub_data
+            |> Map.get(:metadata, Map.get(existing_sub_data, "metadata", %{}))
+            |> Enum.into(%{})
+            |> then(fn values ->
+              if resource_id, do: Map.delete(values, :resource_id), else: values
+            end)
+            |> Map.merge(metadata)
+
+          sub_data =
+            existing_sub_data |> Map.delete("metadata") |> Map.put(:metadata, sub_metadata)
+
           Map.put(p, :subscription_data, sub_data)
         else
           p
@@ -287,11 +363,15 @@ defmodule AshBilling do
   @doc """
   Swaps a subscription to a new price/plan in the billing provider.
 
+  Stripe preserves the current quantity unless an explicit positive integer is
+  supplied. Multiple items require an explicit item ID; missing quantities and
+  ambiguous or truncated item collections return errors instead of guessing.
+
   ## Options
 
     * `:proration_behavior` - `"create_prorations"` (default), `"none"`, or `"always_invoice"`.
-    * `:subscription_item_id` - Explicit Stripe subscription item ID (avoids an extra GET call if known).
-    * `:quantity` - Updated quantity for the new price.
+    * `:subscription_item_id` - Explicit Stripe item ID. Avoids GET only with an explicit quantity.
+    * `:quantity` - Positive integer override; otherwise the current quantity is fetched and preserved.
     * `:proration_date` - Unix timestamp to use for calculating prorations.
     * `:provider` - The billing provider module.
   """
@@ -328,7 +408,14 @@ defmodule AshBilling do
   """
   @spec update_quantity(struct() | String.t(), pos_integer(), keyword()) ::
           {:ok, map()} | {:error, term()}
-  def update_quantity(subscription_or_id, quantity, opts \\ []) do
+  def update_quantity(subscription_or_id, quantity, opts \\ [])
+
+  def update_quantity(_subscription_or_id, quantity, _opts)
+      when not is_integer(quantity) or quantity <= 0 do
+    {:error, :invalid_quantity}
+  end
+
+  def update_quantity(subscription_or_id, quantity, opts) do
     opts =
       Keyword.put_new(opts, :provider, resolve_subscription_provider(subscription_or_id, opts))
 
@@ -343,15 +430,8 @@ defmodule AshBilling do
           {:ok, %{"items" => %{"data" => items}} = body} when is_list(items) ->
             requested_item_id = Keyword.get(opts, :subscription_item_id)
 
-            item =
-              if requested_item_id do
-                Enum.find(items, &(&1["id"] == requested_item_id))
-              else
-                List.first(items)
-              end
-
-            case item do
-              %{"id" => item_id, "price" => %{"id" => price_id}} ->
+            case Stripe.select_subscription_item(body, requested_item_id) do
+              {:ok, %{"id" => item_id, "price" => %{"id" => price_id}}} ->
                 swap_plan(
                   sub_id,
                   price_id,
@@ -359,6 +439,9 @@ defmodule AshBilling do
                   |> Keyword.put(:subscription_item_id, item_id)
                   |> Keyword.put(:quantity, quantity)
                 )
+
+              {:error, reason} ->
+                {:error, reason}
 
               _ ->
                 {:error, {:missing_subscription_item, body}}
@@ -457,9 +540,7 @@ defmodule AshBilling do
   defp on_trial?(_), do: false
 
   defp customer_idempotency_key(resource, record, opts) do
-    metadata = Map.get(record, :__metadata__) || %{}
-    tenant = Keyword.get(opts, :tenant, metadata[:tenant])
-    tenant = Ash.ToTenant.to_tenant(tenant, resource)
+    tenant = customer_tenant(record, opts)
     digest = :crypto.hash(:sha256, :erlang.term_to_binary({resource, tenant, record.id}))
     "ash_cust_" <> Base.encode16(digest, case: :lower)
   end
@@ -493,7 +574,11 @@ defmodule AshBilling do
   end
 
   @doc """
-  Performs pre-flight configuration and resource health diagnostics.
+  Performs partial structural configuration diagnostics.
+
+  Absent credentials remain accepted for compatibility. This does not establish
+  production readiness, contact Stripe, or verify migrations, database access,
+  authorization, persistence actions, or account/tenant routing.
 
   Verifies that billing customer resources, subscription resources, and API credentials
   are properly configured and compliant with AshBilling requirements.
@@ -648,10 +733,45 @@ defmodule AshBilling do
     end
   end
 
-  defp has_update_action?(resource) do
-    Ash.Resource.Info.primary_action(resource, :update) != nil or
-      Ash.Resource.Info.action(resource, :update) != nil
-  rescue
-    _ -> false
+  defp customer_tenant(%resource{} = record, opts) do
+    tenant =
+      case Keyword.get(opts, :tenant) do
+        nil -> Ash.Resource.get_metadata(record, :tenant)
+        tenant -> tenant
+      end
+
+    Ash.ToTenant.to_tenant(tenant, resource)
+  end
+
+  defp validate_customer_tenant(%resource{} = record, opts) do
+    loaded_tenant = Ash.Resource.get_metadata(record, :tenant)
+    requested_tenant = Keyword.get(opts, :tenant)
+
+    if not is_nil(loaded_tenant) and not is_nil(requested_tenant) and
+         Ash.ToTenant.to_tenant(loaded_tenant, resource) !=
+           Ash.ToTenant.to_tenant(requested_tenant, resource),
+       do: {:error, :customer_tenant_mismatch},
+       else: :ok
+  end
+
+  defp validate_customer_tenant(_id, _opts), do: :ok
+
+  defp validate_customer_persistence(_resource, _record, false), do: :ok
+
+  defp validate_customer_persistence(resource, record, true) do
+    cond do
+      not Ash.Resource.Info.resource?(resource) ->
+        {:error, :invalid_customer_resource}
+
+      not persisted_record?(record) ->
+        {:error, :persisted_customer_required}
+
+      Ash.Resource.Info.primary_action(resource, :update) == nil and
+          Ash.Resource.Info.action(resource, :update) == nil ->
+        {:error, :update_action_required}
+
+      true ->
+        :ok
+    end
   end
 end

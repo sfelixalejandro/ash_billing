@@ -134,12 +134,9 @@ defmodule AshBilling.Providers.Stripe do
     req = build_req(opts)
     proration_behavior = Keyword.get(opts, :proration_behavior, "create_prorations")
 
-    with {:ok, item_id} <- resolve_subscription_item_id(subscription_id, opts) do
-      item_params =
-        %{"id" => item_id, "price" => new_price_id}
-        |> then(fn p ->
-          if qty = Keyword.get(opts, :quantity), do: Map.put(p, "quantity", qty), else: p
-        end)
+    with :ok <- validate_quantity_option(opts),
+         {:ok, item_id, quantity} <- resolve_subscription_item(subscription_id, opts) do
+      item_params = %{"id" => item_id, "price" => new_price_id, "quantity" => quantity}
 
       params =
         %{
@@ -167,22 +164,57 @@ defmodule AshBilling.Providers.Stripe do
     end
   end
 
-  defp resolve_subscription_item_id(subscription_id, opts) when is_list(opts) do
-    case Keyword.get(opts, :subscription_item_id) do
-      item_id when is_binary(item_id) and item_id != "" ->
-        {:ok, item_id}
+  defp validate_quantity_option(opts) do
+    case Keyword.fetch(opts, :quantity) do
+      :error -> :ok
+      {:ok, quantity} when is_integer(quantity) and quantity > 0 -> :ok
+      _ -> {:error, :invalid_quantity}
+    end
+  end
+
+  defp resolve_subscription_item(subscription_id, opts) do
+    item_id = Keyword.get(opts, :subscription_item_id)
+
+    # An explicit item AND quantity fully specify the mutation. Otherwise read
+    # once, both to select the item and to preserve its existing quantity.
+    if is_binary(item_id) and item_id != "" and Keyword.has_key?(opts, :quantity) do
+      {:ok, item_id, Keyword.fetch!(opts, :quantity)}
+    else
+      with {:ok, body} <- get_subscription(subscription_id, opts),
+           {:ok, item} <- select_subscription_item(body, item_id),
+           quantity <- Keyword.get(opts, :quantity, item["quantity"]) do
+        if is_integer(quantity) and quantity > 0,
+          do: {:ok, item["id"], quantity},
+          else: {:error, :missing_subscription_quantity}
+      end
+    end
+  end
+
+  @doc false
+  def select_subscription_item(body, requested_id) do
+    case body do
+      %{"items" => %{"data" => items} = collection} when is_list(items) ->
+        cond do
+          collection["has_more"] == true ->
+            {:error, :incomplete_subscription_items}
+
+          requested_id not in [nil, ""] ->
+            case Enum.find(items, &(is_map(&1) and &1["id"] == requested_id)) do
+              %{"id" => id} = item when is_binary(id) and id != "" -> {:ok, item}
+              _ -> {:error, {:missing_subscription_item, body}}
+            end
+
+          true ->
+            case items do
+              [%{"id" => id} = item] when is_binary(id) and id != "" -> {:ok, item}
+              [] -> {:error, {:missing_subscription_item, body}}
+              [_] -> {:error, {:missing_subscription_item, body}}
+              _ -> {:error, :ambiguous_subscription_items}
+            end
+        end
 
       _ ->
-        case get_subscription(subscription_id, opts) do
-          {:ok, %{"items" => %{"data" => [%{"id" => id} | _]}}} ->
-            {:ok, id}
-
-          {:ok, body} ->
-            {:error, {:missing_subscription_item, body}}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        {:error, {:missing_subscription_item, body}}
     end
   end
 

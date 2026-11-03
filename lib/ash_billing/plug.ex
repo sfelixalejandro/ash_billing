@@ -2,6 +2,12 @@ defmodule AshBilling.Plug do
   @moduledoc """
   A Plug for receiving and verifying incoming webhooks from billing providers.
 
+  Handlers must return `:ok`, `{:ok, value}`, or `{:error, reason}`. Unexpected
+  returns and exceptions fail closed. PostgreSQL writes in the configured shared
+  Repo transaction roll back on synchronization or handler failure. Leases are
+  released/marked failed after rollback; HTTP responses are sent after commit.
+  External effects cannot be rolled back and require event/effect idempotency.
+
   ## Usage in Phoenix Router
 
       forward "/webhooks/stripe", AshBilling.Plug,
@@ -150,39 +156,21 @@ defmodule AshBilling.Plug do
                        }}
 
                     {:ok, lease_token} ->
-                      work = fn -> process_event(conn, event, handler, lease_token, opts) end
-
-                      result =
-                        if deduplicate?,
-                          do:
-                            AshBilling.Deduplication.with_lease(event_id, lease_token, opts, work),
-                          else:
-                            AshBilling.ResourceLock.run(
-                              transaction_resources(opts),
-                              {:webhook, event_id},
-                              fn -> {:ok, work.()} end
-                            )
+                      result = execute_event(event, handler, lease_token, opts)
 
                       case result do
-                        {:ok, {response, metadata}} ->
-                          {send_resp(response), metadata}
-
-                        {:error, reason} ->
-                          if deduplicate? and
-                               reason not in [:already_processed, :already_processing] do
-                            release_after_failure(event_id, lease_token, reason, opts)
-                          end
-
-                          status = if reason == :already_processed, do: 200, else: 503
-
+                        {:ok, :processed} ->
                           response =
                             conn
                             |> put_resp_content_type("application/json")
-                            |> send_resp(status, Jason.encode!(%{error: "lease_not_owned"}))
+                            |> send_resp(200, ~s({"status":"received"}))
                             |> halt()
 
                           {response,
-                           %{status: :lease_not_owned, event_id: event_id, error: reason}}
+                           %{status: :received, event_id: event_id, event_type: event_type}}
+
+                        {:error, reason} ->
+                          failure_response(conn, event_id, event_type, lease_token, reason, opts)
                       end
                   end
 
@@ -209,177 +197,141 @@ defmodule AshBilling.Plug do
     end
   end
 
-  defp process_event(conn, event, handler, lease_token, opts) do
-    event_id = Map.get(event, "id")
-    event_type = Map.get(event, "type")
+  # PostgreSQL billing mutations and handlers share a transaction. Durable
+  # completion participates in it; memory completion must wait for its COMMIT.
+  defp execute_event(event, handler, token, opts) do
+    event_id = event["id"]
     deduplicate? = Keyword.get(opts, :deduplicate?, true)
-    return_500? = Keyword.get(opts, :return_500_on_sync_error, true)
 
-    sync_result =
-      if Keyword.has_key?(opts, :subscription_resource) or
-           Keyword.has_key?(opts, :customer_resource) or
-           Keyword.has_key?(opts, :resource) do
-        AshBilling.WebhookSync.sync_event(event, opts)
-      else
-        {:ok, :not_configured}
+    durable? =
+      case AshBilling.Deduplication.transaction_resources(opts) do
+        [resource] -> Ash.DataLayer.data_layer(resource) == AshPostgres.DataLayer
+        _ -> false
       end
 
-    case sync_result do
-      {:error, reason} ->
-        require Logger
-
-        status_code =
-          if return_500? or match?({:transaction_failed, _}, reason), do: 500, else: 200
-
-        Logger.error(
-          "AshBilling.Plug: Webhook synchronization failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(reason)}. Releasing lease. " <>
-            if(status_code == 500,
-              do: "Returning HTTP 500 to trigger Stripe retry.",
-              else: "HTTP 200 requires successful failure recording and transaction commit."
-            )
+    work = fn ->
+      result =
+        AshBilling.ResourceLock.run(
+          transaction_resources(opts),
+          {:webhook, event_id},
+          fn ->
+            with {:ok, _} <- sync_event(event, opts),
+                 :ok <- run_handler(handler, event),
+                 :ok <- if(durable?, do: complete_event(event_id, token, opts), else: :ok) do
+              :processed
+            end
+          end,
+          rollback_on_error?: true
         )
 
-        release_result =
-          if deduplicate? do
-            AshBilling.Deduplication.release(
-              event_id,
-              [lease_token: lease_token, error: reason] ++ opts
-            )
-          else
-            :ok
+      case result do
+        :processed when not durable? ->
+          case complete_event(event_id, token, opts) do
+            :ok -> :processed
+            {:error, _} = error -> error
           end
 
-        status_code = if release_result == :ok, do: status_code, else: 500
-
-        resp_conn =
-          conn
-          |> put_resp_content_type("application/json")
-          |> resp(
-            status_code,
-            Jason.encode!(%{
-              error: "synchronization_failed",
-              details: inspect(reason)
-            })
-          )
-          |> halt()
-
-        {resp_conn,
-         %{
-           status: :sync_failed,
-           event_id: event_id,
-           event_type: event_type,
-           error: reason
-         }}
-
-      _ ->
-        handler_result = invoke_handler(handler, event)
-
-        case handler_result do
-          {:error, handler_reason} ->
-            require Logger
-
-            status_code =
-              if match?({:invalid_webhook_handler, _}, handler_reason) or return_500? do
-                500
-              else
-                200
-              end
-
-            Logger.error(
-              "AshBilling.Plug: Custom handler #{inspect(handler)} failed for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(handler_reason)}. Releasing lease and " <>
-                "preparing a response after recording the failure."
-            )
-
-            release_result =
-              if deduplicate? do
-                AshBilling.Deduplication.release(
-                  event_id,
-                  [lease_token: lease_token, error: handler_reason] ++ opts
-                )
-              else
-                :ok
-              end
-
-            status_code = if release_result == :ok, do: status_code, else: 500
-
-            resp_conn =
-              conn
-              |> put_resp_content_type("application/json")
-              |> resp(
-                status_code,
-                Jason.encode!(%{
-                  error: "handler_failed",
-                  details: inspect(handler_reason)
-                })
-              )
-              |> halt()
-
-            {resp_conn,
-             %{
-               status: :handler_failed,
-               event_id: event_id,
-               event_type: event_type,
-               error: handler_reason
-             }}
-
-          _ ->
-            complete_result =
-              if deduplicate? do
-                AshBilling.Deduplication.complete(
-                  event_id,
-                  [lease_token: lease_token] ++ opts
-                )
-              else
-                :ok
-              end
-
-            case complete_result do
-              :ok ->
-                resp_conn =
-                  conn
-                  |> put_resp_content_type("application/json")
-                  |> resp(200, ~s({"status":"received"}))
-                  |> halt()
-
-                {resp_conn,
-                 %{
-                   status: :received,
-                   event_id: event_id,
-                   event_type: event_type
-                 }}
-
-              {:error, complete_reason} ->
-                require Logger
-
-                status_code = 500
-
-                Logger.error(
-                  "AshBilling.Plug: Failed to complete deduplication lease for event #{inspect(event_id)} (#{inspect(event_type)}): #{inspect(complete_reason)}. " <>
-                    "Returning HTTP 500 to trigger retry."
-                )
-
-                resp_conn =
-                  conn
-                  |> put_resp_content_type("application/json")
-                  |> resp(
-                    status_code,
-                    Jason.encode!(%{
-                      error: "completion_failed",
-                      details: inspect(complete_reason)
-                    })
-                  )
-                  |> halt()
-
-                {resp_conn,
-                 %{
-                   status: :completion_failed,
-                   event_id: event_id,
-                   event_type: event_type,
-                   error: complete_reason
-                 }}
-            end
-        end
+        other ->
+          other
+      end
     end
+
+    if deduplicate? do
+      AshBilling.Deduplication.with_lease(event_id, token, opts, work)
+    else
+      case work.() do
+        {:error, _} = error -> error
+        result -> {:ok, result}
+      end
+    end
+  rescue
+    error -> {:error, {:processing_exception, error}}
+  end
+
+  defp sync_event(event, opts) do
+    if Enum.any?(
+         [:subscription_resource, :customer_resource, :resource],
+         &Keyword.has_key?(opts, &1)
+       ) do
+      AshBilling.WebhookSync.sync_event(event, opts)
+    else
+      {:ok, :not_configured}
+    end
+  end
+
+  defp run_handler(handler, event) do
+    case invoke_handler(handler, event) do
+      :ok -> :ok
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, {:handler_failed, reason}}
+      other -> {:error, {:handler_failed, {:invalid_handler_return, other}}}
+    end
+  end
+
+  defp complete_event(event_id, token, opts) do
+    if Keyword.get(opts, :deduplicate?, true) do
+      case AshBilling.Deduplication.complete(event_id, [lease_token: token] ++ opts) do
+        :ok -> :ok
+        {:error, reason} -> {:error, {:completion_failed, reason}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp failure_response(conn, event_id, event_type, token, reason, opts) do
+    busy? = reason in [:already_processed, :already_processing, :lease_token_mismatch]
+
+    release =
+      if Keyword.get(opts, :deduplicate?, true) and not busy?,
+        do: release_after_failure(event_id, token, reason, opts),
+        else: :ok
+
+    {kind, detail} =
+      case reason do
+        {:handler_failed, detail} -> {:handler_failed, detail}
+        {:completion_failed, detail} -> {:completion_failed, detail}
+        _ when busy? -> {:lease_not_owned, reason}
+        _ -> {:synchronization_failed, reason}
+      end
+
+    # Acknowledgment opt-out applies only to business failures, after rollback
+    # AND successful failure recording. Infrastructure failures always retry.
+    status =
+      cond do
+        reason == :already_processed -> 200
+        busy? -> 503
+        release != :ok -> 500
+        kind == :completion_failed -> 500
+        match?({:transaction_failed, _}, reason) -> 500
+        match?({:processing_exception, _}, reason) -> 500
+        match?({:invalid_webhook_handler, _}, detail) -> 500
+        match?({:invalid_handler_return, _}, detail) -> 500
+        match?({:handler_exception, _}, detail) -> 500
+        Keyword.get(opts, :return_500_on_sync_error, true) -> 500
+        true -> 200
+      end
+
+    require Logger
+
+    Logger.error(
+      "AshBilling.Plug: event #{inspect(event_id)} failed: #{inspect(reason)}. " <>
+        if(status == 500,
+          do: "Returning HTTP 500 to trigger Stripe retry.",
+          else: "Returning HTTP #{status}."
+        )
+    )
+
+    response =
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(status, Jason.encode!(%{error: kind, details: inspect(detail)}))
+      |> halt()
+
+    telemetry_status = if kind == :synchronization_failed, do: :sync_failed, else: kind
+
+    {response,
+     %{status: telemetry_status, event_id: event_id, event_type: event_type, error: detail}}
   end
 
   defp release_after_failure(event_id, token, reason, opts) do
@@ -393,6 +345,12 @@ defmodule AshBilling.Plug do
         Logger.error(
           "AshBilling.Plug: lease cleanup failed after transaction failure: #{inspect(release_reason)}"
         )
+
+        # A failed cleanup COMMIT must still produce 5xx. Make one bounded
+        # cleanup attempt for transient transaction failures to allow prompt retry.
+        if match?({:transaction_failed, _}, release_reason) do
+          AshBilling.Deduplication.release(event_id, [lease_token: token, error: reason] ++ opts)
+        end
 
         {:error, release_reason}
     end
@@ -408,9 +366,9 @@ defmodule AshBilling.Plug do
       _ -> {:error, {:invalid_webhook_handler, handler}}
     end
   rescue
-    error -> {:error, error}
+    error -> {:error, {:handler_exception, error}}
   catch
-    kind, reason -> {:error, {kind, reason}}
+    kind, reason -> {:error, {:handler_exception, {kind, reason}}}
   end
 
   defp invoke_handler(handler, _event), do: {:error, {:invalid_webhook_handler, handler}}

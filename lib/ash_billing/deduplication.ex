@@ -102,9 +102,14 @@ defmodule AshBilling.Deduplication do
   PostgreSQL holds a row lock in a transaction until work and lease completion
   finish. Other data layers use a monitored, node-local OTP lock. External effects
   remain at-least-once: handlers must use the event ID as an idempotency key.
+
+  A callback returning `{:error, reason}` propagates that error and rolls back
+  PostgreSQL writes; other callback results return `{:ok, result}`. Raw consumers
+  must release a failed lease after rollback before retrying. They still own the
+  outer commit when invoking this function in a caller-owned transaction.
   """
   def with_lease(event_id, token, opts, fun)
-  def with_lease(nil, _token, _opts, fun), do: {:ok, fun.()}
+  def with_lease(nil, _token, _opts, fun), do: lease_result(fun.())
 
   def with_lease(event_id, token, opts, fun) do
     case resolve_strategy(opts) do
@@ -114,7 +119,7 @@ defmodule AshBilling.Deduplication do
 
         execute = fn record ->
           case record do
-            %{status: :processing, lease_token: ^token} -> {:ok, fun.()}
+            %{status: :processing, lease_token: ^token} -> lease_result(fun.())
             %{status: :processed} -> {:error, :already_processed}
             _ -> {:error, :lease_token_mismatch}
           end
@@ -139,13 +144,17 @@ defmodule AshBilling.Deduplication do
           key = memory_key(event_id, opts)
 
           case :ets.lookup(@table, key) do
-            [{^key, :processing, _, ^token}] -> {:ok, fun.()}
+            [{^key, :processing, _, ^token}] -> lease_result(fun.())
             [{^key, :processed, _, _}] -> {:error, :already_processed}
             _ -> {:error, :lease_token_mismatch}
           end
         end)
     end
   end
+
+  # Do not hide a business error inside a successful transaction result.
+  defp lease_result({:error, _} = error), do: error
+  defp lease_result(result), do: {:ok, result}
 
   @doc false
   def transaction_resources(opts) do

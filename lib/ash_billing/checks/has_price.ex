@@ -2,6 +2,10 @@ defmodule AshBilling.Checks.HasPrice do
   @moduledoc """
   An Ash policy check that authorizes if the current actor has an active subscription to a specific price.
 
+  Uses the actor snapshot and freshness rules of `AshBilling.Checks.Subscribed`.
+  Multi-item subscriptions are outside the synchronized local model; unsupported
+  updates retain the last supported state until application remediation.
+
   Requires a valid, non-empty `:price` identifier. If `:price` is missing, nil, empty,
   whitespace-only, or not a string, authorization fails closed (denies access).
 

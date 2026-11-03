@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Candidate 0.5.0-rc.1 — Fixed
+
+- Preserve the selected Stripe item's quantity on price changes; reject invalid
+  quantities, missing item quantities, ambiguous selections and truncated collections.
+- Require a Customer ID before recurring Checkout, and exactly one subscription
+  line item. Reject multi-item nonterminal webhook/reconciliation snapshots rather
+  than storing their first price; allow terminal events to revoke access.
+- Reject impossible requested customer persistence before provider calls; preserve
+  the remote customer ID in errors when a later local association fails.
+- Bind record Checkout ownership references to the record and reject a loaded
+  customer's mismatched tenant before customer/Checkout provider calls.
+- Roll back returned synchronization and handler errors on shared-Repo PostgreSQL;
+  record failure/release leases after rollback and retain commit-before-response.
+- Reject unexpected handler returns instead of marking the event processed.
+
+### Candidate 0.5.0-rc.1 — Compatibility
+
+- Explicit item ID avoids GET only when a valid quantity is also supplied.
+- Recurring Checkout no longer lets Stripe create an implicit Customer: persist a
+  Customer first and reload the resource. Payment Checkout remains independent.
+- Handlers must return `:ok`, `{:ok, value}`, or `{:error, reason}`.
+- Raw lease callbacks returning errors now propagate those errors and roll back
+  PostgreSQL; raw callers remain responsible for lease release after rollback.
+- No schema migration or release publication is included. See
+  [the candidate upgrade guide](documentation/topics/upgrading-to-0.5.md).
+
 ## [0.4.1] - 2026-10-31
 
 ### Fixed
@@ -46,7 +72,7 @@ before switching versions. See [Upgrading to 0.4](documentation/topics/upgrading
   - Resolve subscription API/reconciliation providers from the resource, preserving explicit overrides and Stripe defaults for raw IDs.
   - Namespace automatic customer idempotency keys by resource, tenant and local ID. Existing explicit keys remain unchanged; review pending retries when deploying this key format change.
   - Update the development/test Bandit lock from 1.14.0 to 1.14.1; the final Hex audit reports no advisories.
-  - **Compatibility:** review explicit billing write actions, Connect options and tenant-aware event schema before deployment. See `documentation/topics/final-security-hardening.md`.
+  - **Compatibility:** review explicit billing write actions, Connect options and tenant-aware event schema before deployment. See the public upgrade and resilience guides.
 
 - **Webhook commit acknowledgment and contention**: Send successful HTTP responses only after the execution transaction commits; failed commits and lease persistence errors remain retryable even with the legacy error acknowledgment opt-out. Reject missing/empty event IDs when deduplication is enabled. Reject caller-owned HTTP transactions and different primary Repo pools before processing. Use PostgreSQL transaction-scoped try advisory locks plus `FOR UPDATE NOWAIT` and persistent token CAS so duplicates do not wait on an active handler while occupying pool connections. Different Repo modules may explicitly share one primary pool; separate primary pools now fail closed with HTTP 503.
 

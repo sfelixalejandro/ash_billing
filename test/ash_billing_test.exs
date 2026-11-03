@@ -304,7 +304,7 @@ defmodule AshBillingTest do
                AshBilling.create_checkout_session("cus_123", checkout_opts)
     end
 
-    test "auto-injects customer_email when user has no customer_id", %{
+    test "payment checkout injects customer_email when user has no customer_id", %{
       stub_name: stub_name,
       opts: opts
     } do
@@ -327,6 +327,7 @@ defmodule AshBillingTest do
 
       checkout_opts =
         Keyword.merge(opts,
+          mode: "payment",
           price: "price_basic",
           success_url: "https://example.com/ok",
           cancel_url: "https://example.com/cancel"
@@ -503,7 +504,7 @@ defmodule AshBillingTest do
         )
       end)
 
-      opts = Keyword.merge(opts, subscription_item_id: "si_direct_123")
+      opts = Keyword.merge(opts, subscription_item_id: "si_direct_123", quantity: 1)
 
       assert {:ok, %{"id" => "sub_top_swap"}} =
                AshBilling.swap_plan("sub_top_swap", "price_scale", opts)
@@ -729,7 +730,11 @@ defmodule AshBillingTest do
           "GET" ->
             Req.Test.json(conn, %{
               "id" => "sub_del_1",
-              "items" => %{"data" => [%{"id" => "si_del_1", "price" => %{"id" => "price_old"}}]}
+              "items" => %{
+                "data" => [
+                  %{"id" => "si_del_1", "quantity" => 1, "price" => %{"id" => "price_old"}}
+                ]
+              }
             })
 
           "POST" ->
@@ -749,7 +754,11 @@ defmodule AshBillingTest do
           "GET" ->
             Req.Test.json(conn, %{
               "id" => "sub_del_1",
-              "items" => %{"data" => [%{"id" => "si_del_1", "price" => %{"id" => "price_known"}}]}
+              "items" => %{
+                "data" => [
+                  %{"id" => "si_del_1", "quantity" => 1, "price" => %{"id" => "price_known"}}
+                ]
+              }
             })
 
           "POST" ->

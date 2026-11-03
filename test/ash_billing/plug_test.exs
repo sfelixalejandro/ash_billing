@@ -11,6 +11,7 @@ defmodule AshBilling.PlugTest do
   defmodule MockHandler do
     def handle_event(event) do
       send(self(), {:webhook_handled, event})
+      :ok
     end
   end
 

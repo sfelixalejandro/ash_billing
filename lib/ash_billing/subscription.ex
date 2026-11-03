@@ -6,6 +6,12 @@ defmodule AshBilling.Subscription do
   Each scope must use one provider/account/environment. PostgreSQL consumers must
   generate and apply a migration for the injected identity, resolving existing duplicates first.
 
+  The local model represents one recurring item/price per subscription. Multi-item
+  nonterminal snapshots are rejected, retaining the last supported snapshot and
+  returning a retryable error. Terminal events still revoke access without choosing
+  a price. This is not multi-item entitlement support; consumers must remediate
+  unsupported external subscriptions and decide access pending remediation.
+
   Billing state is not implicitly accepted by wildcard create/update actions.
   Explicitly named inputs remain an application authorization decision. Internal
   webhook writes retain actions, policies, validations and tenant scope.
