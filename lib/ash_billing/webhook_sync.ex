@@ -941,7 +941,9 @@ defmodule AshBilling.WebhookSync do
   end
 
   defp multiple_subscription_items?(%{"items" => %{"data" => items} = collection})
-       when is_list(items), do: length(items) > 1 or collection["has_more"] == true
+       when is_list(items) do
+    length(items) > 1 or collection["has_more"] == true
+  end
 
   defp multiple_subscription_items?(_), do: false
 

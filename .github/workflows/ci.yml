@@ -91,6 +91,7 @@ jobs:
         run: |
           mix deps.get
           mix compile --warnings-as-errors
+          mix test --no-start
 
       - name: Verify offline Stripe launcher safety
         if: matrix.elixir == '1.18'

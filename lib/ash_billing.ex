@@ -411,7 +411,9 @@ defmodule AshBilling do
   def update_quantity(subscription_or_id, quantity, opts \\ [])
 
   def update_quantity(_subscription_or_id, quantity, _opts)
-      when not is_integer(quantity) or quantity <= 0, do: {:error, :invalid_quantity}
+      when not is_integer(quantity) or quantity <= 0 do
+    {:error, :invalid_quantity}
+  end
 
   def update_quantity(subscription_or_id, quantity, opts) do
     opts =

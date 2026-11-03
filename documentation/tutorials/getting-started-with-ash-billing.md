@@ -279,7 +279,7 @@ AshBilling.verify_configuration!(
 
 ## Candidate 0.5.0-rc.1 behavior changes
 
-See [Upgrading to 0.4.2](../topics/upgrading-to-0.5.md) for quantity preservation,
+See [Upgrading to 0.5](../topics/upgrading-to-0.5.md) for quantity preservation,
 single-item scope, handler returns, rollback, and actor snapshot freshness. No schema
 migration is added by these changes. The customer and subscription actions must still
 satisfy the atomic-write and authorization contracts described in the resilience guide.

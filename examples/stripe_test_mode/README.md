@@ -72,8 +72,12 @@ curl -X POST http://127.0.0.1:4089/control/resume
 curl -X POST http://127.0.0.1:4089/control/cancel_now
 ```
 
-Run these sequentially and inspect `/state` between mutations until the expected
-signed webhook has converged. Each mutation reads the subscription back from Stripe;
+Run these sequentially. Each mutation reads the subscription back from Stripe and
+waits up to 15 seconds for a processed webhook snapshot, matching PostgreSQL state
+and the expected policies on a freshly loaded actor before returning `PASS`.
+The wait checks event quantity as well as price, status and the cancellation flag;
+it does not repeat the provider mutation. Missing webhooks, stale SQL or incorrect
+authorization fail the command. Inspect `/state` to diagnose a timeout;
 `swap_twenty` requires remote quantity=20 and `swap_ten` requires quantity=10.
 `verify_subscription` checks the session's paid status, remote active status and
 persisted subscription, not just a success redirect. `/state` reloads the actor and
@@ -137,8 +141,13 @@ See [Stripe testing](https://docs.stripe.com/testing) and the
 
 ```sh
 python3 -m unittest discover -s . -p 'test_*.py'
+mix test --no-start
 ```
 
 These checks reject live/unknown keys, require an explicit false livemode during
 preflight, and verify redaction. They mock network access and do not claim real
 Stripe validation.
+
+The Elixir tests exercise convergence and negative controls without starting the
+consumer, contacting Stripe or requiring PostgreSQL. They cover missing webhooks,
+stale quantities/prices/status, incorrect authorization and bounded waiting.

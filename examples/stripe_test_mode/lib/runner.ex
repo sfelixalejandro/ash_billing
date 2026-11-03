@@ -1,5 +1,5 @@
 defmodule AshBillingConsumer.Runner do
-  alias AshBillingConsumer.{User, Subscription, WebhookEvent, Repo, Remote}
+  alias AshBillingConsumer.{User, Subscription, WebhookEvent, Repo, Remote, Convergence}
   @ash [domain: AshBillingConsumer.Domain, authorize?: false]
   defp memory, do: Agent.get(AshBillingConsumer.State, & &1)
 
@@ -115,16 +115,18 @@ defmodule AshBillingConsumer.Runner do
 
     remote = Remote.request(:get, "/v1/subscriptions/" <> session["subscription"])
     ensure(remote["status"] == "active", "Remote subscription not active")
-    sub = current_sub()
+    item = hd(remote["items"]["data"])
 
     ensure(
-      sub.provider_subscription_id == remote["id"] and sub.status == :active,
-      "Signed webhook has not synchronized subscription"
+      item["quantity"] == 20 and item["price"]["id"] == memory().first_price and
+        remote["customer"] == memory().customer,
+      "Remote subscription identity, price or quantity mismatch"
     )
 
+    snapshot = await_subscription(remote)
     remember(%{subscription_id: remote["id"]})
 
-    Map.merge(state(), %{
+    Map.merge(snapshot, %{
       payment_status: session["payment_status"],
       remote_quantity: hd(remote["items"]["data"])["quantity"],
       status: "PASS"
@@ -311,13 +313,17 @@ defmodule AshBillingConsumer.Runner do
       "Remote item mutation mismatch"
     )
 
+    ensure(remote["status"] == "active", "Remote subscription not active")
+    snapshot = await_subscription(remote)
+
     %{
       status: "PASS",
       livemode: remote["livemode"],
       subscription: remote["id"],
       quantity: item["quantity"],
       price: item["price"]["id"],
-      latest_invoice: remote["latest_invoice"]
+      latest_invoice: remote["latest_invoice"],
+      local_state: snapshot
     }
   end
 
@@ -329,12 +335,50 @@ defmodule AshBillingConsumer.Runner do
     if expected_status == "active",
       do: ensure(remote["cancel_at_period_end"] === expected_flag, "Cancellation flag mismatch")
 
+    snapshot = await_subscription(remote)
+
     %{
       status: "PASS",
       remote_status: remote["status"],
       cancel_at_period_end: remote["cancel_at_period_end"],
-      subscription: remote["id"]
+      subscription: remote["id"],
+      local_state: snapshot
     }
+  end
+
+  defp await_subscription(remote) do
+    active? = remote["status"] == "active"
+    item = hd(remote["items"]["data"])
+
+    authorization = %{
+      subscribed: active?,
+      has_price: active? and item["price"]["id"] == memory().first_price,
+      wrong_price: false
+    }
+
+    read_snapshot = fn ->
+      snapshot = state()
+
+      %{rows: rows} =
+        Repo.query!(
+          "SELECT h.payload->'data'->'object' FROM handler_effects h JOIN webhook_events w ON w.event_id=h.event_id WHERE w.status='processed' AND h.event_type IN ('customer.subscription.created','customer.subscription.updated','customer.subscription.deleted') AND h.payload->'data'->'object'->>'id'=$1",
+          [remote["id"]]
+        )
+
+      Map.put(
+        snapshot,
+        :processed_subscription_snapshots,
+        Enum.map(rows, fn [object] -> Convergence.subscription_fields(object) end)
+      )
+    end
+
+    case Convergence.await(remote, authorization, read_snapshot) do
+      {:ok, snapshot} ->
+        Map.delete(snapshot, :processed_subscription_snapshots)
+
+      {:error, :subscription_not_converged} ->
+        raise "Subscription webhook, PostgreSQL state and policies did not converge within 15 seconds"
+    end
   end
 
   def state do
