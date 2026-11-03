@@ -220,11 +220,11 @@ defmodule MyApp.Analytics.Report do
 end
 ```
 
-## Candidate 0.5.0-rc.1 integration contract
+## Version 0.5.0 integration contract
 
 The recurring flow persists a Customer before offering Checkout. Resolve price IDs
 from a server-controlled catalog and carry the same trusted tenant/account options
 through creation, reload and Checkout. One recurring line is supported. Handle
 `{:persistence_failed, customer_id, reason}` by reconciling that identity before retry.
-See [the candidate upgrade guide](../../documentation/topics/upgrading-to-0.5.md)
+See [the 0.5 upgrade guide](../../documentation/topics/upgrading-to-0.5.md)
 for quantity preservation, SQL rollback, handler returns and actor freshness.

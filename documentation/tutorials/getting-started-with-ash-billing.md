@@ -25,7 +25,7 @@ Add `ash_billing` to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.4.0"}
+    {:ash_billing, "~> 0.5.0"}
   ]
 end
 ```
@@ -277,7 +277,7 @@ AshBilling.verify_configuration!(
 )
 ```
 
-## Candidate 0.5.0-rc.1 behavior changes
+## Version 0.5.0 behavior changes
 
 See [Upgrading to 0.5](../topics/upgrading-to-0.5.md) for quantity preservation,
 single-item scope, handler returns, rollback, and actor snapshot freshness. No schema

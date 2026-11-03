@@ -404,7 +404,7 @@ key can create an orphan provider customer when retrying an old, unpersisted req
 The persistent customer association CAS remains authoritative and is not weakened.
 
 
-## Candidate 0.5.0-rc.1: processing failure and rollback
+## Version 0.5.0: processing failure and rollback
 
 A returned synchronization error now rolls back its PostgreSQL mutations, including
 an initial customer association made before a later ownership conflict. The Plug

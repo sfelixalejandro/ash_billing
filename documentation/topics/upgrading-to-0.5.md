@@ -1,11 +1,12 @@
-# Upgrading to candidate 0.5.0
+# Upgrading to 0.5
 
-These changes are prepared as **0.5.0-rc.1** for review and are not a published release.
-Although the work began as a possible 0.4.2 patch, requiring a Customer before
-Checkout, tightening handler returns and changing raw lease error results affect
-previously valid callers. A 0.5 minor candidate communicates that compatibility
-boundary more clearly than a 0.4 patch. The working branch name is retained. There is no
-new schema migration. Existing 0.4.0 migrations and shared-Repo requirements still apply.
+Version **0.5.0** changes several public contracts from 0.4.x. Requiring a Customer
+before recurring Checkout, tightening handler returns and propagating raw lease
+errors affect previously valid callers. The minor increment communicates this
+compatibility boundary within the pre-1.0 series.
+
+There is no new schema migration. Existing 0.4.0 migrations and shared-Repo
+requirements still apply.
 
 ## Customer creation before recurring Checkout
 
@@ -143,11 +144,9 @@ or consumer authorization. Deployments should check required environment/configu
 separately. Checkout validates its mode, line-item container and required URLs before
 effects; missing prices and malformed containers now return explicit error tuples.
 
-## Candidate release checks
+## Release validation
 
-The package version is `0.5.0-rc.1`. Documentation source links point at the working
-branch until release approval; publishing a final version requires updating version
-and source_ref to the approved tag. No tag or publication is implied by local builds.
-Require passing CI on the exact proposed commit, inspect the built package, and keep
-Stripe Test Mode evidence distinct from local simulations. See the optional
+Documentation source links target `v0.5.0`. Require passing CI on the proposed
+release commit, inspect the built package, and keep Stripe Test Mode evidence
+distinct from local simulations. See the optional
 [Stripe Test Mode guide](stripe-test-mode.md) in the repository.

@@ -5,9 +5,8 @@ suite. The repository includes an isolated AshPostgres/Plug consumer with a dedi
 PostgreSQL database, native Ash billing policies and a loopback webhook endpoint.
 The consumer is not included in the Hex package.
 
-See the [consumer instructions and source](https://github.com/sfelixalejandro/ash_billing/tree/fix/v0.4.2-production-hardening/examples/stripe_test_mode)
-for setup and individual scenarios. This URL targets the candidate working branch;
-release documentation should point at the approved release ref.
+See the [consumer instructions and source](https://github.com/sfelixalejandro/ash_billing/tree/v0.5.0/examples/stripe_test_mode)
+for setup and individual scenarios. This URL targets the 0.5.0 release source.
 
 The launcher accepts only `sk_test_` credentials, verifies `livemode=false` against
 Stripe, obtains a test CLI listener secret without printing it, and keeps evidence
@@ -36,7 +35,7 @@ does not validate asynchronous payment methods, live transactions, Connect scope
 or external exactly-once fulfillment. Run application-specific checks separately.
 
 The configuration diagnostic is not proof of readiness. Require CI on the exact
-candidate commit, inspect package contents, and retain private evidence without
+release commit, inspect package contents, and retain private evidence without
 credentials, raw payloads, cookies or Checkout access URLs in public documentation.
 
 Primary references: [Stripe testing](https://docs.stripe.com/testing),
