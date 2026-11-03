@@ -68,13 +68,12 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 
 ## Installation
 
-This branch prepares **0.5.0-rc.1**, which is not published yet. The Hex installation
-below targets the existing 0.4.x release and does not include the candidate's changes.
-To evaluate this working tree locally, use the
-[isolated Stripe Test Mode consumer](documentation/topics/stripe-test-mode.md).
+Version **0.5.0** includes billing lifecycle and webhook consistency changes.
+Read [Upgrading to 0.5](documentation/topics/upgrading-to-0.5.md) before updating
+from 0.4.x. For older upgrades, also see
+[Upgrading to 0.4](documentation/topics/upgrading-to-0.4.md).
 
-`ash_billing` is published on [Hex.pm](https://hex.pm/packages/ash_billing). See the
-[upgrade guide](documentation/topics/upgrading-to-0.4.md) when moving from 0.3.x.
+`ash_billing` is available on [Hex.pm](https://hex.pm/packages/ash_billing).
 
 The recommended way to install `ash_billing` is using Igniter:
 
@@ -89,7 +88,7 @@ Alternatively, you can install it manually by adding `ash_billing` to your `mix.
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.4.0"}
+    {:ash_billing, "~> 0.5.0"}
   ]
 end
 ```
@@ -364,7 +363,7 @@ config :ash_billing,
 
 MIT License. Copyright (c) 2026 Alejandro Felix.
 
-## Billing lifecycle hardening (candidate 0.5.0-rc.1)
+## Billing lifecycle hardening (0.5.0)
 
 Recurring subscriptions support exactly one line item. Multiple subscription lines
 are rejected before Checkout; multi-item nonterminal webhooks return an error and
@@ -380,9 +379,9 @@ Custom webhook handlers must return `:ok`, `{:ok, value}`, or `{:error, reason}`
 Other values and exceptions fail instead of marking an event processed. Shared-Repo
 PostgreSQL writes roll back on processing failure; remote effects remain at-least-once.
 
-See [the candidate 0.5.0-rc.1 upgrade guide](documentation/topics/upgrading-to-0.5.md)
+See [the 0.5 upgrade guide](documentation/topics/upgrading-to-0.5.md)
 for behavior changes, unsupported external subscriptions, actor freshness and retry
-responsibilities. This is an unreleased candidate; it introduces no schema migration.
+responsibilities. Version 0.5 introduces no new schema migration.
 
 ## Stripe Test Mode validation
 

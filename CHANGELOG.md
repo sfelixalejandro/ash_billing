@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Candidate 0.5.0-rc.1 — Fixed
+## [0.5.0] - 2026-11-02
+
+### Fixed
 
 - Preserve the selected Stripe item's quantity on price changes; reject invalid
   quantities, missing item quantities, ambiguous selections and truncated collections.
@@ -24,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record failure/release leases after rollback and retain commit-before-response.
 - Reject unexpected handler returns instead of marking the event processed.
 
-### Candidate 0.5.0-rc.1 — Compatibility
+### Compatibility
 
 - Explicit item ID avoids GET only when a valid quantity is also supplied.
 - Recurring Checkout no longer lets Stripe create an implicit Customer: persist a
@@ -32,8 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Handlers must return `:ok`, `{:ok, value}`, or `{:error, reason}`.
 - Raw lease callbacks returning errors now propagate those errors and roll back
   PostgreSQL; raw callers remain responsible for lease release after rollback.
-- No schema migration or release publication is included. See
-  [the candidate upgrade guide](documentation/topics/upgrading-to-0.5.md).
+- No new schema migration is required. See
+  [the 0.5 upgrade guide](documentation/topics/upgrading-to-0.5.md).
+
+### Documentation and validation
+
+- Update Customer setup, handler contracts, actor freshness and unsupported-snapshot guidance.
+- Add an isolated Stripe Test Mode consumer with bounded webhook/SQL/policy convergence
+  checks and credential-free negative controls. The consumer is excluded from the Hex package.
 
 ## [0.4.1] - 2026-10-31
 
