@@ -231,11 +231,93 @@ defmodule AshBilling.ChecksTest do
 
       # Compile-time validation via init/1 raises error on invalid configuration
       assert {:ok, _} = AshBilling.Checks.HasPrice.init(price: "price_pro")
+      assert {:ok, _} = AshBilling.Checks.HasPrice.init(price: ["price_pro", "price_enterprise"])
       assert {:error, _} = AshBilling.Checks.HasPrice.init([])
       assert {:error, _} = AshBilling.Checks.HasPrice.init(price: nil)
       assert {:error, _} = AshBilling.Checks.HasPrice.init(price: "")
       assert {:error, _} = AshBilling.Checks.HasPrice.init(price: "   ")
       assert {:error, _} = AshBilling.Checks.HasPrice.init(price: 123)
+      assert {:error, _} = AshBilling.Checks.HasPrice.init(price: [])
+      assert {:error, _} = AshBilling.Checks.HasPrice.init(price: [""])
+      assert {:error, _} = AshBilling.Checks.HasPrice.init(price: ["  "])
+      assert {:error, _} = AshBilling.Checks.HasPrice.init(price: ["price_pro", 123])
+    end
+
+    test "HasPrice supports multiple prices in a list and behaves fail-closed" do
+      {:ok, user} = Ash.create(User, %{email: "pro_multi@example.com"}, domain: Domain)
+
+      {:ok, _sub} =
+        Ash.create(
+          Subscription,
+          %{
+            user_id: user.id,
+            provider_subscription_id: "sub_pro_multi",
+            status: :active,
+            price_id: "price_pro"
+          },
+          domain: Domain
+        )
+
+      user_loaded = Ash.load!(user, :subscriptions, domain: Domain)
+
+      # 1. Matches first element in list
+      assert AshBilling.Checks.HasPrice.match?(user_loaded, %{},
+               price: ["price_pro", "price_enterprise"]
+             ) == true
+
+      # 2. Matches second element in list
+      assert AshBilling.Checks.HasPrice.match?(user_loaded, %{},
+               price: ["price_basic", "price_pro"]
+             ) == true
+
+      # 3. No match in list
+      assert AshBilling.Checks.HasPrice.match?(user_loaded, %{},
+               price: ["price_basic", "price_enterprise"]
+             ) == false
+
+      # 4. Empty list fails closed
+      assert AshBilling.Checks.HasPrice.match?(user_loaded, %{}, price: []) == false
+
+      # 5. List with invalid items fails closed
+      assert AshBilling.Checks.HasPrice.match?(user_loaded, %{}, price: ["price_pro", 123]) ==
+               false
+
+      assert AshBilling.Checks.HasPrice.match?(user_loaded, %{}, price: ["price_pro", ""]) ==
+               false
+
+      assert AshBilling.Checks.HasPrice.match?(user_loaded, %{}, price: ["price_pro", "   "]) ==
+               false
+
+      # 6. Lazy-load with Ash.NotLoaded relationship
+      assert AshBilling.Checks.HasPrice.match?(user, %{domain: Domain},
+               price: ["price_pro", "price_enterprise"]
+             ) == true
+
+      assert AshBilling.Checks.HasPrice.match?(user, %{domain: Domain},
+               price: ["price_basic", "price_enterprise"]
+             ) == false
+
+      # 7. Canceled subscription denies
+      {:ok, canceled_user} =
+        Ash.create(User, %{email: "canceled_multi@example.com"}, domain: Domain)
+
+      {:ok, _sub_c} =
+        Ash.create(
+          Subscription,
+          %{
+            user_id: canceled_user.id,
+            provider_subscription_id: "sub_canceled_multi",
+            status: :canceled,
+            price_id: "price_pro"
+          },
+          domain: Domain
+        )
+
+      canceled_user = Ash.load!(canceled_user, :subscriptions, domain: Domain)
+
+      assert AshBilling.Checks.HasPrice.match?(canceled_user, %{},
+               price: ["price_pro", "price_enterprise"]
+             ) == false
     end
 
     test "Ash resource with HasPrice without price: fails compilation" do
