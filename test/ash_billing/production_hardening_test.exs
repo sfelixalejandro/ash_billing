@@ -239,7 +239,7 @@ defmodule AshBilling.ProductionHardeningTest do
     assert {:error, :invalid_line_items} =
              AshBilling.create_checkout_session("cus_audit", line_items: "invalid")
 
-    assert_raise FunctionClauseError, fn -> apply(AshBilling, :get_subscription, [nil]) end
+    assert {:error, :invalid_subscription_id} = AshBilling.get_subscription(nil)
   end
 
   test "H4 concurrent checkout uses one persisted identity or fails before provider effects" do

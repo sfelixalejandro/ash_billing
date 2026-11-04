@@ -290,33 +290,40 @@ defmodule AshBilling do
   def create_portal_session(record_or_customer_id, opts) do
     cust_id = resolve_customer_id(record_or_customer_id)
 
-    if is_nil(cust_id) or cust_id == "" do
-      {:error, :no_customer_id}
-    else
-      provider = resolve_provider(record_or_customer_id, opts)
-      extra_params = Keyword.get(opts, :params, %{})
+    return_url = Keyword.get(opts, :return_url)
 
-      params =
-        extra_params
-        |> Map.merge(%{
-          customer: cust_id,
-          return_url: Keyword.fetch!(opts, :return_url)
-        })
+    cond do
+      is_nil(cust_id) or cust_id == "" ->
+        {:error, :no_customer_id}
 
-      start_meta = %{
-        provider: provider,
-        customer: cust_id
-      }
+      is_nil(return_url) or not is_binary(return_url) or String.trim(return_url) == "" ->
+        {:error, :missing_return_url}
 
-      :telemetry.span([:ash_billing, :portal], start_meta, fn ->
-        case provider.create_portal_session(params, opts) do
-          {:ok, %{url: url}} = success ->
-            {success, %{status: :ok, url: url}}
+      true ->
+        provider = resolve_provider(record_or_customer_id, opts)
+        extra_params = Keyword.get(opts, :params, %{})
 
-          {:error, reason} = error ->
-            {error, %{status: :error, error: reason}}
-        end
-      end)
+        params =
+          extra_params
+          |> Map.merge(%{
+            customer: cust_id,
+            return_url: return_url
+          })
+
+        start_meta = %{
+          provider: provider,
+          customer: cust_id
+        }
+
+        :telemetry.span([:ash_billing, :portal], start_meta, fn ->
+          case provider.create_portal_session(params, opts) do
+            {:ok, %{url: url}} = success ->
+              {success, %{status: :ok, url: url}}
+
+            {:error, reason} = error ->
+              {error, %{status: :error, error: reason}}
+          end
+        end)
     end
   end
 
@@ -326,9 +333,14 @@ defmodule AshBilling do
   @spec get_subscription(struct() | String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def get_subscription(subscription_or_id, opts \\ []) do
-    sub_id = resolve_subscription_id(subscription_or_id)
-    provider = resolve_subscription_provider(subscription_or_id, opts)
-    provider.get_subscription(sub_id, opts)
+    case resolve_subscription_id(subscription_or_id) do
+      sub_id when is_binary(sub_id) and sub_id != "" ->
+        provider = resolve_subscription_provider(subscription_or_id, opts)
+        provider.get_subscription(sub_id, opts)
+
+      _ ->
+        {:error, :invalid_subscription_id}
+    end
   end
 
   @doc """
@@ -342,9 +354,14 @@ defmodule AshBilling do
   @spec cancel_subscription(struct() | String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def cancel_subscription(subscription_or_id, opts \\ []) do
-    sub_id = resolve_subscription_id(subscription_or_id)
-    provider = resolve_subscription_provider(subscription_or_id, opts)
-    provider.cancel_subscription(sub_id, opts)
+    case resolve_subscription_id(subscription_or_id) do
+      sub_id when is_binary(sub_id) and sub_id != "" ->
+        provider = resolve_subscription_provider(subscription_or_id, opts)
+        provider.cancel_subscription(sub_id, opts)
+
+      _ ->
+        {:error, :invalid_subscription_id}
+    end
   end
 
   @doc """
@@ -355,9 +372,14 @@ defmodule AshBilling do
   @spec resume_subscription(struct() | String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def resume_subscription(subscription_or_id, opts \\ []) do
-    sub_id = resolve_subscription_id(subscription_or_id)
-    provider = resolve_subscription_provider(subscription_or_id, opts)
-    provider.resume_subscription(sub_id, opts)
+    case resolve_subscription_id(subscription_or_id) do
+      sub_id when is_binary(sub_id) and sub_id != "" ->
+        provider = resolve_subscription_provider(subscription_or_id, opts)
+        provider.resume_subscription(sub_id, opts)
+
+      _ ->
+        {:error, :invalid_subscription_id}
+    end
   end
 
   @doc """
@@ -378,22 +400,31 @@ defmodule AshBilling do
   @spec swap_plan(struct() | String.t(), String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def swap_plan(subscription_or_id, new_price_id, opts \\ []) do
-    sub_id = resolve_subscription_id(subscription_or_id)
-    provider = resolve_subscription_provider(subscription_or_id, opts)
+    case resolve_subscription_id(subscription_or_id) do
+      sub_id when is_binary(sub_id) and sub_id != "" ->
+        if not is_binary(new_price_id) or String.trim(new_price_id) == "" do
+          {:error, :invalid_price_id}
+        else
+          provider = resolve_subscription_provider(subscription_or_id, opts)
 
-    :telemetry.span(
-      [:ash_billing, :swap_plan],
-      %{provider: provider, subscription_id: sub_id, new_price_id: new_price_id},
-      fn ->
-        case provider.swap_plan(sub_id, new_price_id, opts) do
-          {:ok, result} ->
-            {{:ok, result}, %{status: :ok}}
+          :telemetry.span(
+            [:ash_billing, :swap_plan],
+            %{provider: provider, subscription_id: sub_id, new_price_id: new_price_id},
+            fn ->
+              case provider.swap_plan(sub_id, new_price_id, opts) do
+                {:ok, result} ->
+                  {{:ok, result}, %{status: :ok}}
 
-          {:error, reason} = error ->
-            {error, %{status: :error, error: reason}}
+                {:error, reason} = error ->
+                  {error, %{status: :error, error: reason}}
+              end
+            end
+          )
         end
-      end
-    )
+
+      _ ->
+        {:error, :invalid_subscription_id}
+    end
   end
 
   @doc """
@@ -416,43 +447,51 @@ defmodule AshBilling do
   end
 
   def update_quantity(subscription_or_id, quantity, opts) do
-    opts =
-      Keyword.put_new(opts, :provider, resolve_subscription_provider(subscription_or_id, opts))
+    case resolve_subscription_id(subscription_or_id) do
+      sub_id when is_binary(sub_id) and sub_id != "" ->
+        opts =
+          Keyword.put_new(
+            opts,
+            :provider,
+            resolve_subscription_provider(subscription_or_id, opts)
+          )
 
-    sub_id = resolve_subscription_id(subscription_or_id)
+        case Keyword.get(opts, :price_id) do
+          price_id when is_binary(price_id) and price_id != "" ->
+            swap_plan(sub_id, price_id, Keyword.put(opts, :quantity, quantity))
 
-    case Keyword.get(opts, :price_id) do
-      price_id when is_binary(price_id) ->
-        swap_plan(sub_id, price_id, Keyword.put(opts, :quantity, quantity))
+          _ ->
+            case get_subscription(sub_id, opts) do
+              {:ok, %{"items" => %{"data" => items}} = body} when is_list(items) ->
+                requested_item_id = Keyword.get(opts, :subscription_item_id)
 
-      _ ->
-        case get_subscription(sub_id, opts) do
-          {:ok, %{"items" => %{"data" => items}} = body} when is_list(items) ->
-            requested_item_id = Keyword.get(opts, :subscription_item_id)
+                case Stripe.select_subscription_item(body, requested_item_id) do
+                  {:ok, %{"id" => item_id, "price" => %{"id" => price_id}}} ->
+                    swap_plan(
+                      sub_id,
+                      price_id,
+                      opts
+                      |> Keyword.put(:subscription_item_id, item_id)
+                      |> Keyword.put(:quantity, quantity)
+                    )
 
-            case Stripe.select_subscription_item(body, requested_item_id) do
-              {:ok, %{"id" => item_id, "price" => %{"id" => price_id}}} ->
-                swap_plan(
-                  sub_id,
-                  price_id,
-                  opts
-                  |> Keyword.put(:subscription_item_id, item_id)
-                  |> Keyword.put(:quantity, quantity)
-                )
+                  {:error, reason} ->
+                    {:error, reason}
+
+                  _ ->
+                    {:error, {:missing_subscription_item, body}}
+                end
+
+              {:ok, body} ->
+                {:error, {:missing_subscription_item, body}}
 
               {:error, reason} ->
                 {:error, reason}
-
-              _ ->
-                {:error, {:missing_subscription_item, body}}
             end
-
-          {:ok, body} ->
-            {:error, {:missing_subscription_item, body}}
-
-          {:error, reason} ->
-            {:error, reason}
         end
+
+      _ ->
+        {:error, :invalid_subscription_id}
     end
   end
 
@@ -556,6 +595,7 @@ defmodule AshBilling do
   defp resolve_subscription_id(%{stripe_subscription_id: id}) when is_binary(id), do: id
   defp resolve_subscription_id(%{id: id}) when is_binary(id), do: id
   defp resolve_subscription_id(id) when is_binary(id), do: id
+  defp resolve_subscription_id(_), do: nil
 
   defp resolve_subscription_provider(%resource{}, opts),
     do: Keyword.get(opts, :provider, SubscriptionInfo.provider(resource))
