@@ -51,11 +51,30 @@ if Code.ensure_loaded?(Igniter) do
       1. Ensure STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET are configured in your environment.
       2. Verify resource actions, persistence and authorization policies for your application.
          New subscriptions inherit the customer's PostgreSQL repo when explicitly configured.
-      3. If using a database data layer (e.g., AshPostgres), run:
+      3. For production multi-node deployments, define a dedicated WebhookEvent resource
+         backed by PostgreSQL (sharing the same Repo pool as customer and subscription resources):
+
+         defmodule #{inspect(Igniter.Project.Module.module_name(igniter, "Billing.WebhookEvent"))} do
+           use Ash.Resource,
+             domain: #{inspect(domain)},
+             data_layer: AshPostgres.DataLayer,
+             extensions: [AshBilling.WebhookEvent]
+
+           postgres do
+             table "webhook_events"
+             repo <MyApp.Repo>
+           end
+
+           actions do
+             default_accept :*
+             defaults [:read, :create, :update, :destroy]
+           end
+         end
+
+         Then pass `deduplication_resource: #{inspect(Igniter.Project.Module.module_name(igniter, "Billing.WebhookEvent"))}` to AshBilling.Plug in your router.
+      4. If using a database data layer (e.g., AshPostgres), generate and apply migrations:
          mix ash.codegen create_billing_tables
          mix ash.migrate
-      4. For production, configure an AshBilling.WebhookEvent resource for persistent deduplication.
-         If you use a custom Plug.Parsers body_reader, ensure it assigns the raw body.
       5. Before recurring Checkout, create and persist the Customer with create_customer/2
          and reload the authorized record. Recurring Checkout supports one line item.
       """)
