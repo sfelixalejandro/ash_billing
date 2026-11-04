@@ -62,7 +62,7 @@ if Code.ensure_loaded?(Igniter) do
 
            postgres do
              table "webhook_events"
-             repo <MyApp.Repo>
+             repo #{inspect(Igniter.Project.Module.module_name(igniter, "Repo"))}
            end
 
            actions do

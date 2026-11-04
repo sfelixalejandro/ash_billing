@@ -87,8 +87,14 @@ defmodule AshBilling.Checks.HasPrice do
   @impl Ash.Policy.Check
   def describe(opts) do
     case Keyword.get(opts, :price) do
-      price when is_binary(price) and price != "" ->
-        "actor has an active subscription to price #{price}"
+      price when is_binary(price) ->
+        trimmed = String.trim(price)
+
+        if trimmed == "" do
+          "actor has an active subscription to <unspecified/invalid price>"
+        else
+          "actor has an active subscription to price #{trimmed}"
+        end
 
       [_ | _] = prices when is_list(prices) ->
         case sanitize_price_list(prices) do

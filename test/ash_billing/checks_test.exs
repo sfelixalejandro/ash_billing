@@ -176,6 +176,33 @@ defmodule AshBilling.ChecksTest do
 
       assert AshBilling.Checks.HasPrice.describe(price: "price_pro") ==
                "actor has an active subscription to price price_pro"
+
+      assert AshBilling.Checks.HasPrice.describe(price: "") ==
+               "actor has an active subscription to <unspecified/invalid price>"
+
+      assert AshBilling.Checks.HasPrice.describe(price: "   ") ==
+               "actor has an active subscription to <unspecified/invalid price>"
+
+      assert AshBilling.Checks.HasPrice.describe(price: ["price_pro", "price_enterprise"]) ==
+               "actor has an active subscription to one of prices price_pro, price_enterprise"
+
+      assert AshBilling.Checks.HasPrice.describe(price: ["price_pro", ""]) ==
+               "actor has an active subscription to <unspecified/invalid price>"
+
+      assert AshBilling.Checks.HasPrice.describe(price: ["price_pro", "   "]) ==
+               "actor has an active subscription to <unspecified/invalid price>"
+
+      assert AshBilling.Checks.HasPrice.describe(price: ["price_pro", 123]) ==
+               "actor has an active subscription to <unspecified/invalid price>"
+
+      assert AshBilling.Checks.HasPrice.describe(price: []) ==
+               "actor has an active subscription to <unspecified/invalid price>"
+
+      assert AshBilling.Checks.HasPrice.describe([]) ==
+               "actor has an active subscription to <unspecified/invalid price>"
+
+      assert AshBilling.Checks.HasPrice.describe(price: nil) ==
+               "actor has an active subscription to <unspecified/invalid price>"
     end
 
     test "handles nil and non-struct actors safely" do
