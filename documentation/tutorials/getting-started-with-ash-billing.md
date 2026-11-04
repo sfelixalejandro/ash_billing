@@ -257,7 +257,7 @@ policies do
   end
 
   policy action(:export) do
-    authorize_if {AshBilling.Checks.HasPrice, price: "price_enterprise_annual"}
+    authorize_if {AshBilling.Checks.HasPrice, price: ["price_enterprise_annual", "price_enterprise_monthly"]}
   end
 end
 ```

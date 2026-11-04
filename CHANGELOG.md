@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-03
+
+### Security
+
+- Resolved Hex advisory on retired `ash_sql 0.8.4` (Ecto query cache issue) by upgrading `ash_sql` to `0.8.7` (and `nimble_options` to `1.2.0`). Verified with `mix hex.audit` (0 advisories).
+
+### Added
+
+- `AshBilling.Checks.HasPrice`: added support for specifying multiple allowed price IDs as a list (e.g. `price: ["price_monthly", "price_annual"]`). Authorizes when the active subscription's `price_id` matches any element in the list. Enforces fail-closed semantics on empty lists, blank strings, or invalid non-binary elements.
+
+### Fixed
+
+- Public error contracts in `AshBilling`:
+  - `AshBilling.create_portal_session/2`: Returns `{:error, :missing_return_url}` when `:return_url` is missing, blank, or non-binary, avoiding `KeyError`.
+  - `AshBilling.get_subscription/2`, `cancel_subscription/2`, `resume_subscription/2`: Return `{:error, :invalid_subscription_id}` when given `nil`, `""`, or unsupported structures, preventing `FunctionClauseError` and unneeded Stripe API requests.
+  - `AshBilling.swap_plan/3`: Returns `{:error, :invalid_subscription_id}` when the subscription ID is blank or invalid, and `{:error, :invalid_price_id}` when `new_price_id` is blank or invalid.
+  - `AshBilling.update_quantity/3`: Returns `{:error, :invalid_subscription_id}` when the subscription ID is blank or invalid.
+
+### Developer Experience & Documentation
+
+- `mix ash_billing.install`: Enhanced post-install notice with a concrete PostgreSQL-backed `WebhookEvent` resource example for clustered deployments.
+- Updated `README.md` and documentation examples to highlight `HasPrice` multi-price matching and new error tuple returns.
+
 ## [0.5.0] - 2026-11-02
 
 ### Fixed

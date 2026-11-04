@@ -248,9 +248,9 @@ defmodule MyApp.AI.Prompt do
       authorize_if AshBilling.Checks.Subscribed
     end
 
-    # Require a specific plan tier (e.g., Enterprise)
+    # Require a specific plan tier (single price or list of allowed prices)
     policy action(:export_fine_tuned_weights) do
-      authorize_if {AshBilling.Checks.HasPrice, price: "price_enterprise_annual"}
+      authorize_if {AshBilling.Checks.HasPrice, price: ["price_enterprise_annual", "price_enterprise_monthly"]}
     end
   end
 end
