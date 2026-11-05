@@ -400,6 +400,22 @@ defmodule AshBillingTest do
       assert {:error, :no_customer_id} = AshBilling.create_portal_session(nil, portal_opts)
       assert {:error, :no_customer_id} = AshBilling.create_portal_session("", portal_opts)
     end
+
+    test "returns {:error, :missing_return_url} when :return_url is absent or empty", %{
+      opts: opts
+    } do
+      user = %User{id: Ash.UUID.generate(), stripe_customer_id: "cus_valid_123"}
+      assert {:error, :missing_return_url} = AshBilling.create_portal_session(user, opts)
+
+      assert {:error, :missing_return_url} =
+               AshBilling.create_portal_session(user, Keyword.put(opts, :return_url, ""))
+
+      assert {:error, :missing_return_url} =
+               AshBilling.create_portal_session(user, Keyword.put(opts, :return_url, "   "))
+
+      assert {:error, :missing_return_url} =
+               AshBilling.create_portal_session(user, Keyword.put(opts, :return_url, 12345))
+    end
   end
 
   describe "get_subscription/2" do
@@ -425,6 +441,12 @@ defmodule AshBillingTest do
 
       sub = %{provider_subscription_id: "sub_record_456"}
       assert {:ok, %{"id" => "sub_record_456"}} = AshBilling.get_subscription(sub, opts)
+    end
+
+    test "returns {:error, :invalid_subscription_id} for nil or empty IDs", %{opts: opts} do
+      assert {:error, :invalid_subscription_id} = AshBilling.get_subscription(nil, opts)
+      assert {:error, :invalid_subscription_id} = AshBilling.get_subscription("", opts)
+      assert {:error, :invalid_subscription_id} = AshBilling.get_subscription(%{}, opts)
     end
   end
 
@@ -452,6 +474,11 @@ defmodule AshBillingTest do
 
       sub = %{stripe_subscription_id: "sub_cancel_struct"}
       assert {:ok, %{"id" => "sub_cancel_struct"}} = AshBilling.cancel_subscription(sub, opts)
+    end
+
+    test "returns {:error, :invalid_subscription_id} for nil or empty IDs", %{opts: opts} do
+      assert {:error, :invalid_subscription_id} = AshBilling.cancel_subscription(nil, opts)
+      assert {:error, :invalid_subscription_id} = AshBilling.cancel_subscription("", opts)
     end
   end
 
@@ -485,6 +512,11 @@ defmodule AshBillingTest do
       sub = %{provider_subscription_id: "sub_struct_res"}
       assert {:ok, %{"id" => "sub_struct_res"}} = AshBilling.resume_subscription(sub, opts)
     end
+
+    test "returns {:error, :invalid_subscription_id} for nil or empty IDs", %{opts: opts} do
+      assert {:error, :invalid_subscription_id} = AshBilling.resume_subscription(nil, opts)
+      assert {:error, :invalid_subscription_id} = AshBilling.resume_subscription("", opts)
+    end
   end
 
   describe "swap_plan/3 and update_quantity/3" do
@@ -508,6 +540,26 @@ defmodule AshBillingTest do
 
       assert {:ok, %{"id" => "sub_top_swap"}} =
                AshBilling.swap_plan("sub_top_swap", "price_scale", opts)
+    end
+
+    test "returns {:error, :invalid_subscription_id} for swap_plan with nil/empty id", %{
+      opts: opts
+    } do
+      assert {:error, :invalid_subscription_id} = AshBilling.swap_plan(nil, "price_scale", opts)
+      assert {:error, :invalid_subscription_id} = AshBilling.swap_plan("", "price_scale", opts)
+    end
+
+    test "returns {:error, :invalid_price_id} for swap_plan with nil/empty price", %{opts: opts} do
+      assert {:error, :invalid_price_id} = AshBilling.swap_plan("sub_123", nil, opts)
+      assert {:error, :invalid_price_id} = AshBilling.swap_plan("sub_123", "", opts)
+      assert {:error, :invalid_price_id} = AshBilling.swap_plan("sub_123", "   ", opts)
+    end
+
+    test "returns {:error, :invalid_subscription_id} for update_quantity with nil/empty id", %{
+      opts: opts
+    } do
+      assert {:error, :invalid_subscription_id} = AshBilling.update_quantity(nil, 5, opts)
+      assert {:error, :invalid_subscription_id} = AshBilling.update_quantity("", 5, opts)
     end
 
     test "updates quantity on existing price", %{stub_name: stub_name, opts: opts} do
