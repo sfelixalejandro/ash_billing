@@ -347,4 +347,183 @@ defmodule AshBilling.HardeningRemediationTest do
       end
     end
   end
+
+  # ===========================================================================
+  # AB-09: Subscription Reconciliation & Webhook Drift Recovery
+  # ===========================================================================
+
+  describe "AB-09: reconcile_subscription/2" do
+    defmodule DriftProvider do
+      def get_subscription(id, opts) do
+        case Keyword.get(opts, :mock_response) do
+          {:ok, sub} -> {:ok, sub}
+          {:error, reason} -> {:error, reason}
+          nil -> {:ok, %{"id" => id, "customer" => "cus_drift", "status" => "active"}}
+        end
+      end
+    end
+
+    setup do
+      Ecto.Adapters.SQL.query!(
+        Repo,
+        "TRUNCATE billing_test_subscriptions, billing_test_customers"
+      )
+
+      customer = Ash.create!(PostgresCustomer, %{stripe_customer_id: "cus_drift"}, @opts)
+
+      sub =
+        Ash.create!(
+          PostgresSubscription,
+          %{
+            user_id: customer.id,
+            provider_subscription_id: "sub_drift_1",
+            status: :active,
+            price_id: "price_basic"
+          },
+          @opts
+        )
+
+      %{customer: customer, subscription: sub}
+    end
+
+    test "persists remote cancellation into PostgreSQL when webhook was dropped", %{
+      subscription: sub
+    } do
+      # Simulate Stripe subscription having been canceled during an outage
+      remote_canceled = %{
+        "id" => "sub_drift_1",
+        "customer" => "cus_drift",
+        "status" => "canceled",
+        "items" => %{"data" => [%{"price" => %{"id" => "price_basic"}}]}
+      }
+
+      # AshBilling.get_subscription/2 alone only queries Stripe and does NOT update PostgreSQL:
+      assert {:ok, remote_state} =
+               AshBilling.get_subscription(sub,
+                 provider: DriftProvider,
+                 mock_response: {:ok, remote_canceled}
+               )
+
+      assert remote_state["status"] == "canceled"
+
+      # Verify local DB is still stale (:active)
+      persisted_before = Ash.get!(PostgresSubscription, sub.id, @opts)
+      assert persisted_before.status == :active
+
+      # Calling AshBilling.reconcile_subscription/2 safely persists the live state into PostgreSQL:
+      assert {:ok, reconciled} =
+               AshBilling.reconcile_subscription(sub,
+                 provider: DriftProvider,
+                 mock_response: {:ok, remote_canceled},
+                 domain: PostgresDomain,
+                 authorize?: false
+               )
+
+      assert reconciled.status == :canceled
+
+      # Verify local DB is now reconciled to :canceled
+      persisted_after = Ash.get!(PostgresSubscription, sub.id, @opts)
+      assert persisted_after.status == :canceled
+    end
+
+    test "reconciles plan and price updates using string ID and explicit subscription_resource" do
+      remote_upgraded = %{
+        "id" => "sub_drift_1",
+        "customer" => "cus_drift",
+        "status" => "active",
+        "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
+      }
+
+      assert {:ok, reconciled} =
+               AshBilling.reconcile_subscription("sub_drift_1",
+                 subscription_resource: PostgresSubscription,
+                 provider: DriftProvider,
+                 mock_response: {:ok, remote_upgraded},
+                 domain: PostgresDomain,
+                 authorize?: false
+               )
+
+      assert reconciled.status == :active
+      assert reconciled.price_id == "price_enterprise"
+
+      persisted = Ash.get!(PostgresSubscription, reconciled.id, @opts)
+      assert persisted.price_id == "price_enterprise"
+    end
+
+    test "returns {:error, :missing_subscription_resource} when reconciling a string ID without resource" do
+      assert {:error, :missing_subscription_resource} =
+               AshBilling.reconcile_subscription("sub_drift_1",
+                 provider: DriftProvider,
+                 domain: PostgresDomain
+               )
+    end
+
+    test "returns {:error, :invalid_subscription_id} on blank or nil subscription input" do
+      for invalid <- [nil, "", "   ", %{}] do
+        assert {:error, :invalid_subscription_id} =
+                 AshBilling.reconcile_subscription(invalid,
+                   subscription_resource: PostgresSubscription,
+                   provider: DriftProvider
+                 )
+      end
+    end
+
+    test "propagates remote provider errors cleanly without raising" do
+      assert {:error, :not_found} =
+               AshBilling.reconcile_subscription("sub_drift_1",
+                 subscription_resource: PostgresSubscription,
+                 provider: DriftProvider,
+                 mock_response: {:error, :not_found},
+                 domain: PostgresDomain
+               )
+    end
+  end
+
+  # ===========================================================================
+  # Legacy Provider Fallback Semantics
+  # ===========================================================================
+
+  describe "Legacy Provider Fallback for update_quantity/3" do
+    defmodule LegacyFallbackProvider do
+      def swap_plan(sub_id, price_id, opts) do
+        send(self(), {:legacy_swap_plan, sub_id, price_id, opts})
+        {:ok, %{"id" => sub_id, "price" => price_id, "quantity" => opts[:quantity]}}
+      end
+
+      def get_subscription(sub_id, _opts) do
+        {:ok,
+         %{
+           "id" => sub_id,
+           "items" => %{
+             "data" => [
+               %{"id" => "si_legacy", "price" => %{"id" => "price_current"}, "quantity" => 1}
+             ]
+           }
+         }}
+      end
+    end
+
+    test "legacy provider without update_quantity/3 invokes swap_plan/3 with supplied price_id" do
+      # When caller passes a price_id to a legacy provider, it falls back to swap_plan/3 with that price_id
+      assert {:ok, res} =
+               AshBilling.update_quantity("sub_leg_1", 7,
+                 provider: LegacyFallbackProvider,
+                 price_id: "price_stale"
+               )
+
+      assert res["quantity"] == 7
+      assert_received {:legacy_swap_plan, "sub_leg_1", "price_stale", opts}
+      assert opts[:quantity] == 7
+    end
+
+    test "legacy provider without update_quantity/3 resolves active price via get_subscription/2 when price_id omitted" do
+      assert {:ok, res} =
+               AshBilling.update_quantity("sub_leg_2", 4, provider: LegacyFallbackProvider)
+
+      assert res["quantity"] == 4
+      assert_received {:legacy_swap_plan, "sub_leg_2", "price_current", opts}
+      assert opts[:quantity] == 4
+      assert opts[:subscription_item_id] == "si_legacy"
+    end
+  end
 end

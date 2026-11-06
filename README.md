@@ -68,7 +68,8 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 
 ## Installation
 
-Version **0.5.0** includes billing lifecycle and webhook consistency changes.
+Version **0.5.2** (part of the 0.5.x release line) includes production hardening,
+subscription quantity isolation, URL sanitization, and webhook consistency improvements.
 Read [Upgrading to 0.5](documentation/topics/upgrading-to-0.5.md) before updating
 from 0.4.x. For older upgrades, also see
 [Upgrading to 0.4](documentation/topics/upgrading-to-0.4.md).
@@ -88,7 +89,7 @@ Alternatively, you can install it manually by adding `ash_billing` to your `mix.
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.5.0"}
+    {:ash_billing, "~> 0.5.2"}
   ]
 end
 ```
@@ -230,11 +231,25 @@ AshBilling.subscribed?(user, "price_pro_monthly")
 {:ok, updated_sub} = AshBilling.update_quantity(user_subscription, 10, price_id: "price_seats_v1")
 ```
 
+> [!NOTE]
+> **Provider Quantity Isolation**: `AshBilling.Providers.Stripe` guarantees price isolation by sending only the subscription item ID and updated quantity, omitting the price from the payload. For custom providers lacking `@callback update_quantity/3`, `AshBilling` falls back to `swap_plan/3`. If a caller supplies a stale `:price_id` to a legacy fallback provider, `swap_plan/3` will execute with that stale price. To guarantee price safety, custom providers must implement `update_quantity/3`.
+
 ### Resume a Canceled Subscription
 ```elixir
 # Reactivate a subscription that was scheduled to cancel at period end
 {:ok, resumed_sub} = AshBilling.resume_subscription(user_subscription)
 ```
+
+### Reconcile Subscriptions (Webhook Drift & Recovery)
+```elixir
+# Safely fetch live state from Stripe and commit updates to PostgreSQL inside advisory locks:
+{:ok, reconciled_sub} = AshBilling.reconcile_subscription(user_subscription,
+  domain: MyApp.Billing
+)
+```
+
+> [!TIP]
+> `AshBilling.get_subscription/2` only reads remote state from the billing provider without persisting changes. To repair database drift when webhooks are permanently lost or delayed (e.g. endpoint down > 72h), use `AshBilling.reconcile_subscription/2` in periodic maintenance jobs (such as an Oban worker) or interactive recovery tasks. It wraps the authoritative provider snapshot in a synthetic event, processes it through `AshBilling.WebhookSync.sync_event/2`, and commits state inside transaction and advisory lock boundaries.
 
 ---
 
