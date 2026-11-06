@@ -38,7 +38,7 @@ defmodule AshBilling do
   Reload the record before using it for recurring Checkout. Existing IDs are
   returned without a provider call; callers remain responsible for authorization.
   """
-  @spec create_customer(struct() | map(), keyword()) ::
+  @spec create_customer(term(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
   def create_customer(record_or_params, opts \\ [])
 
@@ -55,6 +55,10 @@ defmodule AshBilling do
       provider = Keyword.get(opts, :provider, Stripe)
       provider.create_customer(params, opts)
     end
+  end
+
+  def create_customer(_record_or_params, _opts) do
+    {:error, :invalid_customer}
   end
 
   defp do_create_customer(resource, record, opts) do
@@ -430,11 +434,21 @@ defmodule AshBilling do
   @doc """
   Updates the quantity of a subscription (e.g. per-seat billing).
 
+  When the provider exports `update_quantity/3` (such as `AshBilling.Providers.Stripe`),
+  the update is applied directly to the subscription item quantity without modifying
+  the plan price. If `:price_id` is supplied, it is validated against the actual active
+  price as an optimistic assertion; if the price on Stripe differs, the update
+  is aborted with `{:error, {:price_mismatch, actual_price_id}}`.
+
+  If the provider does not export `update_quantity/3`, the operation falls back
+  to `swap_plan/3`.
+
   ## Options
 
     * `:proration_behavior` - `"create_prorations"` (default), `"none"`, or `"always_invoice"`.
-    * `:subscription_item_id` - Explicit Stripe subscription item ID (avoids an extra GET call if known).
-    * `:price_id` - The existing price ID (if known, skips the GET call).
+    * `:subscription_item_id` - Explicit subscription item ID (avoids an extra GET call if known).
+    * `:price_id` - Expected active price ID assertion (aborts if Stripe has a different price).
+    * `:proration_date` - Unix timestamp to use for calculating prorations.
     * `:provider` - The billing provider module.
   """
   @spec update_quantity(struct() | String.t(), pos_integer(), keyword()) ::
@@ -456,42 +470,113 @@ defmodule AshBilling do
             resolve_subscription_provider(subscription_or_id, opts)
           )
 
-        case Keyword.get(opts, :price_id) do
-          price_id when is_binary(price_id) and price_id != "" ->
-            swap_plan(sub_id, price_id, Keyword.put(opts, :quantity, quantity))
+        provider = Keyword.fetch!(opts, :provider)
 
-          _ ->
-            case get_subscription(sub_id, opts) do
-              {:ok, %{"items" => %{"data" => items}} = body} when is_list(items) ->
-                requested_item_id = Keyword.get(opts, :subscription_item_id)
-
-                case Stripe.select_subscription_item(body, requested_item_id) do
-                  {:ok, %{"id" => item_id, "price" => %{"id" => price_id}}} ->
-                    swap_plan(
-                      sub_id,
-                      price_id,
-                      opts
-                      |> Keyword.put(:subscription_item_id, item_id)
-                      |> Keyword.put(:quantity, quantity)
-                    )
-
-                  {:error, reason} ->
-                    {:error, reason}
-
-                  _ ->
-                    {:error, {:missing_subscription_item, body}}
-                end
-
-              {:ok, body} ->
-                {:error, {:missing_subscription_item, body}}
-
-              {:error, reason} ->
-                {:error, reason}
-            end
+        if Code.ensure_loaded?(provider) and function_exported?(provider, :update_quantity, 3) do
+          execute_provider_update_quantity(provider, sub_id, quantity, opts)
+        else
+          fallback_update_quantity(sub_id, quantity, opts)
         end
 
       _ ->
         {:error, :invalid_subscription_id}
+    end
+  end
+
+  defp execute_provider_update_quantity(provider, sub_id, quantity, opts) do
+    expected_price_id = Keyword.get(opts, :price_id)
+    requested_item_id = Keyword.get(opts, :subscription_item_id)
+
+    case verify_expected_price(provider, sub_id, expected_price_id, requested_item_id, opts) do
+      {:ok, resolved_opts} ->
+        :telemetry.span(
+          [:ash_billing, :update_quantity],
+          %{provider: provider, subscription_id: sub_id, quantity: quantity},
+          fn ->
+            case provider.update_quantity(sub_id, quantity, resolved_opts) do
+              {:ok, result} ->
+                {{:ok, result}, %{status: :ok}}
+
+              {:error, reason} = error ->
+                {error, %{status: :error, error: reason}}
+            end
+          end
+        )
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp verify_expected_price(_provider, _sub_id, nil, _requested_item_id, opts) do
+    {:ok, opts}
+  end
+
+  defp verify_expected_price(provider, sub_id, expected_price_id, requested_item_id, opts)
+       when is_binary(expected_price_id) and expected_price_id != "" do
+    case provider.get_subscription(sub_id, opts) do
+      {:ok, body} ->
+        case Stripe.select_subscription_item(body, requested_item_id) do
+          {:ok, %{"id" => item_id} = item} ->
+            actual_price = get_in(item, ["price", "id"]) || item["price"]
+
+            if actual_price == expected_price_id do
+              {:ok, Keyword.put(opts, :subscription_item_id, item_id)}
+            else
+              {:error, {:price_mismatch, actual_price}}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+
+          _ ->
+            {:error, {:missing_subscription_item, body}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp verify_expected_price(_provider, _sub_id, _invalid_price, _requested_item_id, _opts) do
+    {:error, :invalid_price_id}
+  end
+
+  defp fallback_update_quantity(sub_id, quantity, opts) do
+    case Keyword.get(opts, :price_id) do
+      price_id when is_binary(price_id) and price_id != "" ->
+        swap_plan(sub_id, price_id, Keyword.put(opts, :quantity, quantity))
+
+      _ ->
+        provider = Keyword.fetch!(opts, :provider)
+
+        case provider.get_subscription(sub_id, opts) do
+          {:ok, %{"items" => %{"data" => items}} = body} when is_list(items) ->
+            requested_item_id = Keyword.get(opts, :subscription_item_id)
+
+            case Stripe.select_subscription_item(body, requested_item_id) do
+              {:ok, %{"id" => item_id, "price" => %{"id" => price_id}}} ->
+                swap_plan(
+                  sub_id,
+                  price_id,
+                  opts
+                  |> Keyword.put(:subscription_item_id, item_id)
+                  |> Keyword.put(:quantity, quantity)
+                )
+
+              {:error, reason} ->
+                {:error, reason}
+
+              _ ->
+                {:error, {:missing_subscription_item, body}}
+            end
+
+          {:ok, body} ->
+            {:error, {:missing_subscription_item, body}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
     end
   end
 

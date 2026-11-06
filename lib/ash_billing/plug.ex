@@ -36,11 +36,20 @@ defmodule AshBilling.Plug do
         call_with_boundary(conn, opts)
 
       {:error, reason} ->
+        require Logger
+
+        Logger.error(
+          "AshBilling.Plug: Pre-authentication transaction boundary failed: #{inspect(reason)}"
+        )
+
         conn
         |> put_resp_content_type("application/json")
         |> send_resp(
           503,
-          Jason.encode!(%{error: "transaction_boundary", details: inspect(reason)})
+          Jason.encode!(%{
+            error: "transaction_boundary",
+            message: "Service temporarily unavailable"
+          })
         )
         |> halt()
     end
@@ -178,7 +187,7 @@ defmodule AshBilling.Plug do
                   resp_conn =
                     conn
                     |> put_resp_content_type("application/json")
-                    |> send_resp(400, Jason.encode!(%{error: to_string(reason)}))
+                    |> send_resp(400, Jason.encode!(%{error: format_error_reason(reason)}))
                     |> halt()
 
                   {resp_conn, %{status: :error, error: reason}}
@@ -188,7 +197,7 @@ defmodule AshBilling.Plug do
               resp_conn =
                 conn
                 |> put_resp_content_type("application/json")
-                |> send_resp(400, Jason.encode!(%{error: to_string(reason)}))
+                |> send_resp(400, Jason.encode!(%{error: format_error_reason(reason)}))
                 |> halt()
 
               {resp_conn, %{status: :error, error: reason}}
@@ -427,4 +436,8 @@ defmodule AshBilling.Plug do
 
   defp resolve_secret(secret) when is_binary(secret) and byte_size(secret) > 0, do: {:ok, secret}
   defp resolve_secret(_), do: {:error, :missing_webhook_secret}
+
+  defp format_error_reason(reason) when is_binary(reason), do: reason
+  defp format_error_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp format_error_reason(_), do: "invalid_payload"
 end

@@ -1,6 +1,8 @@
 defmodule AshBilling.Test.HardeningProvider do
   @behaviour AshBilling.Provider
-  for {name, arity} <- AshBilling.Provider.behaviour_info(:callbacks) do
+
+  for {name, arity} <- AshBilling.Provider.behaviour_info(:callbacks),
+      {name, arity} not in AshBilling.Provider.behaviour_info(:optional_callbacks) do
     args = Macro.generate_arguments(arity, __MODULE__)
     def unquote(name)(unquote_splicing(args)), do: result(unquote(name), [unquote_splicing(args)])
   end

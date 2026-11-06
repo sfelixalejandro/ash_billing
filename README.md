@@ -219,9 +219,15 @@ AshBilling.subscribed?(user, "price_pro_monthly")
 {:ok, updated_sub} = AshBilling.swap_plan(user_subscription, "price_enterprise_annual",
   proration_behavior: "create_prorations"
 )
+```
 
-# Update seat quantities (per-seat billing)
+### Update Quantities (Per-Seat Billing)
+```elixir
+# Update seat quantities directly without altering the subscription's price or plan
 {:ok, updated_sub} = AshBilling.update_quantity(user_subscription, 10)
+
+# Or provide an optimistic price assertion (aborts if Stripe has a different plan):
+{:ok, updated_sub} = AshBilling.update_quantity(user_subscription, 10, price_id: "price_seats_v1")
 ```
 
 ### Resume a Canceled Subscription
@@ -333,6 +339,8 @@ config :ash_billing,
 | `[:ash_billing, :sync, :start \| :stop \| :exception]` | Emitted during database synchronization in `AshBilling.WebhookSync`. | `:system_time` / `:duration` | `:event_type`, `:event_id`, `:customer_resource`, `:subscription_resource`, `:status` |
 | `[:ash_billing, :checkout, :start \| :stop \| :exception]` | Emitted during Checkout session creation in `AshBilling.create_checkout_session/2`. | `:system_time` / `:duration` | `:provider`, `:mode`, `:customer`, `:status`, `:session_id`, `:url` |
 | `[:ash_billing, :portal, :start \| :stop \| :exception]` | Emitted during Billing Portal session creation in `AshBilling.create_portal_session/2`. | `:system_time` / `:duration` | `:provider`, `:customer`, `:status`, `:url` |
+| `[:ash_billing, :swap_plan, :start \| :stop \| :exception]` | Emitted during plan swaps in `AshBilling.swap_plan/3`. | `:system_time` / `:duration` | `:provider`, `:subscription_id`, `:new_price_id`, `:status` |
+| `[:ash_billing, :update_quantity, :start \| :stop \| :exception]` | Emitted during quantity/seat updates in `AshBilling.update_quantity/3`. | `:system_time` / `:duration` | `:provider`, `:subscription_id`, `:quantity`, `:status` |
 
 ---
 

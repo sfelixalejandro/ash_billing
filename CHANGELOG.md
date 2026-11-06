@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.5.2] - 2026-11-06
+
+### Security & Reliability Hardening
+
+- **Subscription Quantity Updates (AB-01, AB-02)**: Added optional `update_quantity/3` callback to `AshBilling.Provider` behaviour and implemented it in `AshBilling.Providers.Stripe`. Quantity updates now POST only `items[0][id]` and `items[0][quantity]`, omitting `items[0][price]`. This prevents unintended plan switches, avoids race conditions where a concurrent plan change would be clobbered by a quantity update, and avoids unnecessary GET requests when `subscription_item_id` is supplied without `price_id`. An optional `:price_id` can be passed as an optimistic assertion against the active plan, returning `{:error, {:price_mismatch, actual}}` if stale. Emits `[:ash_billing, :update_quantity]` telemetry span.
+- **URL Path Sanitization & Traversal Prevention (AB-03)**: Added percent-encoding via `URI.encode(..., &URI.char_unreserved?/1)` for all dynamic `subscription_id` path segments in `AshBilling.Providers.Stripe` (`get_subscription`, `cancel_subscription`, `resume_subscription`, `swap_plan`, `update_quantity`). Validates subscription IDs early and returns `{:error, :invalid_subscription_id}` on blank, whitespace-only, or non-binary input without making remote requests.
+- **Webhook Error Normalization (AB-04)**: Normalized verification error handling in `AshBilling.Plug`. Signed non-JSON payloads now return a clean 400 response with `{"error": "invalid_payload"}` instead of raising `Protocol.UndefinedError` on `Jason.DecodeError`.
+- **Pre-Authentication Information Disclosure Prevention (AB-05)**: Redacted internal repository module names from the 503 response body when the pre-authentication transaction boundary fails in `AshBilling.Plug`. Details are logged via `Logger.error/1` while external callers receive a sanitized `{"error": "transaction_boundary", "message": "Service temporarily unavailable"}`.
+- **Public API Contract Robustness (AB-06)**: Added fallback clause to `AshBilling.create_customer/2` returning `{:error, :invalid_customer}` for non-map / non-struct inputs (`nil`, `""`, numbers, lists), replacing `FunctionClauseError`.
+- **Documentation & Telemetry Consistency (AB-07)**: Documented `[:ash_billing, :swap_plan]` and `[:ash_billing, :update_quantity]` telemetry spans in `README.md`. Updated `SECURITY.md` supported versions to explicitly list `0.5.x`.
 
 ## [0.5.1] - 2026-11-03
 

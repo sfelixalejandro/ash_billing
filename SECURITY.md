@@ -10,7 +10,8 @@ Only the latest minor/patch releases receive security updates.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.4.x   | Yes                |
+| 0.5.x   | Yes                |
+| 0.4.x   | Security fixes only|
 | < 0.4.0 | No                 |
 
 ---
