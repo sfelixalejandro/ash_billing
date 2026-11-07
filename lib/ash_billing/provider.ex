@@ -52,6 +52,13 @@ defmodule AshBilling.Provider do
               {:ok, map()} | {:error, term()}
 
   @doc """
+  Updates the quantity of an active subscription without changing its price/plan.
+  Optional callback. Providers that do not export it fall back to `swap_plan/3`.
+  """
+  @callback update_quantity(subscription_id(), quantity :: pos_integer(), opts :: opts()) ::
+              {:ok, map()} | {:error, term()}
+
+  @doc """
   Verifies an incoming webhook payload and signature.
   Returns `{:ok, event_map}` if valid, or `{:error, reason}` if invalid.
   """
@@ -61,4 +68,6 @@ defmodule AshBilling.Provider do
               secret :: String.t(),
               opts :: opts()
             ) :: {:ok, map()} | {:error, term()}
+
+  @optional_callbacks [update_quantity: 3]
 end

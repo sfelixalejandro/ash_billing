@@ -82,7 +82,7 @@ defmodule AshBillingTest do
           {:ok, body, conn} = Plug.Conn.read_body(conn)
           params = URI.decode_query(body)
           assert params["items[0][id]"] == "si_target"
-          assert params["items[0][price]"] == "price_target"
+          refute Map.has_key?(params, "items[0][price]")
           assert params["items[0][quantity]"] == "5"
           Req.Test.json(conn, %{id: "sub_multi"})
       end
@@ -92,14 +92,18 @@ defmodule AshBillingTest do
              AshBilling.update_quantity(
                "sub_multi",
                5,
-               Keyword.put(opts, :subscription_item_id, "si_target")
+               opts
+               |> Keyword.put(:subscription_item_id, "si_target")
+               |> Keyword.put(:price_id, "price_target")
              )
 
     assert {:error, {:missing_subscription_item, _}} =
              AshBilling.update_quantity(
                "sub_multi",
                5,
-               Keyword.put(opts, :subscription_item_id, "si_absent")
+               opts
+               |> Keyword.put(:subscription_item_id, "si_absent")
+               |> Keyword.put(:price_id, "price_target")
              )
   end
 
@@ -562,24 +566,25 @@ defmodule AshBillingTest do
       assert {:error, :invalid_subscription_id} = AshBilling.update_quantity("", 5, opts)
     end
 
-    test "updates quantity on existing price", %{stub_name: stub_name, opts: opts} do
+    test "updates quantity with explicit item id makes zero GETs and omits price", %{
+      stub_name: stub_name,
+      opts: opts
+    } do
       Req.Test.stub(stub_name, fn conn ->
         assert conn.method == "POST"
         assert conn.request_path == "/v1/subscriptions/sub_qty_123"
 
         {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert body =~ "items%5B0%5D%5Bid%5D=si_seat_item"
         assert body =~ "items%5B0%5D%5Bquantity%5D=5"
-        assert body =~ "items%5B0%5D%5Bprice%5D=price_seats"
+        refute body =~ "items%5B0%5D%5Bprice%5D"
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
         |> Plug.Conn.send_resp(200, Jason.encode!(%{"id" => "sub_qty_123", "status" => "active"}))
       end)
 
-      opts =
-        opts
-        |> Keyword.put(:subscription_item_id, "si_seat_item")
-        |> Keyword.put(:price_id, "price_seats")
+      opts = Keyword.put(opts, :subscription_item_id, "si_seat_item")
 
       assert {:ok, %{"id" => "sub_qty_123"}} =
                AshBilling.update_quantity("sub_qty_123", 5, opts)
@@ -607,7 +612,7 @@ defmodule AshBillingTest do
           "POST" ->
             {:ok, body, conn} = Plug.Conn.read_body(conn)
             assert body =~ "items%5B0%5D%5Bid%5D=si_seat_auto"
-            assert body =~ "items%5B0%5D%5Bprice%5D=price_auto_plan"
+            refute body =~ "items%5B0%5D%5Bprice%5D"
             assert body =~ "items%5B0%5D%5Bquantity%5D=3"
 
             conn

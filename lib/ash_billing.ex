@@ -11,6 +11,7 @@ defmodule AshBilling do
   alias AshBilling.Providers.Stripe
   alias AshBilling.Resource.Info, as: ResourceInfo
   alias AshBilling.Subscription.Info, as: SubscriptionInfo
+  alias AshBilling.WebhookSync
 
   @doc """
   Extracts the customer ID from a record configured with `AshBilling.Resource`.
@@ -38,7 +39,7 @@ defmodule AshBilling do
   Reload the record before using it for recurring Checkout. Existing IDs are
   returned without a provider call; callers remain responsible for authorization.
   """
-  @spec create_customer(struct() | map(), keyword()) ::
+  @spec create_customer(term(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
   def create_customer(record_or_params, opts \\ [])
 
@@ -55,6 +56,10 @@ defmodule AshBilling do
       provider = Keyword.get(opts, :provider, Stripe)
       provider.create_customer(params, opts)
     end
+  end
+
+  def create_customer(_record_or_params, _opts) do
+    {:error, :invalid_customer}
   end
 
   defp do_create_customer(resource, record, opts) do
@@ -344,6 +349,96 @@ defmodule AshBilling do
   end
 
   @doc """
+  Reconciles a subscription against the authoritative provider state and persists updates.
+
+  Unlike `get_subscription/2` which only queries the provider without modifying local
+  data, `reconcile_subscription/2` fetches the live subscription from the provider and
+  passes it to `AshBilling.WebhookSync.sync_event/2` as a synthetic event. This ensures
+  that any status, plan, period, or cancellation changes are safely persisted to
+  PostgreSQL inside advisory locks and transaction boundaries.
+
+  This provides a safe, on-demand or periodic reconciliation procedure to heal local database
+  drift when webhooks are permanently lost or delayed, without requiring an in-library
+  background daemon.
+
+  ## Options
+
+  Requires the synchronization options needed by `AshBilling.WebhookSync.sync_event/2`:
+    * `:subscription_resource` - Ash resource for subscriptions (inferred automatically if `subscription_or_id` is a record).
+    * `:customer_resource` - Ash resource for customers (e.g. `MyApp.Accounts.User`). Inferred from `subscription_resource` relationship if available.
+    * `:domain` - The Ash domain module to execute actions with.
+    * `:tenant` - Optional tenant identifier for multitenant deployments.
+    * `:actor` - Optional system actor to run actions on behalf of.
+    * `:authorize?` - Whether to perform authorization checks. Defaults to `false`.
+    * `:provider` - Billing provider module (defaults to configured provider).
+
+  ## Example
+
+      # In an Oban worker or scheduled task:
+      {:ok, updated_sub} =
+        AshBilling.reconcile_subscription(subscription,
+          domain: MyApp.Billing
+        )
+  """
+  @spec reconcile_subscription(struct() | String.t(), keyword()) ::
+          {:ok, struct() | :ignored} | {:error, term()}
+  def reconcile_subscription(subscription_or_id, opts \\ []) do
+    with {:ok, live_sub} <- get_subscription(subscription_or_id, opts) do
+      subscription_resource =
+        cond do
+          Keyword.has_key?(opts, :subscription_resource) ->
+            Keyword.get(opts, :subscription_resource)
+
+          is_struct(subscription_or_id) ->
+            subscription_or_id.__struct__
+
+          true ->
+            nil
+        end
+
+      customer_resource =
+        opts[:customer_resource] ||
+          (subscription_resource &&
+             case Ash.Resource.Info.relationship(
+                    subscription_resource,
+                    SubscriptionInfo.customer_relationship(subscription_resource)
+                  ) do
+               %{destination: dest} -> dest
+               _ -> nil
+             end)
+
+      if is_nil(subscription_resource) do
+        {:error, :missing_subscription_resource}
+      else
+        event_type =
+          if live_sub["status"] in ["canceled", "incomplete_expired"],
+            do: "customer.subscription.deleted",
+            else: "customer.subscription.updated"
+
+        now = System.system_time(:second)
+
+        synthetic_event = %{
+          "id" => "reconcile_#{live_sub["id"]}_#{now}",
+          "type" => event_type,
+          "created" => now,
+          "data" => %{"object" => live_sub}
+        }
+
+        sync_opts =
+          opts
+          |> Keyword.put(:subscription_resource, subscription_resource)
+          |> then(fn o ->
+            if customer_resource,
+              do: Keyword.put_new(o, :customer_resource, customer_resource),
+              else: o
+          end)
+
+        WebhookSync.sync_event(synthetic_event, sync_opts)
+      end
+    end
+  end
+
+  @doc """
   Cancels a subscription.
 
   ## Options
@@ -430,11 +525,30 @@ defmodule AshBilling do
   @doc """
   Updates the quantity of a subscription (e.g. per-seat billing).
 
+  ### Provider Implementation Note & Legacy Fallback
+
+  * **Stripe Provider (`AshBilling.Providers.Stripe`)**: Implements `@callback update_quantity/3`
+    natively. The HTTP request to Stripe sends only `items[0][id]` and `items[0][quantity]`,
+    omitting `items[0][price]` entirely. This guarantees at the provider level that Stripe cannot
+    accidentally change the plan price during a quantity update, avoiding race conditions with
+    concurrent plan changes. If `:price_id` is supplied, it acts as an optimistic assertion
+    against the live price; if the remote price differs, the update is safely aborted with
+    `{:error, {:price_mismatch, actual_price_id}}`.
+
+  * **Legacy / Custom Providers**: If a custom provider does not implement `@callback update_quantity/3`,
+    `AshBilling` falls back to `swap_plan/3`. If `:price_id` is provided, `swap_plan/3` is called
+    directly with that price ID; if the caller passes a stale price ID, the legacy provider will
+    unintentionally execute a plan swap to that stale price. If `:price_id` is omitted, the fallback
+    retrieves the active price via `get_subscription/2` before swapping, which carries a theoretical
+    race window under concurrent plan modifications. Custom providers must implement
+    `@callback update_quantity/3` to achieve the same price isolation and atomicity guarantees as Stripe.
+
   ## Options
 
     * `:proration_behavior` - `"create_prorations"` (default), `"none"`, or `"always_invoice"`.
-    * `:subscription_item_id` - Explicit Stripe subscription item ID (avoids an extra GET call if known).
-    * `:price_id` - The existing price ID (if known, skips the GET call).
+    * `:subscription_item_id` - Explicit subscription item ID (avoids an extra GET call if known).
+    * `:price_id` - Expected active price ID assertion (aborts if Stripe has a different price).
+    * `:proration_date` - Unix timestamp to use for calculating prorations.
     * `:provider` - The billing provider module.
   """
   @spec update_quantity(struct() | String.t(), pos_integer(), keyword()) ::
@@ -456,42 +570,113 @@ defmodule AshBilling do
             resolve_subscription_provider(subscription_or_id, opts)
           )
 
-        case Keyword.get(opts, :price_id) do
-          price_id when is_binary(price_id) and price_id != "" ->
-            swap_plan(sub_id, price_id, Keyword.put(opts, :quantity, quantity))
+        provider = Keyword.fetch!(opts, :provider)
 
-          _ ->
-            case get_subscription(sub_id, opts) do
-              {:ok, %{"items" => %{"data" => items}} = body} when is_list(items) ->
-                requested_item_id = Keyword.get(opts, :subscription_item_id)
-
-                case Stripe.select_subscription_item(body, requested_item_id) do
-                  {:ok, %{"id" => item_id, "price" => %{"id" => price_id}}} ->
-                    swap_plan(
-                      sub_id,
-                      price_id,
-                      opts
-                      |> Keyword.put(:subscription_item_id, item_id)
-                      |> Keyword.put(:quantity, quantity)
-                    )
-
-                  {:error, reason} ->
-                    {:error, reason}
-
-                  _ ->
-                    {:error, {:missing_subscription_item, body}}
-                end
-
-              {:ok, body} ->
-                {:error, {:missing_subscription_item, body}}
-
-              {:error, reason} ->
-                {:error, reason}
-            end
+        if Code.ensure_loaded?(provider) and function_exported?(provider, :update_quantity, 3) do
+          execute_provider_update_quantity(provider, sub_id, quantity, opts)
+        else
+          fallback_update_quantity(sub_id, quantity, opts)
         end
 
       _ ->
         {:error, :invalid_subscription_id}
+    end
+  end
+
+  defp execute_provider_update_quantity(provider, sub_id, quantity, opts) do
+    expected_price_id = Keyword.get(opts, :price_id)
+    requested_item_id = Keyword.get(opts, :subscription_item_id)
+
+    case verify_expected_price(provider, sub_id, expected_price_id, requested_item_id, opts) do
+      {:ok, resolved_opts} ->
+        :telemetry.span(
+          [:ash_billing, :update_quantity],
+          %{provider: provider, subscription_id: sub_id, quantity: quantity},
+          fn ->
+            case provider.update_quantity(sub_id, quantity, resolved_opts) do
+              {:ok, result} ->
+                {{:ok, result}, %{status: :ok}}
+
+              {:error, reason} = error ->
+                {error, %{status: :error, error: reason}}
+            end
+          end
+        )
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp verify_expected_price(_provider, _sub_id, nil, _requested_item_id, opts) do
+    {:ok, opts}
+  end
+
+  defp verify_expected_price(provider, sub_id, expected_price_id, requested_item_id, opts)
+       when is_binary(expected_price_id) and expected_price_id != "" do
+    case provider.get_subscription(sub_id, opts) do
+      {:ok, body} ->
+        case Stripe.select_subscription_item(body, requested_item_id) do
+          {:ok, %{"id" => item_id} = item} ->
+            actual_price = get_in(item, ["price", "id"]) || item["price"]
+
+            if actual_price == expected_price_id do
+              {:ok, Keyword.put(opts, :subscription_item_id, item_id)}
+            else
+              {:error, {:price_mismatch, actual_price}}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+
+          _ ->
+            {:error, {:missing_subscription_item, body}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp verify_expected_price(_provider, _sub_id, _invalid_price, _requested_item_id, _opts) do
+    {:error, :invalid_price_id}
+  end
+
+  defp fallback_update_quantity(sub_id, quantity, opts) do
+    case Keyword.get(opts, :price_id) do
+      price_id when is_binary(price_id) and price_id != "" ->
+        swap_plan(sub_id, price_id, Keyword.put(opts, :quantity, quantity))
+
+      _ ->
+        provider = Keyword.fetch!(opts, :provider)
+
+        case provider.get_subscription(sub_id, opts) do
+          {:ok, %{"items" => %{"data" => items}} = body} when is_list(items) ->
+            requested_item_id = Keyword.get(opts, :subscription_item_id)
+
+            case Stripe.select_subscription_item(body, requested_item_id) do
+              {:ok, %{"id" => item_id, "price" => %{"id" => price_id}}} ->
+                swap_plan(
+                  sub_id,
+                  price_id,
+                  opts
+                  |> Keyword.put(:subscription_item_id, item_id)
+                  |> Keyword.put(:quantity, quantity)
+                )
+
+              {:error, reason} ->
+                {:error, reason}
+
+              _ ->
+                {:error, {:missing_subscription_item, body}}
+            end
+
+          {:ok, body} ->
+            {:error, {:missing_subscription_item, body}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
     end
   end
 
@@ -591,11 +776,22 @@ defmodule AshBilling do
   defp resolve_customer_id(id) when is_binary(id), do: id
   defp resolve_customer_id(_), do: nil
 
-  defp resolve_subscription_id(%{provider_subscription_id: id}) when is_binary(id), do: id
-  defp resolve_subscription_id(%{stripe_subscription_id: id}) when is_binary(id), do: id
-  defp resolve_subscription_id(%{id: id}) when is_binary(id), do: id
-  defp resolve_subscription_id(id) when is_binary(id), do: id
+  defp resolve_subscription_id(%{provider_subscription_id: id}) when is_binary(id),
+    do: clean_id(id)
+
+  defp resolve_subscription_id(%{stripe_subscription_id: id}) when is_binary(id),
+    do: clean_id(id)
+
+  defp resolve_subscription_id(%{id: id}) when is_binary(id), do: clean_id(id)
+  defp resolve_subscription_id(id) when is_binary(id), do: clean_id(id)
   defp resolve_subscription_id(_), do: nil
+
+  defp clean_id(id) do
+    case String.trim(id) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
 
   defp resolve_subscription_provider(%resource{}, opts),
     do: Keyword.get(opts, :provider, SubscriptionInfo.provider(resource))

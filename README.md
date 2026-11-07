@@ -68,7 +68,8 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 
 ## Installation
 
-Version **0.5.0** includes billing lifecycle and webhook consistency changes.
+Version **0.5.2** (part of the 0.5.x release line) includes production hardening,
+subscription quantity isolation, URL sanitization, and webhook consistency improvements.
 Read [Upgrading to 0.5](documentation/topics/upgrading-to-0.5.md) before updating
 from 0.4.x. For older upgrades, also see
 [Upgrading to 0.4](documentation/topics/upgrading-to-0.4.md).
@@ -88,7 +89,7 @@ Alternatively, you can install it manually by adding `ash_billing` to your `mix.
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.5.0"}
+    {:ash_billing, "~> 0.5.2"}
   ]
 end
 ```
@@ -219,16 +220,36 @@ AshBilling.subscribed?(user, "price_pro_monthly")
 {:ok, updated_sub} = AshBilling.swap_plan(user_subscription, "price_enterprise_annual",
   proration_behavior: "create_prorations"
 )
-
-# Update seat quantities (per-seat billing)
-{:ok, updated_sub} = AshBilling.update_quantity(user_subscription, 10)
 ```
+
+### Update Quantities (Per-Seat Billing)
+```elixir
+# Update seat quantities directly without altering the subscription's price or plan
+{:ok, updated_sub} = AshBilling.update_quantity(user_subscription, 10)
+
+# Or provide an optimistic price assertion (aborts if Stripe has a different plan):
+{:ok, updated_sub} = AshBilling.update_quantity(user_subscription, 10, price_id: "price_seats_v1")
+```
+
+> [!NOTE]
+> **Provider Quantity Isolation**: `AshBilling.Providers.Stripe` guarantees price isolation by sending only the subscription item ID and updated quantity, omitting the price from the payload. For custom providers lacking `@callback update_quantity/3`, `AshBilling` falls back to `swap_plan/3`. If a caller supplies a stale `:price_id` to a legacy fallback provider, `swap_plan/3` will execute with that stale price. To guarantee price safety, custom providers must implement `update_quantity/3`.
 
 ### Resume a Canceled Subscription
 ```elixir
 # Reactivate a subscription that was scheduled to cancel at period end
 {:ok, resumed_sub} = AshBilling.resume_subscription(user_subscription)
 ```
+
+### Reconcile Subscriptions (Webhook Drift & Recovery)
+```elixir
+# Safely fetch live state from Stripe and commit updates to PostgreSQL inside advisory locks:
+{:ok, reconciled_sub} = AshBilling.reconcile_subscription(user_subscription,
+  domain: MyApp.Billing
+)
+```
+
+> [!TIP]
+> `AshBilling.get_subscription/2` only reads remote state from the billing provider without persisting changes. To repair database drift when webhooks are permanently lost or delayed (e.g. endpoint down > 72h), use `AshBilling.reconcile_subscription/2` in periodic maintenance jobs (such as an Oban worker) or interactive recovery tasks. It wraps the authoritative provider snapshot in a synthetic event, processes it through `AshBilling.WebhookSync.sync_event/2`, and commits state inside transaction and advisory lock boundaries.
 
 ---
 
@@ -333,6 +354,8 @@ config :ash_billing,
 | `[:ash_billing, :sync, :start \| :stop \| :exception]` | Emitted during database synchronization in `AshBilling.WebhookSync`. | `:system_time` / `:duration` | `:event_type`, `:event_id`, `:customer_resource`, `:subscription_resource`, `:status` |
 | `[:ash_billing, :checkout, :start \| :stop \| :exception]` | Emitted during Checkout session creation in `AshBilling.create_checkout_session/2`. | `:system_time` / `:duration` | `:provider`, `:mode`, `:customer`, `:status`, `:session_id`, `:url` |
 | `[:ash_billing, :portal, :start \| :stop \| :exception]` | Emitted during Billing Portal session creation in `AshBilling.create_portal_session/2`. | `:system_time` / `:duration` | `:provider`, `:customer`, `:status`, `:url` |
+| `[:ash_billing, :swap_plan, :start \| :stop \| :exception]` | Emitted during plan swaps in `AshBilling.swap_plan/3`. | `:system_time` / `:duration` | `:provider`, `:subscription_id`, `:new_price_id`, `:status` |
+| `[:ash_billing, :update_quantity, :start \| :stop \| :exception]` | Emitted during quantity/seat updates in `AshBilling.update_quantity/3`. | `:system_time` / `:duration` | `:provider`, `:subscription_id`, `:quantity`, `:status` |
 
 ---
 

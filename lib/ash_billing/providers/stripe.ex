@@ -69,73 +69,80 @@ defmodule AshBilling.Providers.Stripe do
 
   @impl true
   def get_subscription(subscription_id, opts \\ []) do
-    req = build_req(opts)
+    with {:ok, path} <- subscription_path(subscription_id) do
+      req = build_req(opts)
 
-    case Req.get(req, url: "/v1/subscriptions/#{subscription_id}") do
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
+      case Req.get(req, url: path) do
+        {:ok, %{status: 200, body: body}} ->
+          {:ok, body}
 
-      {:ok, %{status: status, body: body}} ->
-        {:error, %{status: status, error: extract_error(body)}}
+        {:ok, %{status: status, body: body}} ->
+          {:error, %{status: status, error: extract_error(body)}}
 
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
   @impl true
   def cancel_subscription(subscription_id, opts \\ []) do
-    req = build_req(opts)
-    at_period_end? = Keyword.get(opts, :at_period_end, true)
+    with {:ok, path} <- subscription_path(subscription_id) do
+      req = build_req(opts)
+      at_period_end? = Keyword.get(opts, :at_period_end, true)
 
-    result =
-      if at_period_end? do
-        Req.post(req,
-          url: "/v1/subscriptions/#{subscription_id}",
-          form: [{"cancel_at_period_end", "true"}]
-        )
-      else
-        Req.delete(req, url: "/v1/subscriptions/#{subscription_id}")
+      result =
+        if at_period_end? do
+          Req.post(req,
+            url: path,
+            form: [{"cancel_at_period_end", "true"}]
+          )
+        else
+          Req.delete(req, url: path)
+        end
+
+      case result do
+        {:ok, %{status: 200, body: body}} ->
+          {:ok, body}
+
+        {:ok, %{status: status, body: body}} ->
+          {:error, %{status: status, error: extract_error(body)}}
+
+        {:error, reason} ->
+          {:error, reason}
       end
-
-    case result do
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
-
-      {:ok, %{status: status, body: body}} ->
-        {:error, %{status: status, error: extract_error(body)}}
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 
   @impl true
   def resume_subscription(subscription_id, opts \\ []) do
-    req = build_req(opts)
+    with {:ok, path} <- subscription_path(subscription_id) do
+      req = build_req(opts)
 
-    case Req.post(req,
-           url: "/v1/subscriptions/#{subscription_id}",
-           form: [{"cancel_at_period_end", "false"}]
-         ) do
-      {:ok, %{status: 200, body: body}} ->
-        {:ok, body}
+      case Req.post(req,
+             url: path,
+             form: [{"cancel_at_period_end", "false"}]
+           ) do
+        {:ok, %{status: 200, body: body}} ->
+          {:ok, body}
 
-      {:ok, %{status: status, body: body}} ->
-        {:error, %{status: status, error: extract_error(body)}}
+        {:ok, %{status: status, body: body}} ->
+          {:error, %{status: status, error: extract_error(body)}}
 
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
   @impl true
   def swap_plan(subscription_id, new_price_id, opts \\ []) do
-    req = build_req(opts)
-    proration_behavior = Keyword.get(opts, :proration_behavior, "create_prorations")
-
-    with :ok <- validate_quantity_option(opts),
+    with {:ok, path} <- subscription_path(subscription_id),
+         :ok <- validate_quantity_option(opts),
          {:ok, item_id, quantity} <- resolve_subscription_item(subscription_id, opts) do
+      req = build_req(opts)
+      proration_behavior = Keyword.get(opts, :proration_behavior, "create_prorations")
+
       item_params = %{"id" => item_id, "price" => new_price_id, "quantity" => quantity}
 
       params =
@@ -151,7 +158,7 @@ defmodule AshBilling.Providers.Stripe do
 
       form_params = to_form_params(params)
 
-      case Req.post(req, url: "/v1/subscriptions/#{subscription_id}", form: form_params) do
+      case Req.post(req, url: path, form: form_params) do
         {:ok, %{status: 200, body: body}} ->
           {:ok, body}
 
@@ -160,6 +167,72 @@ defmodule AshBilling.Providers.Stripe do
 
         {:error, reason} ->
           {:error, reason}
+      end
+    end
+  end
+
+  @impl true
+  def update_quantity(subscription_id, quantity, opts \\ []) do
+    with {:ok, path} <- subscription_path(subscription_id),
+         :ok <- validate_quantity_value(quantity),
+         {:ok, item_id} <- resolve_quantity_item_id(subscription_id, opts) do
+      req = build_req(opts)
+      proration_behavior = Keyword.get(opts, :proration_behavior, "create_prorations")
+
+      item_params = %{"id" => item_id, "quantity" => quantity}
+
+      params =
+        %{
+          "items" => [item_params],
+          "proration_behavior" => to_string(proration_behavior)
+        }
+        |> then(fn p ->
+          if p_date = Keyword.get(opts, :proration_date),
+            do: Map.put(p, "proration_date", p_date),
+            else: p
+        end)
+
+      form_params = to_form_params(params)
+
+      case Req.post(req, url: path, form: form_params) do
+        {:ok, %{status: 200, body: body}} ->
+          {:ok, body}
+
+        {:ok, %{status: status, body: body}} ->
+          {:error, %{status: status, error: extract_error(body)}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp subscription_path(subscription_id) do
+    with true <- is_binary(subscription_id),
+         trimmed <- String.trim(subscription_id),
+         true <- trimmed != "" do
+      encoded = URI.encode(trimmed, &URI.char_unreserved?/1)
+      {:ok, "/v1/subscriptions/#{encoded}"}
+    else
+      _ -> {:error, :invalid_subscription_id}
+    end
+  end
+
+  defp validate_quantity_value(quantity) when is_integer(quantity) and quantity > 0, do: :ok
+  defp validate_quantity_value(_), do: {:error, :invalid_quantity}
+
+  defp resolve_quantity_item_id(subscription_id, opts) do
+    item_id = Keyword.get(opts, :subscription_item_id)
+
+    if is_binary(item_id) and item_id != "" do
+      {:ok, item_id}
+    else
+      with {:ok, body} <- get_subscription(subscription_id, opts),
+           {:ok, item} <- select_subscription_item(body, item_id) do
+        case item do
+          %{"id" => id} when is_binary(id) and id != "" -> {:ok, id}
+          _ -> {:error, {:missing_subscription_item, body}}
+        end
       end
     end
   end
