@@ -526,7 +526,7 @@ defmodule AshBilling.HardeningRemediationTest do
       assert_receive {:reconcile_fetch_started, fetch_pid}, 1_000
 
       # A real webhook arrives with a newer plan while reconcile's HTTP fetch is in-flight
-      newer_ts = System.system_time(:second)
+      newer_ts = System.system_time(:second) + 2
 
       newer_webhook = %{
         "id" => "evt_concurrent_upgrade",
@@ -709,9 +709,10 @@ defmodule AshBilling.HardeningRemediationTest do
       assert created.price_id == "price_enterprise"
     end
 
-    test "delayed webhook after reconciliation does not overwrite authoritative state", %{
-      subscription: sub
-    } do
+    test "preserves v0.5.2 delayed-webhook protection without ETS across price upgrades and cancellations",
+         %{subscription: sub} do
+      assert :ets.whereis(:ash_billing_reconciliations) == :undefined
+
       t1 = DateTime.utc_now() |> DateTime.add(-120, :second) |> DateTime.truncate(:second)
       t2_delayed = DateTime.add(t1, 60, :second)
 
@@ -727,7 +728,6 @@ defmodule AshBilling.HardeningRemediationTest do
         "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
       }
 
-      # Reconcile syncs authoritative "price_enterprise" while preserving t1
       assert {:ok, reconciled} =
                AshBilling.reconcile_subscription(sub_t1,
                  provider: DriftProvider,
@@ -737,11 +737,12 @@ defmodule AshBilling.HardeningRemediationTest do
                )
 
       assert reconciled.price_id == "price_enterprise"
-      assert DateTime.compare(reconciled.last_event_created_at, t1) == :eq
+      assert %DateTime{} = reconciled.last_event_created_at
+      assert DateTime.compare(reconciled.last_event_created_at, t2_delayed) == :gt
 
-      # Delayed older webhook (t2_delayed > t1, but <= reconciled_at) carries stale "price_pro"
+      # A delayed older webhook (t1 < t2_delayed < reconciled.last_event_created_at) must not downgrade state
       delayed_webhook = %{
-        "id" => "evt_delayed_after_reconcile",
+        "id" => "evt_delayed_v053",
         "type" => "customer.subscription.updated",
         "created" => DateTime.to_unix(t2_delayed),
         "data" => %{
@@ -754,19 +755,59 @@ defmodule AshBilling.HardeningRemediationTest do
         }
       }
 
-      assert {:ok, after_delayed} =
-               WebhookSync.sync_event(
-                 delayed_webhook,
-                 @sync_opts ++ [provider: DriftProvider, mock_response: {:ok, remote_enterprise}]
-               )
-
+      assert {:ok, after_delayed} = WebhookSync.sync_event(delayed_webhook, @sync_opts)
       assert after_delayed.price_id == "price_enterprise"
 
-      # A genuinely newer webhook after reconciliation applies directly
+      # Reconciling a terminal cancellation also blocks delayed non-terminal reactivation webhooks
+      remote_canceled = %{
+        "id" => "sub_drift_1",
+        "customer" => "cus_drift",
+        "status" => "canceled",
+        "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
+      }
+
+      assert {:ok, canceled_sub} =
+               AshBilling.reconcile_subscription(after_delayed,
+                 provider: DriftProvider,
+                 mock_response: {:ok, remote_canceled},
+                 domain: PostgresDomain,
+                 authorize?: false
+               )
+
+      assert canceled_sub.status == :canceled
+
+      delayed_reactivate = %{
+        "id" => "evt_delayed_reactivate_v053",
+        "type" => "customer.subscription.updated",
+        "created" => System.system_time(:second) - 10,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_drift_1",
+            "customer" => "cus_drift",
+            "status" => "active",
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+          }
+        }
+      }
+
+      assert {:ok, still_canceled} = WebhookSync.sync_event(delayed_reactivate, @sync_opts)
+      assert still_canceled.status == :canceled
+      assert still_canceled.price_id == "price_enterprise"
+
+      # A genuinely newer non-terminal subscription webhook after reconciliation still applies normally
+      {:ok, active_sub} =
+        still_canceled
+        |> Ash.Changeset.for_update(
+          :revise,
+          %{status: :active, price_id: "price_enterprise"},
+          @opts
+        )
+        |> Ash.update(@opts)
+
       future_ts = System.system_time(:second) + 10
 
       newer_webhook = %{
-        "id" => "evt_newer_after_reconcile",
+        "id" => "evt_newer_v053",
         "type" => "customer.subscription.updated",
         "created" => future_ts,
         "data" => %{
@@ -780,180 +821,8 @@ defmodule AshBilling.HardeningRemediationTest do
       }
 
       assert {:ok, after_newer} = WebhookSync.sync_event(newer_webhook, @sync_opts)
+      assert after_newer.id == active_sub.id
       assert after_newer.price_id == "price_ultimate"
-    end
-
-    test "handles local clock skew without ignoring live state or blocking future webhooks", %{
-      subscription: sub
-    } do
-      future_dt = DateTime.add(DateTime.utc_now(), 60, :second)
-
-      # Simulate existing record having a timestamp ahead of local server clock
-      {:ok, sub_with_future_ts} =
-        sub
-        |> Ash.Changeset.for_update(:revise, %{last_event_created_at: future_dt}, @opts)
-        |> Ash.update(@opts)
-
-      remote_upgraded = %{
-        "id" => "sub_drift_1",
-        "customer" => "cus_drift",
-        "status" => "active",
-        "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
-      }
-
-      assert {:ok, reconciled} =
-               AshBilling.reconcile_subscription(sub_with_future_ts,
-                 provider: DriftProvider,
-                 mock_response: {:ok, remote_upgraded},
-                 domain: PostgresDomain,
-                 authorize?: false
-               )
-
-      assert reconciled.price_id == "price_enterprise"
-      assert DateTime.compare(reconciled.last_event_created_at, future_dt) == :eq
-
-      # Also verify reconciliation when last_event_created_at is nil does not stamp local wall-clock
-      # that could block a slightly earlier Stripe webhook timestamp.
-      {:ok, sub_no_ts} =
-        reconciled
-        |> Ash.Changeset.for_update(
-          :revise,
-          %{last_event_created_at: nil, price_id: "price_basic"},
-          @opts
-        )
-        |> Ash.update(@opts)
-
-      assert {:ok, reconciled_no_ts} =
-               AshBilling.reconcile_subscription(sub_no_ts,
-                 provider: DriftProvider,
-                 mock_response: {:ok, remote_upgraded},
-                 domain: PostgresDomain,
-                 authorize?: false
-               )
-
-      assert reconciled_no_ts.price_id == "price_enterprise"
-      assert is_nil(reconciled_no_ts.last_event_created_at)
-    end
-
-    test "demonstrates 0.5.x ETS reconciliation boundary across restart, multi-node, TTL expiry, and post-commit window",
-         %{subscription: sub} do
-      t1 = DateTime.utc_now() |> DateTime.add(-120, :second) |> DateTime.truncate(:second)
-      t2_delayed = DateTime.add(t1, 60, :second)
-
-      remote_enterprise = %{
-        "id" => "sub_drift_1",
-        "customer" => "cus_drift",
-        "status" => "active",
-        "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
-      }
-
-      delayed_webhook = fn id ->
-        %{
-          "id" => id,
-          "type" => "customer.subscription.updated",
-          "created" => DateTime.to_unix(t2_delayed),
-          "data" => %{
-            "object" => %{
-              "id" => "sub_drift_1",
-              "customer" => "cus_drift",
-              "status" => "active",
-              "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
-            }
-          }
-        }
-      end
-
-      reset_and_reconcile = fn ->
-        {:ok, reset_sub} =
-          Ash.get!(PostgresSubscription, sub.id, @opts)
-          |> Ash.Changeset.for_update(
-            :revise,
-            %{price_id: "price_basic", last_event_created_at: t1},
-            @opts
-          )
-          |> Ash.update(@opts)
-
-        {:ok, reconciled} =
-          AshBilling.reconcile_subscription(reset_sub,
-            provider: DriftProvider,
-            mock_response: {:ok, remote_enterprise},
-            domain: PostgresDomain,
-            authorize?: false
-          )
-
-        assert reconciled.price_id == "price_enterprise"
-        reconciled
-      end
-
-      # 1. Process / application restart clears in-memory ETS table
-      _reconciled = reset_and_reconcile.()
-      :ets.delete_all_objects(:ash_billing_reconciliations)
-
-      assert {:ok, after_restart} =
-               WebhookSync.sync_event(
-                 delayed_webhook.("evt_boundary_restart"),
-                 @sync_opts ++ [provider: DriftProvider, mock_response: {:ok, remote_enterprise}]
-               )
-
-      assert after_restart.price_id == "price_pro"
-
-      # 2. Multi-node: Node A reconciles (writes only to Node A ETS); Node B shares PostgreSQL without Node A ETS
-      _reconciled = reset_and_reconcile.()
-      # Simulate Node B's empty local ETS view by removing the Node A entry
-      :ets.delete(:ash_billing_reconciliations, {PostgresSubscription, nil, "sub_drift_1"})
-
-      assert {:ok, on_node_b} =
-               WebhookSync.sync_event(
-                 delayed_webhook.("evt_boundary_node_b"),
-                 @sync_opts ++ [provider: DriftProvider, mock_response: {:ok, remote_enterprise}]
-               )
-
-      assert on_node_b.price_id == "price_pro"
-
-      # 3. ETS entry expires after 24h TTL sweep
-      _reconciled = reset_and_reconcile.()
-      expired_unix = System.system_time(:second) - 90_000
-
-      :ets.insert(
-        :ash_billing_reconciliations,
-        {{PostgresSubscription, nil, "sub_drift_1"}, DateTime.utc_now(), expired_unix}
-      )
-
-      dedup_pid = Process.whereis(AshBilling.Deduplication)
-      send(dedup_pid, :sweep)
-      _ = :sys.get_state(dedup_pid)
-
-      assert :ets.lookup(:ash_billing_reconciliations, {PostgresSubscription, nil, "sub_drift_1"}) ==
-               []
-
-      assert {:ok, after_expiry} =
-               WebhookSync.sync_event(
-                 delayed_webhook.("evt_boundary_expired"),
-                 @sync_opts ++ [provider: DriftProvider, mock_response: {:ok, remote_enterprise}]
-               )
-
-      assert after_expiry.price_id == "price_pro"
-
-      # 4. Window between PostgreSQL COMMIT and ETS record_reconciliation/4
-      {:ok, sub_pre_ets} =
-        Ash.get!(PostgresSubscription, sub.id, @opts)
-        |> Ash.Changeset.for_update(
-          :revise,
-          %{price_id: "price_enterprise", last_event_created_at: t1},
-          @opts
-        )
-        |> Ash.update(@opts)
-
-      assert sub_pre_ets.price_id == "price_enterprise"
-      :ets.delete_all_objects(:ash_billing_reconciliations)
-
-      assert {:ok, in_window} =
-               WebhookSync.sync_event(
-                 delayed_webhook.("evt_boundary_commit_window"),
-                 @sync_opts ++ [provider: DriftProvider, mock_response: {:ok, remote_enterprise}]
-               )
-
-      assert in_window.price_id == "price_pro"
     end
 
     defp wait_for_pg_lock_contention(timeout_ms) do

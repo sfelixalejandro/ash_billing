@@ -252,21 +252,6 @@ defmodule AshBilling.WebhookSync do
               ash_opts
             )
 
-          # Post-reconciliation causality protection:
-          # If reconcile_subscription/2 synced live state without fabricating last_event_created_at,
-          # a delayed webhook from before or at that reconciliation may still have event_dt > last_event_created_at.
-          # Reconcile with the provider so stale webhook payloads cannot overwrite authoritative live state.
-          existing && reconciled_after_or_at_event?(subscription_resource, sub_id, event_dt, opts) ->
-            reconcile_subscription_with_provider(
-              subscription_resource,
-              existing,
-              sub_id,
-              attrs,
-              event_dt,
-              opts,
-              ash_opts
-            )
-
           existing ->
             update_subscription_safely(
               subscription_resource,
@@ -889,26 +874,6 @@ defmodule AshBilling.WebhookSync do
         false
     end
   end
-
-  defp reconciled_after_or_at_event?(
-         subscription_resource,
-         sub_id,
-         %DateTime{} = incoming_dt,
-         opts
-       ) do
-    tenant = Keyword.get(opts, :tenant)
-
-    case AshBilling.Deduplication.reconciled_at(subscription_resource, tenant, sub_id) do
-      %DateTime{} = reconciled_dt ->
-        DateTime.compare(incoming_dt, reconciled_dt) != :gt
-
-      _ ->
-        false
-    end
-  end
-
-  defp reconciled_after_or_at_event?(_subscription_resource, _sub_id, _incoming_dt, _opts),
-    do: false
 
   defp conflicting_status_transition?(current_status, new_status) do
     current_status in [:past_due, "past_due", :unpaid, "unpaid"] and

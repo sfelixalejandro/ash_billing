@@ -421,50 +421,37 @@ defmodule AshBilling do
 
           lock_key = {customer_resource || subscription_resource, Keyword.get(opts, :tenant)}
 
-          result =
-            AshBilling.ResourceLock.run(
-              [customer_resource, subscription_resource],
-              lock_key,
-              fn ->
-                with :ok <-
-                       lock_customer_then_subscription(
-                         customer_resource,
-                         subscription_resource,
-                         sub_id,
-                         opts
-                       ),
-                     {:ok, live_sub} <- get_subscription(subscription_or_id, opts) do
-                  event_type =
-                    if live_sub["status"] in ["canceled", "incomplete_expired"],
-                      do: "customer.subscription.deleted",
-                      else: "customer.subscription.updated"
+          AshBilling.ResourceLock.run(
+            [customer_resource, subscription_resource],
+            lock_key,
+            fn ->
+              with :ok <-
+                     lock_customer_then_subscription(
+                       customer_resource,
+                       subscription_resource,
+                       sub_id,
+                       opts
+                     ),
+                   {:ok, live_sub} <- get_subscription(subscription_or_id, opts) do
+                event_type =
+                  if live_sub["status"] in ["canceled", "incomplete_expired"],
+                    do: "customer.subscription.deleted",
+                    else: "customer.subscription.updated"
 
-                  synthetic_event = %{
-                    "id" => "reconcile_#{live_sub["id"]}_#{System.unique_integer([:positive])}",
-                    "type" => event_type,
-                    "created" => nil,
-                    "data" => %{"object" => live_sub}
-                  }
+                now = System.system_time(:second)
 
-                  WebhookSync.sync_event(synthetic_event, sync_opts)
-                end
-              end,
-              rollback_on_error?: true
-            )
+                synthetic_event = %{
+                  "id" => "reconcile_#{live_sub["id"]}_#{System.unique_integer([:positive])}",
+                  "type" => event_type,
+                  "created" => now,
+                  "data" => %{"object" => live_sub}
+                }
 
-          case result do
-            {:ok, %_{}} ->
-              AshBilling.Deduplication.record_reconciliation(
-                subscription_resource,
-                Keyword.get(opts, :tenant),
-                sub_id
-              )
-
-            _ ->
-              :ok
-          end
-
-          result
+                WebhookSync.sync_event(synthetic_event, sync_opts)
+              end
+            end,
+            rollback_on_error?: true
+          )
         end
 
       _ ->

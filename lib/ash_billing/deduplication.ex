@@ -26,7 +26,6 @@ defmodule AshBilling.Deduplication do
   use GenServer
 
   @table :ash_billing_processed_events
-  @reconciliations_table :ash_billing_reconciliations
   @retention_seconds 86_400
 
   @doc """
@@ -1120,35 +1119,6 @@ defmodule AshBilling.Deduplication do
     _ -> false
   end
 
-  @doc false
-  def record_reconciliation(
-        subscription_resource,
-        tenant,
-        sub_id,
-        reconciled_at \\ DateTime.utc_now()
-      ) do
-    if :ets.whereis(@reconciliations_table) != :undefined do
-      :ets.insert(
-        @reconciliations_table,
-        {{subscription_resource, tenant, sub_id}, reconciled_at, System.system_time(:second)}
-      )
-    end
-
-    :ok
-  end
-
-  @doc false
-  def reconciled_at(subscription_resource, tenant, sub_id) do
-    if :ets.whereis(@reconciliations_table) != :undefined do
-      case :ets.lookup(@reconciliations_table, {subscription_resource, tenant, sub_id}) do
-        [{{^subscription_resource, ^tenant, ^sub_id}, %DateTime{} = dt, _recorded_unix}] -> dt
-        _ -> nil
-      end
-    else
-      nil
-    end
-  end
-
   # Server Callbacks for ETS sweep
 
   @impl true
@@ -1162,17 +1132,8 @@ defmodule AshBilling.Deduplication do
         write_concurrency: true
       ])
 
-    reconciliations_table =
-      :ets.new(@reconciliations_table, [
-        :named_table,
-        :set,
-        :public,
-        read_concurrency: true,
-        write_concurrency: true
-      ])
-
     schedule_sweep()
-    {:ok, %{table: table, reconciliations_table: reconciliations_table}}
+    {:ok, %{table: table}}
   end
 
   @impl true
@@ -1192,10 +1153,6 @@ defmodule AshBilling.Deduplication do
     ]
 
     :ets.select_delete(@table, match_spec)
-
-    :ets.select_delete(@reconciliations_table, [
-      {{:"$1", :"$2", :"$3"}, [{:<, :"$3", cutoff}], [true]}
-    ])
   rescue
     _ -> 0
   end

@@ -30,21 +30,17 @@
   - A failed `compile` or `test` step fails the workflow run instead of reporting success.
   - Workflow summary clearly separates `deps`/`postgres` infra failures from `compile`/`test` compatibility failures.
 
-### P0 — `reconcile_subscription/2` Concurrency & Timestamp Correctness (`0.5.x`)
-- **Problem**: Currently `AshBilling.reconcile_subscription/2` calls `get_subscription/2` **outside** `ResourceLock.run` and stamps `"created" => System.system_time(:second)` **after** the HTTP call returns:
-  1. **TOCTOU Race**: If a real webhook commits a newer state (`price_pro` or `past_due`) while `get_subscription/2` is in-flight with an older snapshot (`price_basic`), `reconcile_subscription/2` computes a newer local timestamp (`T_after > T_webhook`) and overwrites the newer database state with the stale snapshot, also advancing `last_event_created_at`.
-  2. **Clock Skew**: Local server wall-clock ahead of Stripe's clock stamps a future `last_event_created_at`, causing subsequent real Stripe webhooks to be ignored as "older". Local clock behind Stripe's clock causes live reconciliation to be ignored by `existing_event_newer?/2`.
-- **Risks**:
-  - Holding a PostgreSQL transaction/row lock during `get_subscription/2` ties up a DB connection for the HTTP roundtrip (same bounded-timeout trade-off already documented for `reconcile_subscription_with_provider/7` in `webhooks-and-resilience.md`).
-- **Proposed Design**:
-  1. Write a deterministic regression test using a `get_subscription/2` stub that triggers a concurrent `WebhookSync.sync_event/2` update while `get_subscription/2` is in-flight, plus a clock-skew test.
-  2. Execute `reconcile_subscription/2` inside `AshBilling.ResourceLock.run/4`:
-     - When `subscription_resource` is transactional/lockable, acquire `FOR UPDATE` row lock on the existing subscription (or customer row if creating) **before** calling `get_subscription/2`, serializing against concurrent `WebhookSync.sync_event/2` calls.
-     - Pass `"created" => nil` in the synthetic event so `WebhookSync` does **not** overwrite `last_event_created_at` with local wall-clock time and does **not** falsely reject live provider state when local clocks lag behind Stripe.
-- **Acceptance Criteria**:
-  - Deterministic concurrent test fails on the unpatched implementation and passes after the fix.
-  - Clock-skewed `last_event_created_at` does not block live reconciliation, and reconciliation does not advance `last_event_created_at` into the future.
-  - Existing 415+ tests and 72-permutation ordering tests continue passing with 0 regressions.
+### P0 — `reconcile_subscription/2` Concurrency & Lock Error Propagation (`0.5.3`)
+- **Problem**: In `v0.5.2`, `AshBilling.reconcile_subscription/2` called `get_subscription/2` **outside** `ResourceLock.run` and silently discarded read/lock errors with `_ =` during lock acquisition:
+  1. **TOCTOU Race**: If a real webhook commits a newer state (`price_pro` or `past_due`) while `get_subscription/2` is in-flight with an older snapshot (`price_basic`), `reconcile_subscription/2` ran Afterward and overwrote the newer database state with the stale snapshot.
+  2. **Silent Lock/Query Errors**: Failed initial lookups or PostgreSQL `FOR UPDATE` lock acquisitions were discarded via `_ =`, allowing reconciliation to proceed unlocked or mask DB errors.
+- **0.5.3 Trade-off & Preserved `v0.5.2` Timestamp Behavior**:
+  - Holding `Customer -> Subscription` `FOR UPDATE` locks during `get_subscription/2` prevents the in-flight TOCTOU race and serializes concurrent webhooks (requiring bounded HTTP timeouts on `Req`, matching `reconcile_subscription_with_provider/7`).
+  - Rather than setting `"created" => nil` (which would leave delayed older webhooks `t_old > last_event_created_at` unprotected without a schema migration) or introducing temporary node-local ETS state, `0.5.3` retains `v0.5.2`'s `"created" => System.system_time(:second)` inside the lock boundary and documents its existing host-clock-skew limitation.
+- **Acceptance Criteria (`0.5.3`)**:
+  - Deterministic concurrent test verifies PostgreSQL `pg_locks` contention and proves a concurrent webhook is serialized rather than overwritten by an in-flight stale snapshot.
+  - Lock/query errors (`lock_timeout`, missing scoped tenant) propagate `{:error, _}` without calling the provider; missing local records (`{:ok, nil}`) succeed cleanly.
+  - Zero causality regression vs `v0.5.2`: delayed older webhooks (`event.created < reconciled_at`) are still rejected by `existing_event_newer?/2` without relying on in-memory ETS.
 
 ### P1 — Formal Billing Invariants Specification (`0.5.x`)
 - **Problem**: Financial and concurrency guarantees are scattered across `README.md`, `AUDIT_REPORT.md` (local only), and test comments rather than a single public engineering contract.
@@ -94,13 +90,13 @@
 
 ## 3. Execution Order for This Phase
 
-1. **Commit & PR Scope (`0.5.x`)**:
-   - `NEXT_PHASE_PLAN.md` (this document).
+1. **Commit & PR Scope (`0.5.3` — PR #13)**:
+   - `NEXT_PHASE_PLAN.md` (architecture & phase split).
    - `.github/workflows/canary.yml` (PostgreSQL 16 + failure classification + no hidden failures).
-   - `lib/ash_billing.ex`, `lib/ash_billing/deduplication.ex`, `lib/ash_billing/webhook_sync.ex`: `reconcile_subscription/2` lock-serialized fetch, lock error propagation, no forged local wall-clock timestamp, and best-effort single-node ETS post-reconciliation guard (`:ash_billing_reconciliations`, 24h TTL; non-distributed, non-persistent), plus deterministic regression & boundary tests in `test/ash_billing/hardening_remediation_test.exs`.
-   - `documentation/topics/webhooks-and-resilience.md` (Billing Invariants section & exact `0.5.x` ETS boundary).
-2. **Deferred to `0.6.x` (`0.6.0` schema-backed)**:
-   - **Durable cross-node reconciliation causality (`last_reconciled_at`)**: Add `last_reconciled_at` (`Ash.Type.UtcDatetimeUsec`) to `AddSubscriptionAttributes` (with Ecto migration) updated atomically inside the same PostgreSQL `FOR UPDATE` transaction as `reconcile_subscription/2` (using PostgreSQL server time). `WebhookSync` will compare `event.created <= existing.last_reconciled_at` directly from the locked row, eliminating node-local ETS limits (restarts, multi-node clusters, 24h TTL expiry, and the post-commit-to-ETS window).
+   - `lib/ash_billing.ex`: `reconcile_subscription/2` lock-serialized fetch (`Customer -> Subscription` `FOR UPDATE`), lookup/lock error propagation, and preserved `v0.5.2` `"created" => now` semantics (zero ETS state), plus deterministic `pg_locks`, error-propagation, and non-regression tests in `test/ash_billing/hardening_remediation_test.exs`.
+   - `documentation/topics/webhooks-and-resilience.md` (Billing Invariants section & `0.5.x` clock-skew boundary).
+2. **Deferred to `0.6.0` (separate PR)**:
+   - **Durable cross-node reconciliation causality (`last_reconciled_at`)**: Add `last_reconciled_at` (`Ash.Type.UtcDatetimeUsec`) to `AddSubscriptionAttributes` (with Ecto migration and `upgrading-to-0.6.md`), updated atomically inside the same PostgreSQL `FOR UPDATE` transaction as `reconcile_subscription/2` using a bounded-skew checkpoint (Stripe response `Date` / PostgreSQL server time `clock_timestamp()` / monotonic guard, recognizing `Date` vs `event.created` are not strictly ordered across async emitters so `<=` triggers live provider verification rather than silent drops), including terminal-event protection, restart, and two-node `:peer` acceptance tests.
    - Runnable `examples/saas_example` Phoenix app.
    - Automated Stripe Test Clocks E2E suite.
    - New telemetry spans (`:reconcile`, `:deduplication`), `check_configuration/1` extensions, and `mix ash_billing.doctor` / `mix ash_billing.reconcile` tasks.
