@@ -477,6 +477,120 @@ defmodule AshBilling.HardeningRemediationTest do
                  domain: PostgresDomain
                )
     end
+
+    test "does not overwrite a concurrent newer webhook with a stale snapshot", %{
+      subscription: sub
+    } do
+      test_pid = self()
+
+      defmodule SlowReconcileProvider do
+        def get_subscription(id, opts) do
+          pid = Keyword.fetch!(opts, :test_pid)
+          send(pid, :reconcile_fetch_started)
+          Process.sleep(80)
+
+          {:ok,
+           %{
+             "id" => id,
+             "customer" => "cus_drift",
+             "status" => "active",
+             "items" => %{"data" => [%{"price" => %{"id" => "price_basic"}}]}
+           }}
+        end
+      end
+
+      task_reconcile =
+        Task.async(fn ->
+          AshBilling.reconcile_subscription(sub,
+            provider: SlowReconcileProvider,
+            test_pid: test_pid,
+            domain: PostgresDomain,
+            authorize?: false
+          )
+        end)
+
+      assert_receive :reconcile_fetch_started, 1_000
+
+      # A real webhook arrives with a newer plan while reconcile's HTTP fetch is in-flight
+      newer_ts = System.system_time(:second)
+
+      newer_webhook = %{
+        "id" => "evt_concurrent_upgrade",
+        "type" => "customer.subscription.updated",
+        "created" => newer_ts,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_drift_1",
+            "customer" => "cus_drift",
+            "status" => "active",
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+          }
+        }
+      }
+
+      task_webhook =
+        Task.async(fn ->
+          WebhookSync.sync_event(newer_webhook, @sync_opts)
+        end)
+
+      assert {:ok, _} = Task.await(task_reconcile, 5_000)
+      assert {:ok, _} = Task.await(task_webhook, 5_000)
+
+      persisted = Ash.get!(PostgresSubscription, sub.id, @opts)
+      assert persisted.price_id == "price_pro"
+    end
+
+    test "handles local clock skew without ignoring live state or blocking future webhooks", %{
+      subscription: sub
+    } do
+      future_dt = DateTime.add(DateTime.utc_now(), 60, :second)
+
+      # Simulate existing record having a timestamp ahead of local server clock
+      {:ok, sub_with_future_ts} =
+        sub
+        |> Ash.Changeset.for_update(:revise, %{last_event_created_at: future_dt}, @opts)
+        |> Ash.update(@opts)
+
+      remote_upgraded = %{
+        "id" => "sub_drift_1",
+        "customer" => "cus_drift",
+        "status" => "active",
+        "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
+      }
+
+      assert {:ok, reconciled} =
+               AshBilling.reconcile_subscription(sub_with_future_ts,
+                 provider: DriftProvider,
+                 mock_response: {:ok, remote_upgraded},
+                 domain: PostgresDomain,
+                 authorize?: false
+               )
+
+      assert reconciled.price_id == "price_enterprise"
+      assert DateTime.compare(reconciled.last_event_created_at, future_dt) == :eq
+
+      # Also verify reconciliation when last_event_created_at is nil does not stamp local wall-clock
+      # that could block a slightly earlier Stripe webhook timestamp.
+      {:ok, sub_no_ts} =
+        reconciled
+        |> Ash.Changeset.for_update(
+          :revise,
+          %{last_event_created_at: nil, price_id: "price_basic"},
+          @opts
+        )
+        |> Ash.update(@opts)
+
+      assert {:ok, reconciled_no_ts} =
+               AshBilling.reconcile_subscription(sub_no_ts,
+                 provider: DriftProvider,
+                 mock_response: {:ok, remote_upgraded},
+                 domain: PostgresDomain,
+                 authorize?: false
+               )
+
+      assert reconciled_no_ts.price_id == "price_enterprise"
+      assert is_nil(reconciled_no_ts.last_event_created_at)
+    end
   end
 
   # ===========================================================================
