@@ -97,9 +97,10 @@
 1. **Commit & PR Scope (`0.5.x`)**:
    - `NEXT_PHASE_PLAN.md` (this document).
    - `.github/workflows/canary.yml` (PostgreSQL 16 + failure classification + no hidden failures).
-   - `lib/ash_billing.ex` (`reconcile_subscription/2` lock-serialized fetch + no forged local wall-clock timestamp) & deterministic regression tests in `test/ash_billing/hardening_remediation_test.exs`.
-   - `documentation/topics/webhooks-and-resilience.md` (Billing Invariants section).
-2. **Deferred to `0.6.x`**:
+   - `lib/ash_billing.ex`, `lib/ash_billing/deduplication.ex`, `lib/ash_billing/webhook_sync.ex`: `reconcile_subscription/2` lock-serialized fetch, lock error propagation, no forged local wall-clock timestamp, and best-effort single-node ETS post-reconciliation guard (`:ash_billing_reconciliations`, 24h TTL; non-distributed, non-persistent), plus deterministic regression & boundary tests in `test/ash_billing/hardening_remediation_test.exs`.
+   - `documentation/topics/webhooks-and-resilience.md` (Billing Invariants section & exact `0.5.x` ETS boundary).
+2. **Deferred to `0.6.x` (`0.6.0` schema-backed)**:
+   - **Durable cross-node reconciliation causality (`last_reconciled_at`)**: Add `last_reconciled_at` (`Ash.Type.UtcDatetimeUsec`) to `AddSubscriptionAttributes` (with Ecto migration) updated atomically inside the same PostgreSQL `FOR UPDATE` transaction as `reconcile_subscription/2` (using PostgreSQL server time). `WebhookSync` will compare `event.created <= existing.last_reconciled_at` directly from the locked row, eliminating node-local ETS limits (restarts, multi-node clusters, 24h TTL expiry, and the post-commit-to-ETS window).
    - Runnable `examples/saas_example` Phoenix app.
    - Automated Stripe Test Clocks E2E suite.
    - New telemetry spans (`:reconcile`, `:deduplication`), `check_configuration/1` extensions, and `mix ash_billing.doctor` / `mix ash_billing.reconcile` tasks.

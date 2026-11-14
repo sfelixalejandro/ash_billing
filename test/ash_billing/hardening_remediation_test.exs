@@ -560,8 +560,11 @@ defmodule AshBilling.HardeningRemediationTest do
         end)
 
       assert_receive :webhook_attempting_sync, 1_000
-      # Webhook must be blocked on the PostgreSQL FOR UPDATE lock held by reconcile_subscription/2
-      refute_receive :webhook_finished, 50
+
+      # Verify at the PostgreSQL level that task_webhook is genuinely blocked waiting on
+      # the FOR UPDATE lock held by task_reconcile (not just timing luck).
+      assert :ok == wait_for_pg_lock_contention(2_000)
+      Agent.update(order_log, &(&1 ++ [:pg_lock_contended]))
 
       send(fetch_pid, :release_reconcile_fetch)
 
@@ -571,6 +574,7 @@ defmodule AshBilling.HardeningRemediationTest do
       assert Agent.get(order_log, & &1) == [
                :reconcile_fetch_started,
                :webhook_attempting_sync,
+               :pg_lock_contended,
                :reconcile_finished,
                :webhook_finished
              ]
@@ -829,6 +833,150 @@ defmodule AshBilling.HardeningRemediationTest do
 
       assert reconciled_no_ts.price_id == "price_enterprise"
       assert is_nil(reconciled_no_ts.last_event_created_at)
+    end
+
+    test "demonstrates 0.5.x ETS reconciliation boundary across restart, multi-node, TTL expiry, and post-commit window",
+         %{subscription: sub} do
+      t1 = DateTime.utc_now() |> DateTime.add(-120, :second) |> DateTime.truncate(:second)
+      t2_delayed = DateTime.add(t1, 60, :second)
+
+      remote_enterprise = %{
+        "id" => "sub_drift_1",
+        "customer" => "cus_drift",
+        "status" => "active",
+        "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
+      }
+
+      delayed_webhook = fn id ->
+        %{
+          "id" => id,
+          "type" => "customer.subscription.updated",
+          "created" => DateTime.to_unix(t2_delayed),
+          "data" => %{
+            "object" => %{
+              "id" => "sub_drift_1",
+              "customer" => "cus_drift",
+              "status" => "active",
+              "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+            }
+          }
+        }
+      end
+
+      reset_and_reconcile = fn ->
+        {:ok, reset_sub} =
+          Ash.get!(PostgresSubscription, sub.id, @opts)
+          |> Ash.Changeset.for_update(
+            :revise,
+            %{price_id: "price_basic", last_event_created_at: t1},
+            @opts
+          )
+          |> Ash.update(@opts)
+
+        {:ok, reconciled} =
+          AshBilling.reconcile_subscription(reset_sub,
+            provider: DriftProvider,
+            mock_response: {:ok, remote_enterprise},
+            domain: PostgresDomain,
+            authorize?: false
+          )
+
+        assert reconciled.price_id == "price_enterprise"
+        reconciled
+      end
+
+      # 1. Process / application restart clears in-memory ETS table
+      _reconciled = reset_and_reconcile.()
+      :ets.delete_all_objects(:ash_billing_reconciliations)
+
+      assert {:ok, after_restart} =
+               WebhookSync.sync_event(
+                 delayed_webhook.("evt_boundary_restart"),
+                 @sync_opts ++ [provider: DriftProvider, mock_response: {:ok, remote_enterprise}]
+               )
+
+      assert after_restart.price_id == "price_pro"
+
+      # 2. Multi-node: Node A reconciles (writes only to Node A ETS); Node B shares PostgreSQL without Node A ETS
+      _reconciled = reset_and_reconcile.()
+      # Simulate Node B's empty local ETS view by removing the Node A entry
+      :ets.delete(:ash_billing_reconciliations, {PostgresSubscription, nil, "sub_drift_1"})
+
+      assert {:ok, on_node_b} =
+               WebhookSync.sync_event(
+                 delayed_webhook.("evt_boundary_node_b"),
+                 @sync_opts ++ [provider: DriftProvider, mock_response: {:ok, remote_enterprise}]
+               )
+
+      assert on_node_b.price_id == "price_pro"
+
+      # 3. ETS entry expires after 24h TTL sweep
+      _reconciled = reset_and_reconcile.()
+      expired_unix = System.system_time(:second) - 90_000
+
+      :ets.insert(
+        :ash_billing_reconciliations,
+        {{PostgresSubscription, nil, "sub_drift_1"}, DateTime.utc_now(), expired_unix}
+      )
+
+      dedup_pid = Process.whereis(AshBilling.Deduplication)
+      send(dedup_pid, :sweep)
+      _ = :sys.get_state(dedup_pid)
+
+      assert :ets.lookup(:ash_billing_reconciliations, {PostgresSubscription, nil, "sub_drift_1"}) ==
+               []
+
+      assert {:ok, after_expiry} =
+               WebhookSync.sync_event(
+                 delayed_webhook.("evt_boundary_expired"),
+                 @sync_opts ++ [provider: DriftProvider, mock_response: {:ok, remote_enterprise}]
+               )
+
+      assert after_expiry.price_id == "price_pro"
+
+      # 4. Window between PostgreSQL COMMIT and ETS record_reconciliation/4
+      {:ok, sub_pre_ets} =
+        Ash.get!(PostgresSubscription, sub.id, @opts)
+        |> Ash.Changeset.for_update(
+          :revise,
+          %{price_id: "price_enterprise", last_event_created_at: t1},
+          @opts
+        )
+        |> Ash.update(@opts)
+
+      assert sub_pre_ets.price_id == "price_enterprise"
+      :ets.delete_all_objects(:ash_billing_reconciliations)
+
+      assert {:ok, in_window} =
+               WebhookSync.sync_event(
+                 delayed_webhook.("evt_boundary_commit_window"),
+                 @sync_opts ++ [provider: DriftProvider, mock_response: {:ok, remote_enterprise}]
+               )
+
+      assert in_window.price_id == "price_pro"
+    end
+
+    defp wait_for_pg_lock_contention(timeout_ms) do
+      deadline = System.monotonic_time(:millisecond) + timeout_ms
+      do_wait_for_pg_lock_contention(deadline)
+    end
+
+    defp do_wait_for_pg_lock_contention(deadline) do
+      %{rows: [[blocked_count]]} =
+        Repo.query!(
+          "SELECT COUNT(*) FROM pg_locks WHERE NOT granted AND locktype IN ('transactionid', 'tuple')"
+        )
+
+      if blocked_count > 0 do
+        :ok
+      else
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :no_pg_lock_contention_observed}
+        else
+          :erlang.yield()
+          do_wait_for_pg_lock_contention(deadline)
+        end
+      end
     end
   end
 
