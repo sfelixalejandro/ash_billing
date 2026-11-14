@@ -421,35 +421,50 @@ defmodule AshBilling do
 
           lock_key = {customer_resource || subscription_resource, Keyword.get(opts, :tenant)}
 
-          AshBilling.ResourceLock.run(
-            [customer_resource, subscription_resource],
-            lock_key,
-            fn ->
-              lock_customer_then_subscription(
-                customer_resource,
+          result =
+            AshBilling.ResourceLock.run(
+              [customer_resource, subscription_resource],
+              lock_key,
+              fn ->
+                with :ok <-
+                       lock_customer_then_subscription(
+                         customer_resource,
+                         subscription_resource,
+                         sub_id,
+                         opts
+                       ),
+                     {:ok, live_sub} <- get_subscription(subscription_or_id, opts) do
+                  event_type =
+                    if live_sub["status"] in ["canceled", "incomplete_expired"],
+                      do: "customer.subscription.deleted",
+                      else: "customer.subscription.updated"
+
+                  synthetic_event = %{
+                    "id" => "reconcile_#{live_sub["id"]}_#{System.unique_integer([:positive])}",
+                    "type" => event_type,
+                    "created" => nil,
+                    "data" => %{"object" => live_sub}
+                  }
+
+                  WebhookSync.sync_event(synthetic_event, sync_opts)
+                end
+              end,
+              rollback_on_error?: true
+            )
+
+          case result do
+            {:ok, %_{}} ->
+              AshBilling.Deduplication.record_reconciliation(
                 subscription_resource,
-                sub_id,
-                opts
+                Keyword.get(opts, :tenant),
+                sub_id
               )
 
-              with {:ok, live_sub} <- get_subscription(subscription_or_id, opts) do
-                event_type =
-                  if live_sub["status"] in ["canceled", "incomplete_expired"],
-                    do: "customer.subscription.deleted",
-                    else: "customer.subscription.updated"
+            _ ->
+              :ok
+          end
 
-                synthetic_event = %{
-                  "id" => "reconcile_#{live_sub["id"]}_#{System.unique_integer([:positive])}",
-                  "type" => event_type,
-                  "created" => nil,
-                  "data" => %{"object" => live_sub}
-                }
-
-                WebhookSync.sync_event(synthetic_event, sync_opts)
-              end
-            end,
-            rollback_on_error?: true
-          )
+          result
         end
 
       _ ->
@@ -483,38 +498,47 @@ defmodule AshBilling do
 
       # Non-locking lookup to resolve the customer foreign key so we lock Customer -> Subscription
       # in the exact same canonical order as AshBilling.WebhookSync (preventing AB-BA deadlocks).
-      existing_unlocked =
-        subscription_resource
-        |> Ash.Query.new()
-        |> Ash.Query.filter(provider_subscription_id == ^sub_id)
-        |> Ash.read_one(ash_opts)
-
-      customer_id =
-        case existing_unlocked do
-          {:ok, %{} = rec} when not is_nil(rel_attr) -> Map.get(rec, rel_attr)
-          _ -> nil
-        end
-
-      if (customer_id && is_atom(customer_resource)) and
-           Spark.Dsl.is?(customer_resource, Ash.Resource) do
-        _ =
-          customer_resource
-          |> Ash.Query.new()
-          |> Ash.Query.filter(id == ^customer_id)
-          |> AshBilling.ResourceLock.query()
-          |> Ash.read_one(ash_opts)
+      with {:ok, existing_unlocked} <-
+             subscription_resource
+             |> Ash.Query.new()
+             |> Ash.Query.filter(provider_subscription_id == ^sub_id)
+             |> Ash.read_one(ash_opts),
+           :ok <- maybe_lock_customer(existing_unlocked, rel_attr, customer_resource, ash_opts),
+           {:ok, _locked_sub} <-
+             subscription_resource
+             |> Ash.Query.new()
+             |> Ash.Query.filter(provider_subscription_id == ^sub_id)
+             |> AshBilling.ResourceLock.query()
+             |> Ash.read_one(ash_opts) do
+        :ok
+      else
+        {:error, reason} -> {:error, reason}
       end
-
-      _ =
-        subscription_resource
-        |> Ash.Query.new()
-        |> Ash.Query.filter(provider_subscription_id == ^sub_id)
-        |> AshBilling.ResourceLock.query()
-        |> Ash.read_one(ash_opts)
+    else
+      {:error, :invalid_subscription_resource}
     end
-
-    :ok
   end
+
+  defp maybe_lock_customer(%{} = existing_unlocked, rel_attr, customer_resource, ash_opts)
+       when not is_nil(rel_attr) and is_atom(customer_resource) do
+    require Ash.Query
+    customer_id = Map.get(existing_unlocked, rel_attr)
+
+    if customer_id && Spark.Dsl.is?(customer_resource, Ash.Resource) do
+      case customer_resource
+           |> Ash.Query.new()
+           |> Ash.Query.filter(id == ^customer_id)
+           |> AshBilling.ResourceLock.query()
+           |> Ash.read_one(ash_opts) do
+        {:ok, _customer} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp maybe_lock_customer(_existing_unlocked, _rel_attr, _customer_resource, _ash_opts), do: :ok
 
   @doc """
   Cancels a subscription.
