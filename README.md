@@ -68,8 +68,9 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 
 ## Installation
 
-Version **0.5.2** (part of the 0.5.x release line) includes production hardening,
-subscription quantity isolation, URL sanitization, and webhook consistency improvements.
+Version **0.5.3** (part of the 0.5.x release line) includes production hardening,
+subscription quantity isolation, URL sanitization, reconciliation locking fixes,
+and webhook consistency improvements.
 Read [Upgrading to 0.5](documentation/topics/upgrading-to-0.5.md) before updating
 from 0.4.x. For older upgrades, also see
 [Upgrading to 0.4](documentation/topics/upgrading-to-0.4.md).
@@ -89,7 +90,7 @@ Alternatively, you can install it manually by adding `ash_billing` to your `mix.
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.5.2"}
+    {:ash_billing, "~> 0.5.3"}
   ]
 end
 ```

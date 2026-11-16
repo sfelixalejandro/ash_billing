@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.3] - 2026-11-15
+
+### Fixed & Hardened
+
+- **Reconciliation Concurrency & Lock Error Propagation**: `AshBilling.reconcile_subscription/2` now enters a transaction lock boundary and acquires canonical `Customer -> Subscription` `FOR UPDATE` row locks before calling `AshBilling.get_subscription/2`. Lookup and lock-acquisition failures propagate cleanly without invoking the provider, preventing concurrent webhook updates from racing against in-flight stale snapshots while preserving `v0.5.2` synthetic timestamp semantics (`"created" => System.system_time(:second)`) with no breaking API or schema changes.
+- **Billing Invariants Documentation**: Added the `Billing invariants` section to `documentation/topics/webhooks-and-resilience.md` matching verified implementation behavior (`:active`, `:trialing`, and `:past_due` access rules, `ash_cust_` idempotency key prefix, lock order, and `0.5.x` synthetic timestamp boundaries).
+- **Canary CI**: Added PostgreSQL 16 service and readiness verification to `.github/workflows/canary.yml`, removed `continue-on-error: true` so compatibility regressions fail visibly, and classified `INFRASTRUCTURE_FAILURE` vs `COMPATIBILITY_FAILURE` outcomes.
+
 ## [0.5.2] - 2026-11-06
 
 ### Security & Reliability Hardening
