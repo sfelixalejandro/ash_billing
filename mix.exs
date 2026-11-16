@@ -99,6 +99,7 @@ defmodule AshBilling.MixProject do
       extras: [
         {"documentation/topics/upgrading-to-0.4.md", title: "Upgrading to 0.4"},
         {"documentation/topics/upgrading-to-0.5.md", title: "Upgrading to 0.5"},
+        {"documentation/topics/upgrading-to-0.6.md", title: "Upgrading to 0.6"},
         {"documentation/topics/stripe-test-mode.md", title: "Stripe Test Mode validation"},
         {"README.md", title: "Home"},
         {"documentation/tutorials/getting-started-with-ash-billing.md",

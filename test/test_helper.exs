@@ -41,9 +41,15 @@ postgres_available? =
           trial_ends_at TIMESTAMP(6),
           cancel_at_period_end BOOLEAN DEFAULT FALSE,
           cancel_at TIMESTAMP(6),
-          last_event_created_at TIMESTAMP(6)
+          last_event_created_at TIMESTAMP(6),
+          last_reconciled_at TIMESTAMP(6)
         )
         """)
+
+        Ecto.Adapters.SQL.query!(
+          AshBilling.Test.Repo,
+          "ALTER TABLE billing_test_subscriptions ADD COLUMN IF NOT EXISTS last_reconciled_at TIMESTAMP(6)"
+        )
 
         Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
         CREATE UNIQUE INDEX IF NOT EXISTS billing_test_subscriptions_unique_provider_subscription_index
@@ -57,6 +63,11 @@ postgres_available? =
           PRIMARY KEY (id)
         )
         """)
+
+        Ecto.Adapters.SQL.query!(
+          AshBilling.Test.Repo,
+          "ALTER TABLE billing_scoped_subscriptions ADD COLUMN IF NOT EXISTS last_reconciled_at TIMESTAMP(6)"
+        )
 
         Ecto.Adapters.SQL.query!(AshBilling.Test.Repo, """
         CREATE UNIQUE INDEX IF NOT EXISTS billing_scoped_subscriptions_unique_provider_subscription_index

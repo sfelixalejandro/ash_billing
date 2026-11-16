@@ -94,6 +94,7 @@ defmodule AshBilling.Test.PostgresSubscription do
       :cancel_at,
       :trial_ends_at,
       :last_event_created_at,
+      :last_reconciled_at,
       :user_id
     ]
 
@@ -112,6 +113,7 @@ defmodule AshBilling.Test.PostgresSubscription do
         :cancel_at,
         :trial_ends_at,
         :last_event_created_at,
+        :last_reconciled_at,
         :user_id
       ]
     end
@@ -153,7 +155,8 @@ defmodule AshBilling.Test.PostgresScopedSubscription do
       :cancel_at_period_end,
       :cancel_at,
       :trial_ends_at,
-      :last_event_created_at
+      :last_event_created_at,
+      :last_reconciled_at
     ]
 
     defaults [:read, :create, :update, :destroy]
@@ -242,6 +245,7 @@ defmodule AshBilling.Test.PostgresOwnedScopedSubscription do
       :cancel_at,
       :trial_ends_at,
       :last_event_created_at,
+      :last_reconciled_at,
       :user_id
     ]
 

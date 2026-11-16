@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased - 0.6.0]
+
+### Added & Changed
+
+- **Durable Reconciliation Checkpoints (`last_reconciled_at`)**: Added nullable protected attribute `last_reconciled_at` (`:utc_datetime_usec`) to `AshBilling.Subscription`. See [Upgrading to 0.6](documentation/topics/upgrading-to-0.6.md) for the required database migration.
+- **PostgreSQL Shared-Clock Checkpointing**: `AshBilling.reconcile_subscription/2` queries PostgreSQL `clock_timestamp()` under canonical `Customer -> Subscription` `FOR UPDATE` locks, omits fabricated local timestamps (`"created" => nil`), and persists `last_reconciled_at` monotonically and atomically in the same transaction as reconciled state.
+- **Ambiguous Delayed-Webhook Re-Verification**: `AshBilling.WebhookSync` evaluates non-terminal and terminal webhooks with `event.created <= last_reconciled_at + reconciliation_skew_seconds` (default `60s`, configurable via `:reconciliation_skew_seconds`) as ambiguous and re-verifies live provider state under the lock before updating, failing closed on provider or PostgreSQL errors without touching ETS for cross-node state.
+
 ## [0.5.3] - 2026-11-15
 
 ### Fixed & Hardened

@@ -41,7 +41,8 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
       {:cancel_at_period_end, Ash.Type.Boolean, [default: false, public?: true]},
       {:cancel_at, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]},
       {:trial_ends_at, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]},
-      {:last_event_created_at, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]}
+      {:last_event_created_at, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]},
+      {:last_reconciled_at, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]}
     ]
 
     with {:ok, state} <- add_attributes(dsl_state, attributes),
