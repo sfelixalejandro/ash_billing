@@ -442,3 +442,24 @@ load subscriptions at the authenticated request/job boundary if immediate revoca
 is required; reuse the refreshed actor within that operation. The policy checks do
 not perform a new DB query for each invocation. Tenant/ownership authorization of
 target resources remains separate.
+
+## Billing invariants
+
+Every production integration with `AshBilling` relies on the following verifiable invariants:
+
+1. **Authoritative state**: The billing provider (Stripe) is the single source of truth for subscription lifecycle, pricing, quantities, and payment status. Local PostgreSQL tables are synchronized projections, never mutated by unverified client input (`ProtectBillingAttributes` blocks billing attributes from wildcard actions).
+2. **Local synchronization & atomicity**: All webhook-driven and reconciled writes execute inside an advisory/transaction lock boundary with PostgreSQL transactions and `FOR UPDATE` row locks (`Customer -> Subscription` canonical lock order). Returned errors roll back local SQL mutations, and `WebhookEvent` rows transition to `:processed` only inside the committing transaction.
+3. **Access rights (fail-closed entitlements)**: `AshBilling.Checks.Subscribed` and `AshBilling.Checks.HasPrice` evaluate strictly against synced local subscription snapshots (`status`, `price_id`, `trial_ends_at`, `billing_deleted_at`).
+   - `:active` grants access unconditionally (does not require a `trial_ends_at` timestamp).
+   - `:trialing` grants access when `trial_ends_at` is `nil` (no end date) or in the future.
+   - `:past_due` grants access **only** when `trial_ends_at` is present and in the future.
+   - Access is denied (fail-closed) for `:canceled`, `:incomplete`, `:incomplete_expired`, `:unpaid`, `:paused`, `nil`, unknown statuses, or when `billing_deleted_at` is set.
+4. **Event ordering & reconciliation causality**:
+   - Terminal statuses (`:canceled`, `:incomplete_expired`) cannot revert to non-terminal statuses for Stripe subscriptions.
+   - Out-of-order events older than `last_event_created_at` are ignored; same-second conflicts and backward transitions (`:past_due` / `:unpaid` → `:active` / `:trialing`) trigger live provider reconciliation inside the transaction lock.
+   - `AshBilling.reconcile_subscription/2` acquires the canonical `Customer -> Subscription` `FOR UPDATE` row locks **before** fetching live state from the provider (propagating lookup and lock errors cleanly without invoking the provider), so concurrent webhooks are serialized against in-flight snapshots instead of racing outside the lock.
+   - **0.5.x synthetic timestamp boundary**: To preserve `v0.5.2` protection against delayed older webhooks (`event.created < last_event_created_at`) without requiring a `0.5.x` schema migration, `reconcile_subscription/2` still records synthetic `"created" => System.system_time(:second)` as `last_event_created_at`. Consequently, `0.5.x` inherits the `v0.5.2` host-clock assumption: if a node's wall clock lags behind Stripe's latest `last_event_created_at`, reconciliation can be ignored as out-of-order, and if a node's clock runs ahead of Stripe, real webhooks created before that future second can be ignored until Stripe time catches up (or trigger provider reconciliation on the same second). Durable clock-skew-resilient reconciliation checkpoints persisted in PostgreSQL (`last_reconciled_at`) are scoped to `0.6.0`.
+5. **Expirations & webhook drift**: `current_period_end` is informational and does not auto-expire local entitlements without a provider webhook or explicit reconciliation. When webhooks are dropped (e.g., prolonged endpoint outage), schedule `AshBilling.reconcile_subscription/2` to converge local state.
+6. **Idempotency**:
+   - Remote customer creation (`AshBilling.create_customer/2`) sends deterministic per-resource/tenant/record idempotency keys (`ash_cust_...`).
+   - Multi-node webhook processing uses PostgreSQL `WebhookEvent` leases (`pg_try_advisory_xact_lock`, `FOR UPDATE NOWAIT`, and `lease_token` CAS) for at-least-once delivery; side effects outside the shared PostgreSQL Repo remain the application's responsibility to make idempotent.

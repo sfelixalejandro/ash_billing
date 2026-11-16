@@ -10,7 +10,21 @@ jobs:
   canary:
     name: Canary Build against ash@main & spark@main
     runs-on: ubuntu-latest
-    continue-on-error: true
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+          POSTGRES_DB: ash_billing_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: Checkout repository
@@ -23,6 +37,7 @@ jobs:
           otp-version: '27'
 
       - name: Point dependencies to ash-project/ash and spark main branches
+        id: rewrite_deps
         run: |
           elixir -e '
             content = File.read!("mix.exs")
@@ -32,10 +47,51 @@ jobs:
           '
 
       - name: Install dependencies from git
+        id: deps
         run: mix deps.get
 
+      - name: Verify PostgreSQL 16 readiness
+        id: postgres
+        run: |
+          for i in $(seq 1 15); do
+            if pg_isready -h localhost -p 5432 -U postgres; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL 16 did not become ready in time" >&2
+          exit 1
+
       - name: Compile with latest Ash & Spark
+        id: compile
         run: mix compile
 
       - name: Run test suite against canary Ash & Spark
+        id: test
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+          POSTGRES_DB: ash_billing_test
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
         run: mix test
+
+      - name: Classify canary outcome
+        if: always()
+        run: |
+          {
+            echo "## Canary CI Classification"
+            echo ""
+            if [[ "${{ steps.deps.outcome }}" == "failure" || "${{ steps.postgres.outcome }}" == "failure" ]]; then
+              echo "- **Classification**: \`INFRASTRUCTURE_FAILURE\`"
+              echo "- **Cause**: Dependency fetch (\`${{ steps.deps.outcome }}\`) or PostgreSQL 16 readiness (\`${{ steps.postgres.outcome }}\`) failed."
+            elif [[ "${{ steps.compile.outcome }}" == "failure" || "${{ steps.test.outcome }}" == "failure" ]]; then
+              echo "- **Classification**: \`COMPATIBILITY_FAILURE\`"
+              echo "- **Cause**: Compilation (\`${{ steps.compile.outcome }}\`) or test suite (\`${{ steps.test.outcome }}\`) failed against \`ash@main\` / \`spark@main\`."
+            elif [[ "${{ steps.test.outcome }}" == "success" ]]; then
+              echo "- **Classification**: \`PASS\`"
+              echo "- All tests passed against \`ash@main\` / \`spark@main\` with PostgreSQL 16."
+            else
+              echo "- **Classification**: \`CANCELLED_OR_UNKNOWN\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

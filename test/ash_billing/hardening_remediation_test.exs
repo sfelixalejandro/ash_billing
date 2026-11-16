@@ -477,6 +477,376 @@ defmodule AshBilling.HardeningRemediationTest do
                  domain: PostgresDomain
                )
     end
+
+    test "does not overwrite a concurrent newer webhook with a stale snapshot", %{
+      subscription: sub
+    } do
+      test_pid = self()
+      {:ok, order_log} = Agent.start_link(fn -> [] end)
+
+      defmodule SyncReconcileProvider do
+        def get_subscription(id, opts) do
+          pid = Keyword.fetch!(opts, :test_pid)
+          log = Keyword.fetch!(opts, :order_log)
+          Agent.update(log, &(&1 ++ [:reconcile_fetch_started]))
+          send(pid, {:reconcile_fetch_started, self()})
+
+          receive do
+            :release_reconcile_fetch -> :ok
+          after
+            5_000 -> raise "timed out waiting for :release_reconcile_fetch"
+          end
+
+          {:ok,
+           %{
+             "id" => id,
+             "customer" => "cus_drift",
+             "status" => "active",
+             "items" => %{"data" => [%{"price" => %{"id" => "price_basic"}}]}
+           }}
+        end
+      end
+
+      task_reconcile =
+        Task.async(fn ->
+          res =
+            AshBilling.reconcile_subscription(sub,
+              provider: SyncReconcileProvider,
+              test_pid: test_pid,
+              order_log: order_log,
+              domain: PostgresDomain,
+              authorize?: false
+            )
+
+          Agent.update(order_log, &(&1 ++ [:reconcile_finished]))
+          send(test_pid, :reconcile_finished)
+          res
+        end)
+
+      assert_receive {:reconcile_fetch_started, fetch_pid}, 1_000
+
+      # A real webhook arrives with a newer plan while reconcile's HTTP fetch is in-flight
+      newer_ts = System.system_time(:second) + 2
+
+      newer_webhook = %{
+        "id" => "evt_concurrent_upgrade",
+        "type" => "customer.subscription.updated",
+        "created" => newer_ts,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_drift_1",
+            "customer" => "cus_drift",
+            "status" => "active",
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+          }
+        }
+      }
+
+      task_webhook =
+        Task.async(fn ->
+          Agent.update(order_log, &(&1 ++ [:webhook_attempting_sync]))
+          send(test_pid, :webhook_attempting_sync)
+
+          res =
+            WebhookSync.sync_event(
+              newer_webhook,
+              @sync_opts ++
+                [provider: DriftProvider, mock_response: {:ok, newer_webhook["data"]["object"]}]
+            )
+
+          Agent.update(order_log, &(&1 ++ [:webhook_finished]))
+          send(test_pid, :webhook_finished)
+          res
+        end)
+
+      assert_receive :webhook_attempting_sync, 1_000
+
+      # Verify at the PostgreSQL level that task_webhook is genuinely blocked waiting on
+      # the FOR UPDATE lock held by task_reconcile (not just timing luck).
+      assert :ok == wait_for_pg_lock_contention(2_000)
+      Agent.update(order_log, &(&1 ++ [:pg_lock_contended]))
+
+      send(fetch_pid, :release_reconcile_fetch)
+
+      assert {:ok, _} = Task.await(task_reconcile, 5_000)
+      assert {:ok, _} = Task.await(task_webhook, 5_000)
+
+      assert Agent.get(order_log, & &1) == [
+               :reconcile_fetch_started,
+               :webhook_attempting_sync,
+               :pg_lock_contended,
+               :reconcile_finished,
+               :webhook_finished
+             ]
+
+      persisted = Ash.get!(PostgresSubscription, sub.id, @opts)
+      assert persisted.price_id == "price_pro"
+    end
+
+    test "propagates query and lock acquisition errors without calling provider", %{
+      customer: customer,
+      subscription: sub
+    } do
+      test_pid = self()
+
+      defmodule GuardedProvider do
+        def get_subscription(_id, opts) do
+          send(Keyword.fetch!(opts, :test_pid), :provider_called)
+          {:ok, %{"id" => "sub_drift_1", "customer" => "cus_drift", "status" => "active"}}
+        end
+      end
+
+      # 1. Initial lookup query failure (missing required tenant) propagates error without calling provider
+      assert {:error, _reason} =
+               AshBilling.reconcile_subscription("sub_scoped_missing_tenant",
+                 subscription_resource: AshBilling.Test.PostgresScopedSubscription,
+                 provider: GuardedProvider,
+                 test_pid: test_pid,
+                 domain: PostgresDomain,
+                 authorize?: false
+               )
+
+      refute_received :provider_called
+
+      # 2. Customer FOR UPDATE lock failure propagates error without calling provider
+      holder =
+        Task.async(fn ->
+          Repo.transaction(fn ->
+            Repo.query!("SELECT id FROM billing_test_customers WHERE id = $1 FOR UPDATE", [
+              Ecto.UUID.dump!(customer.id)
+            ])
+
+            send(test_pid, :customer_locked)
+
+            receive do
+              :release_customer_lock -> :ok
+            after
+              5_000 -> :timeout
+            end
+          end)
+        end)
+
+      assert_receive :customer_locked, 1_000
+
+      assert {:error, _reason} =
+               Repo.transaction(fn ->
+                 Repo.query!("SET LOCAL lock_timeout = '25ms'")
+
+                 case AshBilling.reconcile_subscription(sub,
+                        provider: GuardedProvider,
+                        test_pid: test_pid,
+                        domain: PostgresDomain,
+                        authorize?: false
+                      ) do
+                   {:ok, val} -> val
+                   {:error, err} -> Repo.rollback(err)
+                 end
+               end)
+
+      send(holder.pid, :release_customer_lock)
+      Task.await(holder, 5_000)
+      refute_received :provider_called
+
+      # 3. Subscription FOR UPDATE lock failure propagates error without calling provider
+      sub_holder =
+        Task.async(fn ->
+          Repo.transaction(fn ->
+            Repo.query!("SELECT id FROM billing_test_subscriptions WHERE id = $1 FOR UPDATE", [
+              Ecto.UUID.dump!(sub.id)
+            ])
+
+            send(test_pid, :subscription_locked)
+
+            receive do
+              :release_subscription_lock -> :ok
+            after
+              5_000 -> :timeout
+            end
+          end)
+        end)
+
+      assert_receive :subscription_locked, 1_000
+
+      assert {:error, _reason} =
+               Repo.transaction(fn ->
+                 Repo.query!("SET LOCAL lock_timeout = '25ms'")
+
+                 case AshBilling.reconcile_subscription(sub,
+                        customer_resource: nil,
+                        provider: GuardedProvider,
+                        test_pid: test_pid,
+                        domain: PostgresDomain,
+                        authorize?: false
+                      ) do
+                   {:ok, val} -> val
+                   {:error, err} -> Repo.rollback(err)
+                 end
+               end)
+
+      send(sub_holder.pid, :release_subscription_lock)
+      Task.await(sub_holder, 5_000)
+      refute_received :provider_called
+    end
+
+    test "reconciles cleanly when local subscription record does not exist yet" do
+      remote_new = %{
+        "id" => "sub_missing_locally",
+        "customer" => "cus_drift",
+        "status" => "active",
+        "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
+      }
+
+      assert {:ok, created} =
+               AshBilling.reconcile_subscription("sub_missing_locally",
+                 subscription_resource: PostgresSubscription,
+                 provider: DriftProvider,
+                 mock_response: {:ok, remote_new},
+                 domain: PostgresDomain,
+                 authorize?: false
+               )
+
+      assert created.provider_subscription_id == "sub_missing_locally"
+      assert created.price_id == "price_enterprise"
+    end
+
+    test "preserves v0.5.2 delayed-webhook protection without ETS across price upgrades and cancellations",
+         %{subscription: sub} do
+      assert :ets.whereis(:ash_billing_reconciliations) == :undefined
+
+      t1 = DateTime.utc_now() |> DateTime.add(-120, :second) |> DateTime.truncate(:second)
+      t2_delayed = DateTime.add(t1, 60, :second)
+
+      {:ok, sub_t1} =
+        sub
+        |> Ash.Changeset.for_update(:revise, %{last_event_created_at: t1}, @opts)
+        |> Ash.update(@opts)
+
+      remote_enterprise = %{
+        "id" => "sub_drift_1",
+        "customer" => "cus_drift",
+        "status" => "active",
+        "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
+      }
+
+      assert {:ok, reconciled} =
+               AshBilling.reconcile_subscription(sub_t1,
+                 provider: DriftProvider,
+                 mock_response: {:ok, remote_enterprise},
+                 domain: PostgresDomain,
+                 authorize?: false
+               )
+
+      assert reconciled.price_id == "price_enterprise"
+      assert %DateTime{} = reconciled.last_event_created_at
+      assert DateTime.compare(reconciled.last_event_created_at, t2_delayed) == :gt
+
+      # A delayed older webhook (t1 < t2_delayed < reconciled.last_event_created_at) must not downgrade state
+      delayed_webhook = %{
+        "id" => "evt_delayed_v053",
+        "type" => "customer.subscription.updated",
+        "created" => DateTime.to_unix(t2_delayed),
+        "data" => %{
+          "object" => %{
+            "id" => "sub_drift_1",
+            "customer" => "cus_drift",
+            "status" => "active",
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+          }
+        }
+      }
+
+      assert {:ok, after_delayed} = WebhookSync.sync_event(delayed_webhook, @sync_opts)
+      assert after_delayed.price_id == "price_enterprise"
+
+      # Reconciling a terminal cancellation also blocks delayed non-terminal reactivation webhooks
+      remote_canceled = %{
+        "id" => "sub_drift_1",
+        "customer" => "cus_drift",
+        "status" => "canceled",
+        "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
+      }
+
+      assert {:ok, canceled_sub} =
+               AshBilling.reconcile_subscription(after_delayed,
+                 provider: DriftProvider,
+                 mock_response: {:ok, remote_canceled},
+                 domain: PostgresDomain,
+                 authorize?: false
+               )
+
+      assert canceled_sub.status == :canceled
+
+      delayed_reactivate = %{
+        "id" => "evt_delayed_reactivate_v053",
+        "type" => "customer.subscription.updated",
+        "created" => System.system_time(:second) - 10,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_drift_1",
+            "customer" => "cus_drift",
+            "status" => "active",
+            "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+          }
+        }
+      }
+
+      assert {:ok, still_canceled} = WebhookSync.sync_event(delayed_reactivate, @sync_opts)
+      assert still_canceled.status == :canceled
+      assert still_canceled.price_id == "price_enterprise"
+
+      # A genuinely newer non-terminal subscription webhook after reconciliation still applies normally
+      {:ok, active_sub} =
+        still_canceled
+        |> Ash.Changeset.for_update(
+          :revise,
+          %{status: :active, price_id: "price_enterprise"},
+          @opts
+        )
+        |> Ash.update(@opts)
+
+      future_ts = System.system_time(:second) + 10
+
+      newer_webhook = %{
+        "id" => "evt_newer_v053",
+        "type" => "customer.subscription.updated",
+        "created" => future_ts,
+        "data" => %{
+          "object" => %{
+            "id" => "sub_drift_1",
+            "customer" => "cus_drift",
+            "status" => "active",
+            "items" => %{"data" => [%{"price" => %{"id" => "price_ultimate"}}]}
+          }
+        }
+      }
+
+      assert {:ok, after_newer} = WebhookSync.sync_event(newer_webhook, @sync_opts)
+      assert after_newer.id == active_sub.id
+      assert after_newer.price_id == "price_ultimate"
+    end
+
+    defp wait_for_pg_lock_contention(timeout_ms) do
+      deadline = System.monotonic_time(:millisecond) + timeout_ms
+      do_wait_for_pg_lock_contention(deadline)
+    end
+
+    defp do_wait_for_pg_lock_contention(deadline) do
+      %{rows: [[blocked_count]]} =
+        Repo.query!(
+          "SELECT COUNT(*) FROM pg_locks WHERE NOT granted AND locktype IN ('transactionid', 'tuple')"
+        )
+
+      if blocked_count > 0 do
+        :ok
+      else
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :no_pg_lock_contention_observed}
+        else
+          :erlang.yield()
+          do_wait_for_pg_lock_contention(deadline)
+        end
+      end
+    end
   end
 
   # ===========================================================================
