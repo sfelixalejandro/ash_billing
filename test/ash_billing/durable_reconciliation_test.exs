@@ -491,6 +491,43 @@ defmodule AshBilling.DurableReconciliationTest do
 
     assert Agent.get(counter, & &1) == 1
     assert upgraded.price_id == "price_ultimate"
+
+    # 3. Documented heuristic boundary:
+    # An event with event.created > last_reconciled_at + reconciliation_skew_seconds (and > last_event_created_at)
+    # is treated as a normal newer webhook without extra provider calls.
+    {:ok, outside_counter} = Agent.start_link(fn -> 0 end)
+
+    outside_horizon_ts =
+      DateTime.to_unix(DateTime.add(upgraded.last_reconciled_at, 61, :second))
+
+    outside_webhook = %{
+      "id" => "evt_outside_uncertainty_window",
+      "type" => "customer.subscription.updated",
+      "created" => outside_horizon_ts,
+      "data" => %{
+        "object" => %{
+          "id" => "sub_durable_1",
+          "customer" => "cus_durable",
+          "status" => "active",
+          "items" => %{"data" => [%{"price" => %{"id" => "price_after_horizon"}}]}
+        }
+      }
+    }
+
+    assert {:ok, outside_applied} =
+             WebhookSync.sync_event(
+               outside_webhook,
+               @sync_opts ++
+                 [
+                   provider: CountingProvider,
+                   counter: outside_counter,
+                   live_response: live_ultimate,
+                   reconciliation_skew_seconds: 60
+                 ]
+             )
+
+    assert Agent.get(outside_counter, & &1) == 0
+    assert outside_applied.price_id == "price_after_horizon"
   end
 
   test "rolls back cleanly on provider and PostgreSQL errors without advancing last_reconciled_at",
