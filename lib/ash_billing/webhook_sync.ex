@@ -225,11 +225,28 @@ defmodule AshBilling.WebhookSync do
 
             {:ok, existing}
 
-          # Post-reconciliation ambiguity check (covers both non-terminal and delayed terminal events):
-          # Because provider event timestamps and reconciliation checkpoints do not form a strict
-          # total order across async event emitters, any webhook inside the uncertainty horizon
-          # re-verifies live provider state under the row lock instead of applying stale attributes.
-          existing && reconciled_checkpoint_covers_event?(existing, event_dt, opts) ->
+          # Post-reconciliation financial verification & no-op fast path:
+          # When a subscription has a durable last_reconciled_at checkpoint:
+          # - If the incoming webhook changes NO critical financial attributes, skip provider
+          #   re-verification (no-op if event timestamp is also unchanged, or update timestamp cleanly).
+          # - If ANY critical financial attribute differs (whether inside or outside
+          #   reconciliation_skew_seconds, and whether non-terminal or terminal), re-verify live
+          #   provider state under the row lock before applying so stale payloads cannot overwrite.
+          existing && has_reconciled_checkpoint?(existing) && not is_nil(event_dt) &&
+              not critical_financial_diff?(existing, attrs) ->
+            if same_value?(Map.get(existing, :last_event_created_at), event_dt) do
+              {:ok, existing}
+            else
+              update_subscription_safely(
+                subscription_resource,
+                existing,
+                attrs,
+                event_dt,
+                ash_opts
+              )
+            end
+
+          existing && has_reconciled_checkpoint?(existing) && not is_nil(event_dt) ->
             reconcile_subscription_with_provider(
               subscription_resource,
               existing,
@@ -937,27 +954,24 @@ defmodule AshBilling.WebhookSync do
     end
   end
 
-  defp reconciled_checkpoint_covers_event?(existing, %DateTime{} = incoming_dt, opts) do
-    case Map.get(existing, :last_reconciled_at) do
-      %DateTime{} = reconciled_dt ->
-        skew_seconds = reconciliation_skew_seconds(opts)
-        horizon = DateTime.add(reconciled_dt, skew_seconds, :second)
-        DateTime.compare(incoming_dt, horizon) != :gt
+  @financial_sync_fields [
+    :status,
+    :price_id,
+    :trial_ends_at,
+    :current_period_end,
+    :cancel_at_period_end,
+    :cancel_at
+  ]
 
-      _ ->
-        false
-    end
+  defp has_reconciled_checkpoint?(existing) do
+    match?(%DateTime{}, Map.get(existing, :last_reconciled_at))
   end
 
-  defp reconciled_checkpoint_covers_event?(_existing, _incoming_dt, _opts), do: false
-
-  defp reconciliation_skew_seconds(opts) do
-    val =
-      Keyword.get_lazy(opts, :reconciliation_skew_seconds, fn ->
-        Application.get_env(:ash_billing, :reconciliation_skew_seconds, 60)
-      end)
-
-    if is_integer(val) and val >= 0, do: val, else: 60
+  defp critical_financial_diff?(existing, attrs) do
+    Enum.any?(@financial_sync_fields, fn field ->
+      Map.has_key?(existing, field) and Map.has_key?(attrs, field) and
+        not same_value?(Map.get(existing, field), Map.get(attrs, field))
+    end)
   end
 
   @doc false
@@ -1021,20 +1035,7 @@ defmodule AshBilling.WebhookSync do
     case {Map.get(existing, :last_event_created_at), incoming_dt} do
       {%DateTime{} = recorded_dt, %DateTime{} = inc_dt} ->
         DateTime.compare(recorded_dt, inc_dt) == :eq and
-          Enum.any?(
-            [
-              :status,
-              :price_id,
-              :trial_ends_at,
-              :current_period_end,
-              :cancel_at_period_end,
-              :cancel_at
-            ],
-            fn field ->
-              Map.has_key?(existing, field) and Map.has_key?(attrs, field) and
-                not same_value?(Map.get(existing, field), Map.get(attrs, field))
-            end
-          )
+          critical_financial_diff?(existing, attrs)
 
       _ ->
         false

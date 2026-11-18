@@ -26,6 +26,13 @@ defmodule AshBilling.DurableReconciliationTest do
         Agent.update(counter, &(&1 + 1))
       end
 
+      if delay_ms = Keyword.get(opts, :delay_ms) do
+        receive do
+        after
+          delay_ms -> :ok
+        end
+      end
+
       case Keyword.get(opts, :live_response) do
         %{} = payload -> {:ok, payload}
         {:error, _} = err -> err
@@ -484,26 +491,98 @@ defmodule AshBilling.DurableReconciliationTest do
                  [
                    provider: CountingProvider,
                    counter: counter,
-                   live_response: live_ultimate,
-                   reconciliation_skew_seconds: 60
+                   live_response: live_ultimate
                  ]
              )
 
     assert Agent.get(counter, & &1) == 1
     assert upgraded.price_id == "price_ultimate"
 
-    # 3. Documented heuristic boundary:
-    # An event with event.created > last_reconciled_at + reconciliation_skew_seconds (and > last_event_created_at)
-    # is treated as a normal newer webhook without extra provider calls.
-    {:ok, outside_counter} = Agent.start_link(fn -> 0 end)
+    # 3. Old webhook outside 60s window (+120s beyond last_reconciled_at) proposing stale price,
+    # stale cancel_at_period_end, and stale period must still re-verify live provider state and NOT overwrite.
+    {:ok, stale_outside_counter} = Agent.start_link(fn -> 0 end)
+    outside_horizon_ts = DateTime.to_unix(DateTime.add(upgraded.last_reconciled_at, 120, :second))
 
-    outside_horizon_ts =
-      DateTime.to_unix(DateTime.add(upgraded.last_reconciled_at, 61, :second))
-
-    outside_webhook = %{
-      "id" => "evt_outside_uncertainty_window",
+    stale_outside_webhook = %{
+      "id" => "evt_stale_outside_60s_window",
       "type" => "customer.subscription.updated",
       "created" => outside_horizon_ts,
+      "data" => %{
+        "object" => %{
+          "id" => "sub_durable_1",
+          "customer" => "cus_durable",
+          "status" => "active",
+          "cancel_at_period_end" => true,
+          "current_period_end" =>
+            DateTime.to_unix(DateTime.add(DateTime.utc_now(), -86_400, :second)),
+          "items" => %{"data" => [%{"price" => %{"id" => "price_basic"}}]}
+        }
+      }
+    }
+
+    assert {:ok, stale_rejected} =
+             WebhookSync.sync_event(
+               stale_outside_webhook,
+               @sync_opts ++
+                 [
+                   provider: CountingProvider,
+                   counter: stale_outside_counter,
+                   live_response: live_ultimate
+                 ]
+             )
+
+    assert Agent.get(stale_outside_counter, & &1) == 1
+    assert stale_rejected.price_id == "price_ultimate"
+    assert stale_rejected.cancel_at_period_end == false
+    assert is_nil(stale_rejected.current_period_end)
+
+    # 4. Non-mutating webhook outside 60s window (identical financial attributes) skips provider GET
+    {:ok, noop_counter} = Agent.start_link(fn -> 0 end)
+    noop_ts = outside_horizon_ts + 30
+
+    noop_webhook = %{
+      "id" => "evt_noop_outside_window",
+      "type" => "customer.subscription.updated",
+      "created" => noop_ts,
+      "data" => %{
+        "object" => %{
+          "id" => "sub_durable_1",
+          "customer" => "cus_durable",
+          "status" => "active",
+          "cancel_at_period_end" => false,
+          "items" => %{"data" => [%{"price" => %{"id" => "price_ultimate"}}]}
+        }
+      }
+    }
+
+    assert {:ok, after_noop} =
+             WebhookSync.sync_event(
+               noop_webhook,
+               @sync_opts ++
+                 [
+                   provider: CountingProvider,
+                   counter: noop_counter,
+                   live_response: live_ultimate
+                 ]
+             )
+
+    assert Agent.get(noop_counter, & &1) == 0
+    assert after_noop.price_id == "price_ultimate"
+
+    # 5. Legitimate new upgrade outside 60s window re-verifies with provider and updates state
+    {:ok, upgrade_counter} = Agent.start_link(fn -> 0 end)
+
+    live_after_horizon = %{
+      "id" => "sub_durable_1",
+      "customer" => "cus_durable",
+      "status" => "active",
+      "items" => %{"data" => [%{"price" => %{"id" => "price_after_horizon"}}]}
+    }
+
+    legit_outside_webhook = %{
+      "id" => "evt_legit_outside_60s_window",
+      "type" => "customer.subscription.updated",
+      "created" => noop_ts + 60,
       "data" => %{
         "object" => %{
           "id" => "sub_durable_1",
@@ -516,18 +595,209 @@ defmodule AshBilling.DurableReconciliationTest do
 
     assert {:ok, outside_applied} =
              WebhookSync.sync_event(
-               outside_webhook,
+               legit_outside_webhook,
                @sync_opts ++
                  [
                    provider: CountingProvider,
-                   counter: outside_counter,
-                   live_response: live_ultimate,
-                   reconciliation_skew_seconds: 60
+                   counter: upgrade_counter,
+                   live_response: live_after_horizon
                  ]
              )
 
-    assert Agent.get(outside_counter, & &1) == 0
+    assert Agent.get(upgrade_counter, & &1) == 1
     assert outside_applied.price_id == "price_after_horizon"
+
+    # 6. Delayed terminal webhook outside 60s window also re-verifies live provider state
+    {:ok, terminal_outside_counter} = Agent.start_link(fn -> 0 end)
+
+    delayed_terminal_outside = %{
+      "id" => "evt_delayed_terminal_outside_60s",
+      "type" => "customer.subscription.deleted",
+      "created" => noop_ts + 120,
+      "data" => %{
+        "object" => %{
+          "id" => "sub_durable_1",
+          "customer" => "cus_durable",
+          "status" => "canceled",
+          "items" => %{"data" => [%{"price" => %{"id" => "price_basic"}}]}
+        }
+      }
+    }
+
+    assert {:ok, preserved_after_terminal} =
+             WebhookSync.sync_event(
+               delayed_terminal_outside,
+               @sync_opts ++
+                 [
+                   provider: CountingProvider,
+                   counter: terminal_outside_counter,
+                   live_response: live_after_horizon
+                 ]
+             )
+
+    assert Agent.get(terminal_outside_counter, & &1) == 1
+    assert preserved_after_terminal.status == :active
+    assert preserved_after_terminal.price_id == "price_after_horizon"
+
+    # 7. Provider HTTP 503 failure during outside-window re-verification fails closed without applying payload
+    stale_http_fail = %{
+      "id" => "evt_http_503_outside_window",
+      "type" => "customer.subscription.updated",
+      "created" => noop_ts + 180,
+      "data" => %{
+        "object" => %{
+          "id" => "sub_durable_1",
+          "customer" => "cus_durable",
+          "status" => "active",
+          "items" => %{"data" => [%{"price" => %{"id" => "price_basic"}}]}
+        }
+      }
+    }
+
+    assert {:error, {:reconciliation_failed, %{status: 503}}} =
+             WebhookSync.sync_event(
+               stale_http_fail,
+               @sync_opts ++
+                 [provider: CountingProvider, live_response: {:error, %{status: 503}}]
+             )
+
+    persisted_after_503 = Ash.get!(PostgresSubscription, sub.id, @opts)
+    assert persisted_after_503.price_id == "price_after_horizon"
+  end
+
+  test "measures additional provider calls and latency impact across fast-paths and financial diffs",
+       %{subscription: sub} do
+    # Reconcile once so last_reconciled_at is set
+    live_enterprise = %{
+      "id" => "sub_durable_1",
+      "customer" => "cus_durable",
+      "status" => "active",
+      "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
+    }
+
+    assert {:ok, reconciled} =
+             AshBilling.reconcile_subscription(sub,
+               provider: CountingProvider,
+               live_response: live_enterprise,
+               domain: PostgresDomain,
+               authorize?: false
+             )
+
+    # 1. Obsolete event (< last_event_created_at): 0 extra provider calls
+    {:ok, obsolete_counter} = Agent.start_link(fn -> 0 end)
+    obsolete_ts = DateTime.to_unix(DateTime.add(reconciled.last_event_created_at, -30, :second))
+
+    obsolete_event = %{
+      "id" => "evt_measure_obsolete",
+      "type" => "customer.subscription.updated",
+      "created" => obsolete_ts,
+      "data" => %{
+        "object" => %{
+          "id" => "sub_durable_1",
+          "customer" => "cus_durable",
+          "status" => "active",
+          "items" => %{"data" => [%{"price" => %{"id" => "price_basic"}}]}
+        }
+      }
+    }
+
+    {obsolete_us, {:ok, _}} =
+      :timer.tc(fn ->
+        WebhookSync.sync_event(
+          obsolete_event,
+          @sync_opts ++
+            [
+              provider: CountingProvider,
+              counter: obsolete_counter,
+              delay_ms: 40,
+              live_response: live_enterprise
+            ]
+        )
+      end)
+
+    assert Agent.get(obsolete_counter, & &1) == 0
+
+    # 2. No financial diff outside window: 0 extra provider calls
+    {:ok, noop_counter} = Agent.start_link(fn -> 0 end)
+    later_ts = DateTime.to_unix(DateTime.add(reconciled.last_reconciled_at, 120, :second))
+
+    noop_event = %{
+      "id" => "evt_measure_noop",
+      "type" => "customer.subscription.updated",
+      "created" => later_ts,
+      "data" => %{
+        "object" => %{
+          "id" => "sub_durable_1",
+          "customer" => "cus_durable",
+          "status" => "active",
+          "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
+        }
+      }
+    }
+
+    {noop_us, {:ok, _}} =
+      :timer.tc(fn ->
+        WebhookSync.sync_event(
+          noop_event,
+          @sync_opts ++
+            [
+              provider: CountingProvider,
+              counter: noop_counter,
+              delay_ms: 40,
+              live_response: live_enterprise
+            ]
+        )
+      end)
+
+    assert Agent.get(noop_counter, & &1) == 0
+
+    # 3. Critical financial diff outside window: 1 extra provider GET adding provider RTT latency
+    {:ok, diff_counter} = Agent.start_link(fn -> 0 end)
+
+    live_pro = %{
+      "id" => "sub_durable_1",
+      "customer" => "cus_durable",
+      "status" => "active",
+      "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+    }
+
+    diff_event = %{
+      "id" => "evt_measure_diff",
+      "type" => "customer.subscription.updated",
+      "created" => later_ts + 30,
+      "data" => %{
+        "object" => %{
+          "id" => "sub_durable_1",
+          "customer" => "cus_durable",
+          "status" => "active",
+          "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+        }
+      }
+    }
+
+    {diff_us, {:ok, updated}} =
+      :timer.tc(fn ->
+        WebhookSync.sync_event(
+          diff_event,
+          @sync_opts ++
+            [
+              provider: CountingProvider,
+              counter: diff_counter,
+              delay_ms: 40,
+              live_response: live_pro
+            ]
+        )
+      end)
+
+    assert Agent.get(diff_counter, & &1) == 1
+    assert updated.price_id == "price_pro"
+    assert diff_us >= 40_000
+    assert diff_us > noop_us
+    assert diff_us > obsolete_us
+
+    IO.puts(
+      "[0.6.0-dev Latency Measure] obsolete=#{obsolete_us}us (calls=0), noop=#{noop_us}us (calls=0), financial_diff=#{diff_us}us (calls=1, simulated_rtt=40ms)"
+    )
   end
 
   test "rolls back cleanly on provider and PostgreSQL errors without advancing last_reconciled_at",

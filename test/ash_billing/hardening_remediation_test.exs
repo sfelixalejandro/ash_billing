@@ -826,7 +826,16 @@ defmodule AshBilling.HardeningRemediationTest do
         }
       }
 
-      assert {:ok, after_newer} = WebhookSync.sync_event(newer_webhook, @sync_opts)
+      assert {:ok, after_newer} =
+               WebhookSync.sync_event(
+                 newer_webhook,
+                 @sync_opts ++
+                   [
+                     provider: DriftProvider,
+                     mock_response: {:ok, newer_webhook["data"]["object"]}
+                   ]
+               )
+
       assert after_newer.id == active_sub.id
       assert after_newer.price_id == "price_ultimate"
     end
