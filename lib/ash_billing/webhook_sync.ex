@@ -127,6 +127,12 @@ defmodule AshBilling.WebhookSync do
       stripe_cust_id = extract_customer_id(Map.take(object, ["customer"]))
       status = normalize_status(object["status"])
       price_id = if multiple_subscription_items?(object), do: nil, else: extract_price_id(object)
+
+      provider_subscription_item_id =
+        if multiple_subscription_items?(object),
+          do: nil,
+          else: extract_subscription_item_id(object)
+
       current_period_end = extract_current_period_end(object)
       trial_ends_at = extract_trial_ends_at(object)
       cancel_at_period_end = Map.get(object, "cancel_at_period_end", false)
@@ -153,6 +159,7 @@ defmodule AshBilling.WebhookSync do
       reconciled_at = Keyword.get(opts, :reconciled_at)
 
       with :ok <- validate_subscription_items(object),
+           {:ok, quantity} <- extract_quantity(object),
            {:ok, customer} <- find_customer(customer_resource, stripe_cust_id, object, ash_opts),
            {:ok, existing} <-
              fetch_existing_subscription(subscription_resource, sub_id, ash_opts),
@@ -165,6 +172,21 @@ defmodule AshBilling.WebhookSync do
             current_period_end: current_period_end,
             cancel_at_period_end: cancel_at_period_end
           }
+          |> then(fn a ->
+            if Ash.Resource.Info.attribute(subscription_resource, :quantity) != nil do
+              Map.put(a, :quantity, quantity)
+            else
+              a
+            end
+          end)
+          |> then(fn a ->
+            if Ash.Resource.Info.attribute(subscription_resource, :provider_subscription_item_id) !=
+                 nil do
+              Map.put(a, :provider_subscription_item_id, provider_subscription_item_id)
+            else
+              a
+            end
+          end)
           |> then(fn a ->
             if Ash.Resource.Info.attribute(subscription_resource, :cancel_at) != nil do
               Map.put(a, :cancel_at, cancel_at)
@@ -499,13 +521,17 @@ defmodule AshBilling.WebhookSync do
 
     case provider.get_subscription(sub_id, opts) do
       {:ok, live_sub} when is_map(live_sub) ->
-        if validate_subscription_items(live_sub) != :ok do
-          {:error, :unsupported_subscription_items}
-        else
+        with :ok <- validate_subscription_items(live_sub),
+             {:ok, live_quantity} <- extract_quantity(live_sub) do
           live_status = normalize_status(live_sub["status"])
 
           live_price_id =
             if multiple_subscription_items?(live_sub), do: nil, else: extract_price_id(live_sub)
+
+          live_subscription_item_id =
+            if multiple_subscription_items?(live_sub),
+              do: nil,
+              else: extract_subscription_item_id(live_sub)
 
           live_current_period_end = extract_current_period_end(live_sub)
           live_trial_ends_at = extract_trial_ends_at(live_sub)
@@ -537,6 +563,23 @@ defmodule AshBilling.WebhookSync do
               |> Map.put(:price_id, live_price_id)
               |> Map.put(:current_period_end, live_current_period_end)
               |> Map.put(:cancel_at_period_end, live_cancel_at_period_end)
+              |> then(fn a ->
+                if Ash.Resource.Info.attribute(subscription_resource, :quantity) != nil do
+                  Map.put(a, :quantity, live_quantity)
+                else
+                  a
+                end
+              end)
+              |> then(fn a ->
+                if Ash.Resource.Info.attribute(
+                     subscription_resource,
+                     :provider_subscription_item_id
+                   ) != nil do
+                  Map.put(a, :provider_subscription_item_id, live_subscription_item_id)
+                else
+                  a
+                end
+              end)
               |> then(fn a ->
                 if Ash.Resource.Info.attribute(subscription_resource, :cancel_at) != nil do
                   Map.put(a, :cancel_at, live_cancel_at)
@@ -646,6 +689,8 @@ defmodule AshBilling.WebhookSync do
             [
               :status,
               :price_id,
+              :quantity,
+              :provider_subscription_item_id,
               :trial_ends_at,
               :current_period_end,
               :cancel_at_period_end,
@@ -971,6 +1016,8 @@ defmodule AshBilling.WebhookSync do
   @financial_sync_fields [
     :status,
     :price_id,
+    :quantity,
+    :provider_subscription_item_id,
     :trial_ends_at,
     :current_period_end,
     :cancel_at_period_end,
@@ -1131,6 +1178,67 @@ defmodule AshBilling.WebhookSync do
   defp extract_price_id(%{"price" => %{"id" => id}}) when is_binary(id), do: id
   defp extract_price_id(%{"price" => id}) when is_binary(id), do: id
   defp extract_price_id(_), do: nil
+
+  # Quantity extraction semantics (fail-closed on malformed data):
+  # 1. Legitimately absent or `nil` (metered/usage-based or custom provider without quantity) -> `{:ok, nil}`
+  # 2. Legitimately `0` (e.g. zero-seat licensed subscription) -> `{:ok, 0}` (never fabricates seats or clears to nil)
+  # 3. Positive integer -> `{:ok, n}`
+  # 4. Present with invalid type or negative value (e.g. -5, "10", 2.5, true, map) -> `{:error, :invalid_quantity}`
+  # Terminal multi-item payloads return `{:ok, nil}` so cancellation still revokes access cleanly.
+  defp extract_quantity(object) do
+    if multiple_subscription_items?(object) do
+      {:ok, nil}
+    else
+      do_extract_quantity(object)
+    end
+  end
+
+  defp do_extract_quantity(%{"items" => %{"data" => [item]}} = object) when is_map(item) do
+    cond do
+      Map.has_key?(item, "quantity") ->
+        parse_synced_quantity(item["quantity"])
+
+      Map.has_key?(object, "quantity") ->
+        parse_synced_quantity(object["quantity"])
+
+      true ->
+        {:ok, nil}
+    end
+  end
+
+  defp do_extract_quantity(%{"items" => %{"data" => []}} = object) do
+    if Map.has_key?(object, "quantity") do
+      parse_synced_quantity(object["quantity"])
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp do_extract_quantity(%{"items" => _}), do: {:ok, nil}
+  defp do_extract_quantity(%{"quantity" => quantity}), do: parse_synced_quantity(quantity)
+  defp do_extract_quantity(_), do: {:ok, nil}
+
+  defp parse_synced_quantity(nil), do: {:ok, nil}
+
+  defp parse_synced_quantity(quantity) when is_integer(quantity) and quantity >= 0,
+    do: {:ok, quantity}
+
+  defp parse_synced_quantity(_), do: {:error, :invalid_quantity}
+
+  defp extract_subscription_item_id(%{"items" => %{"data" => [%{"id" => id}]}})
+       when is_binary(id) do
+    trimmed = String.trim(id)
+    if trimmed != "", do: trimmed, else: nil
+  end
+
+  defp extract_subscription_item_id(%{"items" => _}), do: nil
+
+  defp extract_subscription_item_id(%{"subscription_item_id" => id}) when is_binary(id) do
+    trimmed = String.trim(id)
+    if trimmed != "", do: trimmed, else: nil
+  end
+
+  defp extract_subscription_item_id(_), do: nil
 
   defp parse_unix_timestamp(ts) when is_integer(ts) do
     case DateTime.from_unix(ts, :second) do

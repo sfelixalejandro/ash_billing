@@ -217,22 +217,29 @@ defmodule AshBillingConsumer.Runner do
         else: memory().first_price
 
     stale_price = sub_before.price_id
+    stale_quantity = sub_before.quantity
+    target_quantity = if stale_quantity == 15, do: 12, else: 15
     prev_event_ts = sub_before.last_event_created_at
 
     Application.put_env(:ash_billing_consumer, :drop_webhooks, true)
 
     try do
       {:ok, _} = AshBilling.swap_plan(sub_before, target_price, Remote.opts())
+      {:ok, _} = AshBilling.update_quantity(sub_before, target_quantity, Remote.opts())
       Process.sleep(2_000)
 
       remote = Remote.request(:get, "/v1/subscriptions/" <> memory().subscription_id)
-      remote_price = hd(remote["items"]["data"])["price"]["id"]
+      remote_item = hd(remote["items"]["data"])
+      remote_price = remote_item["price"]["id"]
+      remote_qty = remote_item["quantity"]
       ensure(remote_price == target_price, "Stripe did not apply target plan")
+      ensure(remote_qty == target_quantity, "Stripe did not apply target quantity")
 
       local_while_dropped = current_sub()
 
       ensure(
-        local_while_dropped.price_id == stale_price,
+        local_while_dropped.price_id == stale_price and
+          local_while_dropped.quantity == stale_quantity,
         "Expected local PostgreSQL state to remain stale while webhooks were dropped"
       )
 
@@ -243,6 +250,16 @@ defmodule AshBillingConsumer.Runner do
         )
 
       ensure(reconciled.price_id == target_price, "Reconciliation did not converge local price")
+
+      ensure(
+        reconciled.quantity == target_quantity,
+        "Reconciliation did not converge local quantity"
+      )
+
+      ensure(
+        reconciled.provider_subscription_item_id == remote_item["id"],
+        "Reconciliation did not persist provider_subscription_item_id"
+      )
 
       ensure(
         match?(%DateTime{}, reconciled.last_reconciled_at),
@@ -261,7 +278,10 @@ defmodule AshBillingConsumer.Runner do
         livemode: remote["livemode"],
         subscription: remote["id"],
         stale_price_before_reconcile: stale_price,
+        stale_quantity_before_reconcile: stale_quantity,
         reconciled_price: reconciled.price_id,
+        reconciled_quantity: reconciled.quantity,
+        provider_subscription_item_id: reconciled.provider_subscription_item_id,
         last_event_created_at: reconciled.last_event_created_at,
         last_reconciled_at: reconciled.last_reconciled_at,
         local_state: state()
@@ -315,8 +335,8 @@ defmodule AshBillingConsumer.Runner do
     sub_after = current_sub()
 
     ensure(
-      sub_after.price_id == sub_before.price_id,
-      "Delayed old event overwrote reconciled live Stripe price!"
+      sub_after.price_id == sub_before.price_id and sub_after.quantity == sub_before.quantity,
+      "Delayed old event overwrote reconciled live Stripe price or quantity!"
     )
 
     ensure(
@@ -330,7 +350,9 @@ defmodule AshBillingConsumer.Runner do
         "local HMAC-signed re-delivery of captured real Stripe payload verified against live Stripe Test API",
       original_captured_event: captured_event["id"],
       injected_stale_price: stale_price,
+      injected_stale_quantity: hd(captured_event["data"]["object"]["items"]["data"])["quantity"],
       preserved_live_price: sub_after.price_id,
+      preserved_live_quantity: sub_after.quantity,
       http_status: response.status,
       last_reconciled_at_before: sub_before.last_reconciled_at,
       last_reconciled_at_after: sub_after.last_reconciled_at
@@ -591,6 +613,8 @@ defmodule AshBillingConsumer.Runner do
             :provider_subscription_id,
             :status,
             :price_id,
+            :quantity,
+            :provider_subscription_item_id,
             :cancel_at_period_end,
             :current_period_end,
             :last_event_created_at,

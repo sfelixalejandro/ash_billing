@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased - 0.7.0]
+
+### Added & Changed
+
+- **Subscription Quantity & Item Synchronization**: Added protected nullable attributes `quantity` (`:integer`, `min: 0`) and `provider_subscription_item_id` (`:string`) to `AshBilling.Subscription` (`AddSubscriptionAttributes` + wildcard exclusion via `ProtectBillingAttributes`). `WebhookSync` and `AshBilling.reconcile_subscription/2` now extract, persist, compare (`@financial_sync_fields`), and atomically CAS-guard both attributes for single-item subscriptions: legitimately absent/`null` quantities remain `nil` (never assuming `1`), explicit `0` persists as `0` contracted seats, negative or malformed non-integer quantities fail closed with `{:error, :invalid_quantity}` without erasing valid persisted quantities, and multi-item non-terminal payloads remain rejected (`:unsupported_subscription_items`). See [Upgrading to 0.7](documentation/topics/upgrading-to-0.7.md).
+
 ## [0.6.0] - 2026-11-19
 
 ### Added & Changed
