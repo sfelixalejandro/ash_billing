@@ -168,6 +168,175 @@ defmodule AshBillingConsumer.Runner do
         "canceled"
       )
 
+  def command("api_subscribe") do
+    ensure(Map.has_key?(memory(), :customer), "Run setup first")
+    ensure(not Map.has_key?(memory(), :subscription_id), "Subscription already active")
+
+    customer = memory().customer
+    first_price = memory().first_price
+
+    pm =
+      Remote.request(:post, "/v1/payment_methods/pm_card_visa/attach", %{
+        customer: customer
+      })
+
+    ensure(pm["livemode"] === false, "PaymentMethod not in test mode")
+
+    Remote.request(:post, "/v1/customers/" <> customer, %{
+      invoice_settings: %{default_payment_method: pm["id"]}
+    })
+
+    remote =
+      Remote.request(:post, "/v1/subscriptions", %{
+        customer: customer,
+        default_payment_method: pm["id"],
+        items: [%{price: first_price, quantity: 20}]
+      })
+
+    ensure(remote["livemode"] === false and remote["status"] == "active", "Remote sub not active")
+    snapshot = await_subscription(remote)
+    remember(%{subscription_id: remote["id"]})
+
+    %{
+      status: "PASS",
+      livemode: false,
+      subscription: remote["id"],
+      price: first_price,
+      remote_quantity: hd(remote["items"]["data"])["quantity"],
+      local_state: snapshot
+    }
+  end
+
+  def command("missed_webhook_reconcile") do
+    sub_before = current_sub()
+    ensure(sub_before.status == :active, "Subscription must be active before missed-webhook test")
+
+    target_price =
+      if sub_before.price_id == memory().first_price,
+        do: memory().second_price,
+        else: memory().first_price
+
+    stale_price = sub_before.price_id
+    prev_event_ts = sub_before.last_event_created_at
+
+    Application.put_env(:ash_billing_consumer, :drop_webhooks, true)
+
+    try do
+      {:ok, _} = AshBilling.swap_plan(sub_before, target_price, Remote.opts())
+      Process.sleep(2_000)
+
+      remote = Remote.request(:get, "/v1/subscriptions/" <> memory().subscription_id)
+      remote_price = hd(remote["items"]["data"])["price"]["id"]
+      ensure(remote_price == target_price, "Stripe did not apply target plan")
+
+      local_while_dropped = current_sub()
+
+      ensure(
+        local_while_dropped.price_id == stale_price,
+        "Expected local PostgreSQL state to remain stale while webhooks were dropped"
+      )
+
+      {:ok, reconciled} =
+        AshBilling.reconcile_subscription(
+          local_while_dropped,
+          sync_opts()
+        )
+
+      ensure(reconciled.price_id == target_price, "Reconciliation did not converge local price")
+
+      ensure(
+        match?(%DateTime{}, reconciled.last_reconciled_at),
+        "last_reconciled_at was not persisted"
+      )
+
+      if prev_event_ts do
+        ensure(
+          DateTime.compare(reconciled.last_event_created_at, prev_event_ts) == :eq,
+          "reconcile_subscription unexpectedly mutated last_event_created_at"
+        )
+      end
+
+      %{
+        status: "PASS",
+        livemode: remote["livemode"],
+        subscription: remote["id"],
+        stale_price_before_reconcile: stale_price,
+        reconciled_price: reconciled.price_id,
+        last_event_created_at: reconciled.last_event_created_at,
+        last_reconciled_at: reconciled.last_reconciled_at,
+        local_state: state()
+      }
+    after
+      Application.put_env(:ash_billing_consumer, :drop_webhooks, false)
+    end
+  end
+
+  def command("delayed_old_event_after_reconcile") do
+    sub_before = current_sub()
+
+    ensure(
+      match?(%DateTime{}, sub_before.last_reconciled_at),
+      "Run missed_webhook_reconcile first"
+    )
+
+    stale_price =
+      if sub_before.price_id == memory().first_price,
+        do: memory().second_price,
+        else: memory().first_price
+
+    %{rows: [[captured_event]]} =
+      Repo.query!(
+        """
+        SELECT payload FROM handler_effects
+        WHERE event_type IN ('customer.subscription.created', 'customer.subscription.updated')
+          AND payload->'data'->'object'->>'id' = $1
+          AND payload->'data'->'object'->'items'->'data'->0->'price'->>'id' = $2
+        ORDER BY event_id DESC LIMIT 1
+        """,
+        [memory().subscription_id, stale_price]
+      )
+
+    # Craft a fresh event_id so deduplication does not short-circuit, with a real current
+    # timestamp (>= last_event_created_at and >= last_reconciled_at, without advancing into
+    # the future) using the real captured Stripe subscription object carrying the stale price.
+    Process.sleep(1_100)
+
+    replay_unix =
+      max(System.system_time(:second), DateTime.to_unix(sub_before.last_reconciled_at) + 1)
+
+    delayed_event =
+      captured_event
+      |> Map.put("id", "evt_local_delayed_" <> Ash.UUID.generate())
+      |> Map.put("created", replay_unix)
+
+    response = signed_delivery(delayed_event)
+    ensure(response.status == 200, "Delayed event delivery failed with HTTP #{response.status}")
+
+    sub_after = current_sub()
+
+    ensure(
+      sub_after.price_id == sub_before.price_id,
+      "Delayed old event overwrote reconciled live Stripe price!"
+    )
+
+    ensure(
+      DateTime.compare(sub_after.last_reconciled_at, sub_before.last_reconciled_at) in [:gt, :eq],
+      "last_reconciled_at moved backwards"
+    )
+
+    %{
+      status: "PASS",
+      execution:
+        "local HMAC-signed re-delivery of captured real Stripe payload verified against live Stripe Test API",
+      original_captured_event: captured_event["id"],
+      injected_stale_price: stale_price,
+      preserved_live_price: sub_after.price_id,
+      http_status: response.status,
+      last_reconciled_at_before: sub_before.last_reconciled_at,
+      last_reconciled_at_after: sub_after.last_reconciled_at
+    }
+  end
+
   def command("payment_checkout") do
     {:ok, session} =
       AshBilling.create_checkout_session(
@@ -218,11 +387,23 @@ defmodule AshBillingConsumer.Runner do
   end
 
   def command("replay") do
-    %{rows: [[event]]} =
-      Repo.query!(
-        "SELECT payload FROM handler_effects WHERE event_type='checkout.session.completed' AND payload->'data'->'object'->>'id'=$1",
-        [memory().subscription_checkout]
-      )
+    event =
+      case Repo.query!(
+             "SELECT payload FROM handler_effects WHERE event_type='checkout.session.completed' AND payload->'data'->'object'->>'id'=$1 LIMIT 1",
+             [memory().subscription_checkout]
+           ).rows do
+        [[ev]] ->
+          ev
+
+        [] ->
+          %{rows: [[ev]]} =
+            Repo.query!(
+              "SELECT payload FROM handler_effects WHERE event_type='customer.subscription.created' AND payload->'data'->'object'->>'id'=$1 ORDER BY event_id LIMIT 1",
+              [memory().subscription_id]
+            )
+
+          ev
+      end
 
     before_count = effect_count(event["id"])
     response = signed_delivery(event)
@@ -411,7 +592,9 @@ defmodule AshBillingConsumer.Runner do
             :status,
             :price_id,
             :cancel_at_period_end,
-            :current_period_end
+            :current_period_end,
+            :last_event_created_at,
+            :last_reconciled_at
           ])
         ),
       canceling: Enum.any?(subs, &AshBilling.canceling?/1),

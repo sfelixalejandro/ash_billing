@@ -117,21 +117,47 @@ end
 
 defmodule AshBillingConsumer.Router do
   use Plug.Router
-  plug :match
-  plug :dispatch
 
-  forward "/webhooks/stripe",
-    to: AshBilling.Plug,
-    init_opts: [
-      customer_resource: AshBillingConsumer.User,
-      subscription_resource: AshBillingConsumer.Subscription,
-      deduplication_resource: AshBillingConsumer.WebhookEvent,
-      domain: AshBillingConsumer.Domain,
-      handler: AshBillingConsumer.Handler,
-      expected_livemode: false,
-      webhook_secret: {System, :get_env, ["STRIPE_WEBHOOK_SECRET"]},
-      api_key: {System, :get_env, ["STRIPE_SECRET_KEY"]}
-    ]
+  defp maybe_drop_webhook(conn, _opts) do
+    if Application.get_env(:ash_billing_consumer, :drop_webhooks, false) do
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.send_resp(503, Jason.encode!(%{error: "simulated_webhook_outage"}))
+      |> Plug.Conn.halt()
+    else
+      conn
+    end
+  end
+
+  plug(:match)
+  plug(:dispatch)
+
+  post "/webhooks/stripe" do
+    conn = maybe_drop_webhook(conn, [])
+
+    if conn.halted do
+      conn
+    else
+      opts =
+        AshBilling.Plug.init(
+          customer_resource: AshBillingConsumer.User,
+          subscription_resource: AshBillingConsumer.Subscription,
+          deduplication_resource: AshBillingConsumer.WebhookEvent,
+          domain: AshBillingConsumer.Domain,
+          handler: AshBillingConsumer.Handler,
+          expected_livemode: false,
+          webhook_secret: {System, :get_env, ["STRIPE_WEBHOOK_SECRET"]},
+          api_key: {System, :get_env, ["STRIPE_SECRET_KEY"]},
+          req_opts: [
+            connect_options: [timeout: 3_000],
+            receive_timeout: 5_000,
+            retry: false
+          ]
+        )
+
+      AshBilling.Plug.call(conn, opts)
+    end
+  end
 
   get "/health" do
     send_resp(conn, 200, Jason.encode!(%{ready: true, mode: "test"}))

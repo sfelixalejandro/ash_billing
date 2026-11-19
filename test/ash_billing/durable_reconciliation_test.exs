@@ -418,8 +418,9 @@ defmodule AshBilling.DurableReconciliationTest do
   test "handles host clock skew and uncertainty window without silent loss or regressions", %{
     subscription: sub
   } do
-    # 1. Host clock lagging 120s behind existing last_event_created_at:
-    # reconcile_subscription/2 still updates live state without advancing last_event_created_at
+    # 1. Host clock lagging 120s behind existing last_event_created_at (or 0.5.x ahead cursor):
+    # reconcile_subscription/2 updates live state, sets last_reconciled_at, and clears the
+    # ahead last_event_created_at to nil so subsequent real webhooks are not silently dropped.
     ahead_ts = DateTime.utc_now() |> DateTime.add(120, :second) |> DateTime.truncate(:second)
 
     {:ok, sub_ahead} =
@@ -443,7 +444,7 @@ defmodule AshBilling.DurableReconciliationTest do
              )
 
     assert reconciled.price_id == "price_enterprise"
-    assert DateTime.compare(reconciled.last_event_created_at, ahead_ts) == :eq
+    assert is_nil(reconciled.last_event_created_at)
     assert %DateTime{} = reconciled.last_reconciled_at
 
     # 2. Event inside uncertainty window [last_reconciled_at, last_reconciled_at + skew_seconds]:
@@ -918,6 +919,183 @@ defmodule AshBilling.DurableReconciliationTest do
     persisted_after_pg_fail = Ash.get!(PostgresSubscription, sub.id, @opts)
     assert persisted_after_pg_fail.price_id == "price_enterprise"
     assert DateTime.compare(persisted_after_pg_fail.last_reconciled_at, checkpoint_1) == :eq
+  end
+
+  test "0.5.3 upgrade compatibility: clears ahead synthetic last_event_created_at on 0.6.0 reconciliation so real webhooks are not ignored",
+       %{subscription: sub} do
+    # 1. Simulate a pre-0.6.0 (0.5.3) subscription where synthetic reconciliation stamped
+    #    last_event_created_at ahead of Stripe/PostgreSQL current time (e.g., +180s forward skew)
+    #    and last_reconciled_at is NULL after adding the 0.6.0 column.
+    synthetic_ahead_ts =
+      DateTime.utc_now()
+      |> DateTime.add(180, :second)
+      |> DateTime.truncate(:second)
+
+    {:ok, legacy_053_sub} =
+      sub
+      |> Ash.Changeset.for_update(
+        :revise,
+        %{
+          status: :active,
+          price_id: "price_pro",
+          last_event_created_at: synthetic_ahead_ts,
+          last_reconciled_at: nil
+        },
+        @opts
+      )
+      |> Ash.update(@opts)
+
+    assert is_nil(legacy_053_sub.last_reconciled_at)
+
+    # 2. After upgrading to 0.6.0, reconcile_subscription/2 fetches live state from Stripe.
+    remote_pro = %{
+      "id" => "sub_durable_1",
+      "customer" => "cus_durable",
+      "status" => "active",
+      "items" => %{"data" => [%{"price" => %{"id" => "price_pro"}}]}
+    }
+
+    assert {:ok, reconciled_060} =
+             AshBilling.reconcile_subscription(legacy_053_sub,
+               provider: CountingProvider,
+               live_response: remote_pro,
+               domain: PostgresDomain,
+               authorize?: false
+             )
+
+    assert %DateTime{} = reconciled_060.last_reconciled_at
+    assert is_nil(reconciled_060.last_event_created_at)
+
+    # 3. A delayed stale webhook arriving immediately after clearing the synthetic cursor
+    #    is STILL blocked from overwriting reconciled state because last_reconciled_at triggers
+    #    live provider re-verification.
+    stale_past_ts =
+      DateTime.utc_now()
+      |> DateTime.add(-600, :second)
+      |> DateTime.truncate(:second)
+
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    stale_webhook = %{
+      "id" => "evt_stale_after_053_upgrade",
+      "type" => "customer.subscription.updated",
+      "created" => DateTime.to_unix(stale_past_ts),
+      "data" => %{
+        "object" => %{
+          "id" => "sub_durable_1",
+          "customer" => "cus_durable",
+          "status" => "active",
+          "items" => %{"data" => [%{"price" => %{"id" => "price_basic"}}]}
+        }
+      }
+    }
+
+    assert {:ok, after_stale} =
+             WebhookSync.sync_event(
+               stale_webhook,
+               @sync_opts ++
+                 [provider: CountingProvider, counter: counter, live_response: remote_pro]
+             )
+
+    assert Agent.get(counter, & &1) == 1
+    assert after_stale.price_id == "price_pro"
+
+    # 4. Now a legitimate real Stripe webhook arrives with event.created < synthetic_ahead_ts
+    #    (real current Stripe time) upgrading the plan to price_enterprise.
+    #    It MUST NOT be ignored by existing_event_newer?/2.
+    real_webhook_ts =
+      DateTime.utc_now()
+      |> DateTime.add(5, :second)
+      |> DateTime.truncate(:second)
+
+    assert DateTime.compare(real_webhook_ts, synthetic_ahead_ts) == :lt
+
+    remote_enterprise = %{
+      "id" => "sub_durable_1",
+      "customer" => "cus_durable",
+      "status" => "active",
+      "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
+    }
+
+    legitimate_webhook = %{
+      "id" => "evt_legit_after_053_upgrade",
+      "type" => "customer.subscription.updated",
+      "created" => DateTime.to_unix(real_webhook_ts),
+      "data" => %{
+        "object" => remote_enterprise
+      }
+    }
+
+    assert {:ok, after_legit} =
+             WebhookSync.sync_event(
+               legitimate_webhook,
+               @sync_opts ++
+                 [provider: CountingProvider, counter: counter, live_response: remote_enterprise]
+             )
+
+    assert Agent.get(counter, & &1) == 2
+    assert after_legit.price_id == "price_enterprise"
+    assert DateTime.compare(after_legit.last_event_created_at, real_webhook_ts) == :eq
+
+    # 5. Shared App+PostgreSQL forward skew case: synthetic last_event_created_at <= DB clock
+    #    (e.g., DB clock was also ahead of Stripe). Explicit reset_event_cursor?: true clears
+    #    last_event_created_at atomically with last_reconciled_at so earlier Stripe events apply.
+    shared_skew_ts =
+      DateTime.utc_now()
+      |> DateTime.add(-10, :second)
+      |> DateTime.truncate(:second)
+
+    {:ok, shared_skew_sub} =
+      after_legit
+      |> Ash.Changeset.for_update(
+        :revise,
+        %{
+          status: :active,
+          price_id: "price_enterprise",
+          last_event_created_at: shared_skew_ts,
+          last_reconciled_at: nil
+        },
+        @opts
+      )
+      |> Ash.update(@opts)
+
+    assert {:ok, reset_sub} =
+             AshBilling.reconcile_subscription(shared_skew_sub,
+               provider: CountingProvider,
+               live_response: remote_enterprise,
+               reset_event_cursor?: true,
+               domain: PostgresDomain,
+               authorize?: false
+             )
+
+    assert %DateTime{} = reset_sub.last_reconciled_at
+    assert is_nil(reset_sub.last_event_created_at)
+
+    stripe_behind_db_ts = DateTime.add(shared_skew_ts, -30, :second)
+
+    remote_canceled = %{
+      "id" => "sub_durable_1",
+      "customer" => "cus_durable",
+      "status" => "canceled",
+      "items" => %{"data" => [%{"price" => %{"id" => "price_enterprise"}}]}
+    }
+
+    legitimate_cancel = %{
+      "id" => "evt_legit_cancel_shared_skew",
+      "type" => "customer.subscription.deleted",
+      "created" => DateTime.to_unix(stripe_behind_db_ts),
+      "data" => %{"object" => remote_canceled}
+    }
+
+    assert {:ok, canceled_sub} =
+             WebhookSync.sync_event(
+               legitimate_cancel,
+               @sync_opts ++
+                 [provider: CountingProvider, counter: counter, live_response: remote_canceled]
+             )
+
+    assert canceled_sub.status == :canceled
+    assert DateTime.compare(canceled_sub.last_event_created_at, stripe_behind_db_ts) == :eq
   end
 
   defp wait_for_pg_lock_contention(timeout_ms) do

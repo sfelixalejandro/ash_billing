@@ -233,7 +233,9 @@ AshBilling.subscribed?(user, "price_pro_monthly")
 ```
 
 > [!NOTE]
-> **Provider Quantity Isolation**: `AshBilling.Providers.Stripe` guarantees price isolation by sending only the subscription item ID and updated quantity, omitting the price from the payload. For custom providers lacking `@callback update_quantity/3`, `AshBilling` falls back to `swap_plan/3`. If a caller supplies a stale `:price_id` to a legacy fallback provider, `swap_plan/3` will execute with that stale price. To guarantee price safety, custom providers must implement `update_quantity/3`.
+> **Provider Quantity Isolation & Persistence Scope**: `AshBilling.Providers.Stripe` guarantees price isolation by sending only the subscription item ID and updated quantity, omitting the price from the payload. For custom providers lacking `@callback update_quantity/3`, `AshBilling` falls back to `swap_plan/3`. If a caller supplies a stale `:price_id` to a legacy fallback provider, `swap_plan/3` will execute with that stale price. To guarantee price safety, custom providers must implement `update_quantity/3`.
+>
+> **Important:** Subscription `quantity` can be modified remotely through the Stripe API (`update_quantity/3`, `swap_plan/3`, and `create_checkout_session/2`), **but `quantity` is not yet part of the synchronized attributes stored in PostgreSQL on `AshBilling.Subscription`** (`status`, `price_id`, `current_period_end`, `trial_ends_at`, `cancel_at_period_end`, `cancel_at`, `last_event_created_at`, `last_reconciled_at`). Applications requiring local seat-count persistence must track it in their own webhook handler or read it from Stripe.
 
 ### Resume a Canceled Subscription
 ```elixir

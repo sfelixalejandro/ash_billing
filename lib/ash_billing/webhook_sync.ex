@@ -180,9 +180,23 @@ defmodule AshBilling.WebhookSync do
             end
           end)
           |> then(fn a ->
-            if Ash.Resource.Info.attribute(subscription_resource, :last_event_created_at) != nil and
-                 not is_nil(event_dt) do
-              Map.put(a, :last_event_created_at, event_dt)
+            if Ash.Resource.Info.attribute(subscription_resource, :last_event_created_at) != nil do
+              cond do
+                not is_nil(event_dt) ->
+                  Map.put(a, :last_event_created_at, event_dt)
+
+                should_reset_event_cursor?(existing, reconciled_at, opts) ->
+                  require Logger
+
+                  Logger.warning(
+                    "AshBilling.WebhookSync: Clearing last_event_created_at (#{inspect(Map.get(existing, :last_event_created_at))}) during reconciliation for subscription #{inspect(sub_id)} at checkpoint #{inspect(reconciled_at)}."
+                  )
+
+                  Map.put(a, :last_event_created_at, nil)
+
+                true ->
+                  a
+              end
             else
               a
             end
@@ -966,6 +980,21 @@ defmodule AshBilling.WebhookSync do
   defp has_reconciled_checkpoint?(existing) do
     match?(%DateTime{}, Map.get(existing, :last_reconciled_at))
   end
+
+  defp should_reset_event_cursor?(nil, _reconciled_at, _opts), do: false
+
+  defp should_reset_event_cursor?(existing, %DateTime{} = reconciled_at, opts) do
+    case Map.get(existing, :last_event_created_at) do
+      %DateTime{} = existing_event_dt ->
+        Keyword.get(opts, :reset_event_cursor?, false) == true or
+          DateTime.compare(existing_event_dt, reconciled_at) == :gt
+
+      _ ->
+        false
+    end
+  end
+
+  defp should_reset_event_cursor?(_existing, _reconciled_at, _opts), do: false
 
   defp critical_financial_diff?(existing, attrs) do
     Enum.any?(@financial_sync_fields, fn field ->
