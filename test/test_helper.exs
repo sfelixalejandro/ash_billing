@@ -37,7 +37,7 @@ postgres_available? =
           provider_subscription_id TEXT NOT NULL,
           status TEXT NOT NULL,
           price_id TEXT,
-          quantity INTEGER CHECK (quantity IS NULL OR quantity >= 1),
+          quantity INTEGER,
           provider_subscription_item_id TEXT,
           current_period_end TIMESTAMP(6),
           trial_ends_at TIMESTAMP(6),
@@ -55,7 +55,17 @@ postgres_available? =
 
         Ecto.Adapters.SQL.query!(
           AshBilling.Test.Repo,
-          "ALTER TABLE billing_test_subscriptions ADD COLUMN IF NOT EXISTS quantity INTEGER CHECK (quantity IS NULL OR quantity >= 1)"
+          "ALTER TABLE billing_test_subscriptions ADD COLUMN IF NOT EXISTS quantity INTEGER"
+        )
+
+        Ecto.Adapters.SQL.query!(
+          AshBilling.Test.Repo,
+          "ALTER TABLE billing_test_subscriptions DROP CONSTRAINT IF EXISTS billing_test_subscriptions_quantity_check"
+        )
+
+        Ecto.Adapters.SQL.query!(
+          AshBilling.Test.Repo,
+          "ALTER TABLE billing_test_subscriptions ADD CONSTRAINT billing_test_subscriptions_quantity_check CHECK (quantity IS NULL OR quantity >= 0)"
         )
 
         Ecto.Adapters.SQL.query!(
@@ -83,7 +93,17 @@ postgres_available? =
 
         Ecto.Adapters.SQL.query!(
           AshBilling.Test.Repo,
-          "ALTER TABLE billing_scoped_subscriptions ADD COLUMN IF NOT EXISTS quantity INTEGER CHECK (quantity IS NULL OR quantity >= 1)"
+          "ALTER TABLE billing_scoped_subscriptions ADD COLUMN IF NOT EXISTS quantity INTEGER"
+        )
+
+        Ecto.Adapters.SQL.query!(
+          AshBilling.Test.Repo,
+          "ALTER TABLE billing_scoped_subscriptions DROP CONSTRAINT IF EXISTS billing_scoped_subscriptions_quantity_check"
+        )
+
+        Ecto.Adapters.SQL.query!(
+          AshBilling.Test.Repo,
+          "ALTER TABLE billing_scoped_subscriptions ADD CONSTRAINT billing_scoped_subscriptions_quantity_check CHECK (quantity IS NULL OR quantity >= 0)"
         )
 
         Ecto.Adapters.SQL.query!(

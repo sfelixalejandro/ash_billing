@@ -769,9 +769,9 @@ defmodule AshBilling.QuantitySyncTest do
     assert reconciled.provider_subscription_item_id == "si_seated_1"
   end
 
-  test "11. custom provider with incomplete/non-standard responses and legacy update_quantity fallback",
+  test "11. custom provider with incomplete responses, legitimate zero quantity, fail-closed malformed quantity, and legacy fallback",
        %{t1: t1} do
-    # Incomplete custom provider payload (no items, no quantity) -> quantity = nil (not 1)
+    # A) Incomplete custom provider payload (no items, no quantity) -> quantity = nil (not 1)
     incomplete_obj = %{
       "id" => "sub_custom_1",
       "customer" => "cus_qty_1",
@@ -789,29 +789,24 @@ defmodule AshBilling.QuantitySyncTest do
     assert is_nil(sub.quantity)
     assert is_nil(sub.provider_subscription_item_id)
 
-    # Non-positive / invalid quantity values safely become nil instead of violating min: 1 or fabricating 1
-    for {bad_qty, idx} <- Enum.with_index([nil, 0, -5, "10", 2.5], 1) do
-      ts = DateTime.add(t1, idx * 10, :second)
+    # B) Explicit nil quantity (metered / custom provider contract) remains nil cleanly
+    t_nil = DateTime.add(t1, 10, :second)
 
-      obj = %{
-        "id" => "sub_custom_1",
-        "customer" => "cus_qty_1",
-        "status" => "active",
-        "price" => "price_custom",
-        "quantity" => bad_qty
-      }
+    assert {:ok, synced_nil} =
+             WebhookSync.sync_event(
+               sub_event(
+                 "evt_cust_nil",
+                 "customer.subscription.updated",
+                 t_nil,
+                 Map.put(incomplete_obj, "quantity", nil)
+               ),
+               @sync_opts
+             )
 
-      assert {:ok, synced} =
-               WebhookSync.sync_event(
-                 sub_event("evt_cust_bad_#{idx}", "customer.subscription.updated", ts, obj),
-                 @sync_opts
-               )
+    assert is_nil(synced_nil.quantity)
 
-      assert is_nil(synced.quantity)
-    end
-
-    # Top-level custom provider quantity & subscription_item_id are supported
-    t_valid = DateTime.add(t1, 100, :second)
+    # C) Top-level custom provider valid quantity & subscription_item_id are persisted
+    t_valid = DateTime.add(t1, 20, :second)
 
     custom_valid = %{
       "id" => "sub_custom_1",
@@ -836,7 +831,40 @@ defmodule AshBilling.QuantitySyncTest do
     assert synced_custom.quantity == 9
     assert synced_custom.provider_subscription_item_id == "custom_item_9"
 
-    # Legacy custom provider without update_quantity/3 continues falling back to swap_plan/3
+    # D) Malformed quantity values fail closed BEFORE last_reconciled_at and NEVER erase valid quantity=9
+    for {bad_qty, idx} <- Enum.with_index([-5, "10", 2.5, true, %{"seats" => 5}], 1) do
+      ts = DateTime.add(t_valid, idx * 10, :second)
+      bad_obj = Map.put(custom_valid, "quantity", bad_qty)
+
+      assert {:error, :invalid_quantity} =
+               WebhookSync.sync_event(
+                 sub_event(
+                   "evt_cust_bad_pre_#{idx}",
+                   "customer.subscription.updated",
+                   ts,
+                   bad_obj
+                 ),
+                 @sync_opts
+               )
+
+      persisted = Ash.get!(PostgresSubscription, synced_custom.id, @opts)
+      assert persisted.quantity == 9
+      assert DateTime.compare(persisted.last_event_created_at, t_valid) == :eq
+    end
+
+    # E) Legitimately zero quantity (0 contracted seats) persists exact 0 (never nil, never 1)
+    t_zero = DateTime.add(t_valid, 100, :second)
+    zero_obj = Map.put(custom_valid, "quantity", 0)
+
+    assert {:ok, synced_zero} =
+             WebhookSync.sync_event(
+               sub_event("evt_cust_zero", "customer.subscription.updated", t_zero, zero_obj),
+               @sync_opts
+             )
+
+    assert synced_zero.quantity === 0
+
+    # F) Legacy custom provider without update_quantity/3 continues falling back to swap_plan/3
     assert {:ok, _} =
              AshBilling.update_quantity("sub_legacy_fallback", 12,
                provider: LegacyFallbackProvider,
@@ -846,6 +874,206 @@ defmodule AshBilling.QuantitySyncTest do
     assert_received {:legacy_swap_plan, "sub_legacy_fallback", "price_legacy", swap_opts}
     assert Keyword.get(swap_opts, :quantity) == 12
     assert Keyword.get(swap_opts, :subscription_item_id) == "si_legacy_1"
+  end
+
+  test "11b. regression: fail-closed malformed quantity and zero-seat semantics preserve valid quantity both pre- and post-reconciliation",
+       %{t1: t1} do
+    # Create single-item Stripe subscription with valid quantity=10
+    obj_10 =
+      stripe_sub_object("sub_qty_guard", "cus_qty_1", "price_pro", 10, item_id: "si_qty_guard")
+
+    assert {:ok, created} =
+             WebhookSync.sync_event(
+               sub_event("evt_guard_init", "customer.subscription.created", t1, obj_10),
+               @sync_opts
+             )
+
+    assert created.quantity == 10
+
+    # 1) Pre-reconciliation: malformed Stripe item quantity fails closed via Plug (HTTP 500)
+    #    and preserves quantity=10 without marking event processed.
+    secret = "whsec_qty_malformed"
+    t2 = DateTime.add(t1, 30, :second)
+
+    malformed_item_obj =
+      stripe_sub_object("sub_qty_guard", "cus_qty_1", "price_pro", "10", item_id: "si_qty_guard")
+
+    malformed_payload =
+      Jason.encode!(
+        sub_event("evt_guard_bad_plug", "customer.subscription.updated", t2, malformed_item_obj)
+      )
+
+    plug_opts =
+      AshBilling.Plug.init(
+        webhook_secret: secret,
+        expected_livemode: false,
+        customer_resource: PostgresCustomer,
+        subscription_resource: PostgresSubscription,
+        deduplication_resource: PostgresWebhookEvent,
+        domain: PostgresDomain
+      )
+
+    conn =
+      conn(:post, "/webhooks/stripe", malformed_payload)
+      |> put_req_header("stripe-signature", sign_webhook(malformed_payload, secret))
+      |> AshBilling.Plug.call(plug_opts)
+
+    assert conn.status == 500
+    assert Ash.get!(PostgresSubscription, created.id, @opts).quantity == 10
+    assert Ash.get!(PostgresWebhookEvent, "evt_guard_bad_plug", @opts).status == :failed
+
+    # 2) Reconcile subscription so last_reconciled_at is set
+    assert {:ok, reconciled} =
+             AshBilling.reconcile_subscription(created,
+               provider: CountingProvider,
+               live_response: obj_10,
+               domain: PostgresDomain,
+               authorize?: false
+             )
+
+    checkpoint_1 = reconciled.last_reconciled_at
+    assert %DateTime{} = checkpoint_1
+    assert reconciled.quantity == 10
+
+    # 3) Post-reconciliation: malformed webhook quantities (-5, "10", 2.5) fail closed BEFORE
+    #    calling Stripe and preserve quantity=10, last_event_created_at, and last_reconciled_at.
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    for {bad_qty, idx} <- Enum.with_index([-5, "10", 2.5], 1) do
+      ts = DateTime.add(checkpoint_1, 120 + idx, :second)
+
+      bad_obj =
+        stripe_sub_object("sub_qty_guard", "cus_qty_1", "price_pro", bad_qty,
+          item_id: "si_qty_guard"
+        )
+
+      assert {:error, :invalid_quantity} =
+               WebhookSync.sync_event(
+                 sub_event(
+                   "evt_guard_post_bad_#{idx}",
+                   "customer.subscription.updated",
+                   ts,
+                   bad_obj
+                 ),
+                 @sync_opts ++
+                   [provider: CountingProvider, counter: counter, live_response: obj_10]
+               )
+    end
+
+    assert Agent.get(counter, & &1) == 0
+    after_bad_post = Ash.get!(PostgresSubscription, created.id, @opts)
+    assert after_bad_post.quantity == 10
+    assert DateTime.compare(after_bad_post.last_reconciled_at, checkpoint_1) == :eq
+
+    # 4) Post-reconciliation: malformed quantity returned by LIVE provider GET also fails closed
+    t_live_bad = DateTime.add(checkpoint_1, 150, :second)
+
+    valid_incoming_20 =
+      stripe_sub_object("sub_qty_guard", "cus_qty_1", "price_pro", 20, item_id: "si_qty_guard")
+
+    malformed_live_obj =
+      stripe_sub_object("sub_qty_guard", "cus_qty_1", "price_pro", -3, item_id: "si_qty_guard")
+
+    assert {:error, :invalid_quantity} =
+             WebhookSync.sync_event(
+               sub_event(
+                 "evt_guard_live_bad",
+                 "customer.subscription.updated",
+                 t_live_bad,
+                 valid_incoming_20
+               ),
+               @sync_opts ++
+                 [provider: CountingProvider, counter: counter, live_response: malformed_live_obj]
+             )
+
+    assert Agent.get(counter, & &1) == 1
+    assert Ash.get!(PostgresSubscription, created.id, @opts).quantity == 10
+
+    # 5) Direct reconcile_subscription/2 with malformed live quantity also fails closed
+    assert {:error, :invalid_quantity} =
+             AshBilling.reconcile_subscription(after_bad_post,
+               provider: CountingProvider,
+               live_response: malformed_live_obj,
+               domain: PostgresDomain,
+               authorize?: false
+             )
+
+    assert Ash.get!(PostgresSubscription, created.id, @opts).quantity == 10
+
+    # 6) Post-reconciliation legitimate quantity=0:
+    #    - Stale 0 webhook when Stripe still has 10 -> re-verifies and preserves 10
+    t_zero_stale = DateTime.add(checkpoint_1, 180, :second)
+
+    obj_0 =
+      stripe_sub_object("sub_qty_guard", "cus_qty_1", "price_pro", 0, item_id: "si_qty_guard")
+
+    assert {:ok, preserved_10} =
+             WebhookSync.sync_event(
+               sub_event(
+                 "evt_guard_zero_stale",
+                 "customer.subscription.updated",
+                 t_zero_stale,
+                 obj_0
+               ),
+               @sync_opts ++ [provider: CountingProvider, counter: counter, live_response: obj_10]
+             )
+
+    assert preserved_10.quantity == 10
+
+    #    - Legitimate 0 webhook confirmed by live Stripe -> persists exact 0 (never nil, never 1)
+    t_zero_live = DateTime.add(checkpoint_1, 210, :second)
+
+    assert {:ok, confirmed_0} =
+             WebhookSync.sync_event(
+               sub_event(
+                 "evt_guard_zero_live",
+                 "customer.subscription.updated",
+                 t_zero_live,
+                 obj_0
+               ),
+               @sync_opts ++ [provider: CountingProvider, counter: counter, live_response: obj_0]
+             )
+
+    assert confirmed_0.quantity === 0
+
+    #    - Delayed stale 10 webhook while live Stripe is 0 -> preserves exact 0
+    t_stale_10 = DateTime.add(checkpoint_1, 240, :second)
+
+    assert {:ok, preserved_0} =
+             WebhookSync.sync_event(
+               sub_event(
+                 "evt_guard_stale_10",
+                 "customer.subscription.updated",
+                 t_stale_10,
+                 obj_10
+               ),
+               @sync_opts ++ [provider: CountingProvider, counter: counter, live_response: obj_0]
+             )
+
+    assert preserved_0.quantity === 0
+
+    #    - Transitioning to legitimately nil/metered plan confirmed by live Stripe -> clears cleanly
+    t_metered_live = DateTime.add(checkpoint_1, 270, :second)
+
+    obj_metered =
+      stripe_sub_object("sub_qty_guard", "cus_qty_1", "price_metered", :omit,
+        item_id: "si_qty_guard"
+      )
+
+    assert {:ok, confirmed_metered} =
+             WebhookSync.sync_event(
+               sub_event(
+                 "evt_guard_metered",
+                 "customer.subscription.updated",
+                 t_metered_live,
+                 obj_metered
+               ),
+               @sync_opts ++
+                 [provider: CountingProvider, counter: counter, live_response: obj_metered]
+             )
+
+    assert confirmed_metered.price_id == "price_metered"
+    assert is_nil(confirmed_metered.quantity)
   end
 
   test "12. rejects multi-item non-terminal subscriptions, clears fields on terminal multi-item, and prevents canceled reactivation via quantity webhook",

@@ -127,7 +127,6 @@ defmodule AshBilling.WebhookSync do
       stripe_cust_id = extract_customer_id(Map.take(object, ["customer"]))
       status = normalize_status(object["status"])
       price_id = if multiple_subscription_items?(object), do: nil, else: extract_price_id(object)
-      quantity = if multiple_subscription_items?(object), do: nil, else: extract_quantity(object)
 
       provider_subscription_item_id =
         if multiple_subscription_items?(object),
@@ -160,6 +159,7 @@ defmodule AshBilling.WebhookSync do
       reconciled_at = Keyword.get(opts, :reconciled_at)
 
       with :ok <- validate_subscription_items(object),
+           {:ok, quantity} <- extract_quantity(object),
            {:ok, customer} <- find_customer(customer_resource, stripe_cust_id, object, ash_opts),
            {:ok, existing} <-
              fetch_existing_subscription(subscription_resource, sub_id, ash_opts),
@@ -521,16 +521,12 @@ defmodule AshBilling.WebhookSync do
 
     case provider.get_subscription(sub_id, opts) do
       {:ok, live_sub} when is_map(live_sub) ->
-        if validate_subscription_items(live_sub) != :ok do
-          {:error, :unsupported_subscription_items}
-        else
+        with :ok <- validate_subscription_items(live_sub),
+             {:ok, live_quantity} <- extract_quantity(live_sub) do
           live_status = normalize_status(live_sub["status"])
 
           live_price_id =
             if multiple_subscription_items?(live_sub), do: nil, else: extract_price_id(live_sub)
-
-          live_quantity =
-            if multiple_subscription_items?(live_sub), do: nil, else: extract_quantity(live_sub)
 
           live_subscription_item_id =
             if multiple_subscription_items?(live_sub),
@@ -1183,20 +1179,51 @@ defmodule AshBilling.WebhookSync do
   defp extract_price_id(%{"price" => id}) when is_binary(id), do: id
   defp extract_price_id(_), do: nil
 
-  defp extract_quantity(%{"items" => %{"data" => [item]}} = object) when is_map(item) do
-    if Map.has_key?(item, "quantity") do
-      parse_positive_integer(item["quantity"])
+  # Quantity extraction semantics (fail-closed on malformed data):
+  # 1. Legitimately absent or `nil` (metered/usage-based or custom provider without quantity) -> `{:ok, nil}`
+  # 2. Legitimately `0` (e.g. zero-seat licensed subscription) -> `{:ok, 0}` (never fabricates seats or clears to nil)
+  # 3. Positive integer -> `{:ok, n}`
+  # 4. Present with invalid type or negative value (e.g. -5, "10", 2.5, true, map) -> `{:error, :invalid_quantity}`
+  # Terminal multi-item payloads return `{:ok, nil}` so cancellation still revokes access cleanly.
+  defp extract_quantity(object) do
+    if multiple_subscription_items?(object) do
+      {:ok, nil}
     else
-      parse_positive_integer(object["quantity"])
+      do_extract_quantity(object)
     end
   end
 
-  defp extract_quantity(%{"items" => _}), do: nil
-  defp extract_quantity(%{"quantity" => quantity}), do: parse_positive_integer(quantity)
-  defp extract_quantity(_), do: nil
+  defp do_extract_quantity(%{"items" => %{"data" => [item]}} = object) when is_map(item) do
+    cond do
+      Map.has_key?(item, "quantity") ->
+        parse_synced_quantity(item["quantity"])
 
-  defp parse_positive_integer(quantity) when is_integer(quantity) and quantity > 0, do: quantity
-  defp parse_positive_integer(_), do: nil
+      Map.has_key?(object, "quantity") ->
+        parse_synced_quantity(object["quantity"])
+
+      true ->
+        {:ok, nil}
+    end
+  end
+
+  defp do_extract_quantity(%{"items" => %{"data" => []}} = object) do
+    if Map.has_key?(object, "quantity") do
+      parse_synced_quantity(object["quantity"])
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp do_extract_quantity(%{"items" => _}), do: {:ok, nil}
+  defp do_extract_quantity(%{"quantity" => quantity}), do: parse_synced_quantity(quantity)
+  defp do_extract_quantity(_), do: {:ok, nil}
+
+  defp parse_synced_quantity(nil), do: {:ok, nil}
+
+  defp parse_synced_quantity(quantity) when is_integer(quantity) and quantity >= 0,
+    do: {:ok, quantity}
+
+  defp parse_synced_quantity(_), do: {:error, :invalid_quantity}
 
   defp extract_subscription_item_id(%{"items" => %{"data" => [%{"id" => id}]}})
        when is_binary(id) do

@@ -8,8 +8,8 @@ defmodule AshBillingConsumer.Repo.Migrations.AddQuantityAndItemId do
     end
 
     create(
-      constraint(:subscriptions, :subscriptions_quantity_positive,
-        check: "quantity IS NULL OR quantity >= 1"
+      constraint(:subscriptions, :subscriptions_quantity_non_negative,
+        check: "quantity IS NULL OR quantity >= 0"
       )
     )
   end

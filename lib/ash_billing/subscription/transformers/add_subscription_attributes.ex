@@ -37,7 +37,7 @@ defmodule AshBilling.Subscription.Transformers.AddSubscriptionAttributes do
          public?: true
        ]},
       {:price_id, Ash.Type.String, [allow_nil?: true, public?: true]},
-      {:quantity, Ash.Type.Integer, [constraints: [min: 1], allow_nil?: true, public?: true]},
+      {:quantity, Ash.Type.Integer, [constraints: [min: 0], allow_nil?: true, public?: true]},
       {:provider_subscription_item_id, Ash.Type.String, [allow_nil?: true, public?: true]},
       {:current_period_end, Ash.Type.UtcDatetimeUsec, [allow_nil?: true, public?: true]},
       {:cancel_at_period_end, Ash.Type.Boolean, [default: false, public?: true]},
