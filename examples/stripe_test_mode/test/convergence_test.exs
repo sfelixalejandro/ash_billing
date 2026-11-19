@@ -20,6 +20,7 @@ defmodule AshBillingConsumer.ConvergenceTest do
           provider_subscription_id: object["id"],
           status: if(object["status"] == "canceled", do: :canceled, else: :active),
           price_id: "price_fixture",
+          quantity: hd(object["items"]["data"])["quantity"],
           cancel_at_period_end: object["cancel_at_period_end"]
         }
       ],
@@ -55,6 +56,12 @@ defmodule AshBillingConsumer.ConvergenceTest do
   test "a processed event does not conceal stale PostgreSQL price" do
     object = remote()
     stale = put_in(snapshot(object), [:subscriptions, Access.at(0), :price_id], "price_old")
+    assert {:error, :subscription_not_converged} = wait(object, stale)
+  end
+
+  test "a processed event does not conceal stale PostgreSQL quantity" do
+    object = remote()
+    stale = put_in(snapshot(object), [:subscriptions, Access.at(0), :quantity], 99)
     assert {:error, :subscription_not_converged} = wait(object, stale)
   end
 

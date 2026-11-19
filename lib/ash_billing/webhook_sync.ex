@@ -127,6 +127,13 @@ defmodule AshBilling.WebhookSync do
       stripe_cust_id = extract_customer_id(Map.take(object, ["customer"]))
       status = normalize_status(object["status"])
       price_id = if multiple_subscription_items?(object), do: nil, else: extract_price_id(object)
+      quantity = if multiple_subscription_items?(object), do: nil, else: extract_quantity(object)
+
+      provider_subscription_item_id =
+        if multiple_subscription_items?(object),
+          do: nil,
+          else: extract_subscription_item_id(object)
+
       current_period_end = extract_current_period_end(object)
       trial_ends_at = extract_trial_ends_at(object)
       cancel_at_period_end = Map.get(object, "cancel_at_period_end", false)
@@ -165,6 +172,21 @@ defmodule AshBilling.WebhookSync do
             current_period_end: current_period_end,
             cancel_at_period_end: cancel_at_period_end
           }
+          |> then(fn a ->
+            if Ash.Resource.Info.attribute(subscription_resource, :quantity) != nil do
+              Map.put(a, :quantity, quantity)
+            else
+              a
+            end
+          end)
+          |> then(fn a ->
+            if Ash.Resource.Info.attribute(subscription_resource, :provider_subscription_item_id) !=
+                 nil do
+              Map.put(a, :provider_subscription_item_id, provider_subscription_item_id)
+            else
+              a
+            end
+          end)
           |> then(fn a ->
             if Ash.Resource.Info.attribute(subscription_resource, :cancel_at) != nil do
               Map.put(a, :cancel_at, cancel_at)
@@ -507,6 +529,14 @@ defmodule AshBilling.WebhookSync do
           live_price_id =
             if multiple_subscription_items?(live_sub), do: nil, else: extract_price_id(live_sub)
 
+          live_quantity =
+            if multiple_subscription_items?(live_sub), do: nil, else: extract_quantity(live_sub)
+
+          live_subscription_item_id =
+            if multiple_subscription_items?(live_sub),
+              do: nil,
+              else: extract_subscription_item_id(live_sub)
+
           live_current_period_end = extract_current_period_end(live_sub)
           live_trial_ends_at = extract_trial_ends_at(live_sub)
           live_cancel_at_period_end = Map.get(live_sub, "cancel_at_period_end", false)
@@ -537,6 +567,23 @@ defmodule AshBilling.WebhookSync do
               |> Map.put(:price_id, live_price_id)
               |> Map.put(:current_period_end, live_current_period_end)
               |> Map.put(:cancel_at_period_end, live_cancel_at_period_end)
+              |> then(fn a ->
+                if Ash.Resource.Info.attribute(subscription_resource, :quantity) != nil do
+                  Map.put(a, :quantity, live_quantity)
+                else
+                  a
+                end
+              end)
+              |> then(fn a ->
+                if Ash.Resource.Info.attribute(
+                     subscription_resource,
+                     :provider_subscription_item_id
+                   ) != nil do
+                  Map.put(a, :provider_subscription_item_id, live_subscription_item_id)
+                else
+                  a
+                end
+              end)
               |> then(fn a ->
                 if Ash.Resource.Info.attribute(subscription_resource, :cancel_at) != nil do
                   Map.put(a, :cancel_at, live_cancel_at)
@@ -646,6 +693,8 @@ defmodule AshBilling.WebhookSync do
             [
               :status,
               :price_id,
+              :quantity,
+              :provider_subscription_item_id,
               :trial_ends_at,
               :current_period_end,
               :cancel_at_period_end,
@@ -971,6 +1020,8 @@ defmodule AshBilling.WebhookSync do
   @financial_sync_fields [
     :status,
     :price_id,
+    :quantity,
+    :provider_subscription_item_id,
     :trial_ends_at,
     :current_period_end,
     :cancel_at_period_end,
@@ -1131,6 +1182,36 @@ defmodule AshBilling.WebhookSync do
   defp extract_price_id(%{"price" => %{"id" => id}}) when is_binary(id), do: id
   defp extract_price_id(%{"price" => id}) when is_binary(id), do: id
   defp extract_price_id(_), do: nil
+
+  defp extract_quantity(%{"items" => %{"data" => [item]}} = object) when is_map(item) do
+    if Map.has_key?(item, "quantity") do
+      parse_positive_integer(item["quantity"])
+    else
+      parse_positive_integer(object["quantity"])
+    end
+  end
+
+  defp extract_quantity(%{"items" => _}), do: nil
+  defp extract_quantity(%{"quantity" => quantity}), do: parse_positive_integer(quantity)
+  defp extract_quantity(_), do: nil
+
+  defp parse_positive_integer(quantity) when is_integer(quantity) and quantity > 0, do: quantity
+  defp parse_positive_integer(_), do: nil
+
+  defp extract_subscription_item_id(%{"items" => %{"data" => [%{"id" => id}]}})
+       when is_binary(id) do
+    trimmed = String.trim(id)
+    if trimmed != "", do: trimmed, else: nil
+  end
+
+  defp extract_subscription_item_id(%{"items" => _}), do: nil
+
+  defp extract_subscription_item_id(%{"subscription_item_id" => id}) when is_binary(id) do
+    trimmed = String.trim(id)
+    if trimmed != "", do: trimmed, else: nil
+  end
+
+  defp extract_subscription_item_id(_), do: nil
 
   defp parse_unix_timestamp(ts) when is_integer(ts) do
     case DateTime.from_unix(ts, :second) do

@@ -58,6 +58,7 @@ defmodule AshBillingConsumer.Convergence do
     not is_nil(local) and
       to_string(local.status) == expected.status and
       local.price_id == expected.price and
+      local.quantity == expected.quantity and
       local.cancel_at_period_end === expected.cancel_at_period_end and
       snapshot.canceling === expected_canceling and
       snapshot.authorization == authorization and
