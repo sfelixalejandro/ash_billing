@@ -150,6 +150,8 @@ defmodule AshBilling.WebhookSync do
 
       ash_opts = ash_options(domain, opts)
 
+      reconciled_at = Keyword.get(opts, :reconciled_at)
+
       with :ok <- validate_subscription_items(object),
            {:ok, customer} <- find_customer(customer_resource, stripe_cust_id, object, ash_opts),
            {:ok, existing} <-
@@ -178,9 +180,31 @@ defmodule AshBilling.WebhookSync do
             end
           end)
           |> then(fn a ->
-            if Ash.Resource.Info.attribute(subscription_resource, :last_event_created_at) != nil and
-                 not is_nil(event_dt) do
-              Map.put(a, :last_event_created_at, event_dt)
+            if Ash.Resource.Info.attribute(subscription_resource, :last_event_created_at) != nil do
+              cond do
+                not is_nil(event_dt) ->
+                  Map.put(a, :last_event_created_at, event_dt)
+
+                should_reset_event_cursor?(existing, reconciled_at, opts) ->
+                  require Logger
+
+                  Logger.warning(
+                    "AshBilling.WebhookSync: Clearing last_event_created_at (#{inspect(Map.get(existing, :last_event_created_at))}) during reconciliation for subscription #{inspect(sub_id)} at checkpoint #{inspect(reconciled_at)}."
+                  )
+
+                  Map.put(a, :last_event_created_at, nil)
+
+                true ->
+                  a
+              end
+            else
+              a
+            end
+          end)
+          |> then(fn a ->
+            if Ash.Resource.Info.attribute(subscription_resource, :last_reconciled_at) != nil and
+                 match?(%DateTime{}, reconciled_at) do
+              Map.put(a, :last_reconciled_at, max_reconciled_datetime(existing, reconciled_at))
             else
               a
             end
@@ -214,6 +238,38 @@ defmodule AshBilling.WebhookSync do
             )
 
             {:ok, existing}
+
+          # Post-reconciliation financial verification & no-op fast path:
+          # When a subscription has a durable last_reconciled_at checkpoint:
+          # - If the incoming webhook changes NO critical financial attributes, skip provider
+          #   re-verification (no-op if event timestamp is also unchanged, or update timestamp cleanly).
+          # - If ANY critical financial attribute differs (whether inside or outside
+          #   reconciliation_skew_seconds, and whether non-terminal or terminal), re-verify live
+          #   provider state under the row lock before applying so stale payloads cannot overwrite.
+          existing && has_reconciled_checkpoint?(existing) && not is_nil(event_dt) &&
+              not critical_financial_diff?(existing, attrs) ->
+            if same_value?(Map.get(existing, :last_event_created_at), event_dt) do
+              {:ok, existing}
+            else
+              update_subscription_safely(
+                subscription_resource,
+                existing,
+                attrs,
+                event_dt,
+                ash_opts
+              )
+            end
+
+          existing && has_reconciled_checkpoint?(existing) && not is_nil(event_dt) ->
+            reconcile_subscription_with_provider(
+              subscription_resource,
+              existing,
+              sub_id,
+              attrs,
+              event_dt,
+              opts,
+              ash_opts
+            )
 
           # A terminal notification must not be replaced by a same-second live snapshot.
           existing && terminal_status?(status) ->
@@ -462,34 +518,55 @@ defmodule AshBilling.WebhookSync do
             "AshBilling.WebhookSync: Reconciled subscription #{inspect(sub_id)} with provider. Authoritative live status: #{inspect(live_status)}"
           )
 
-          reconciled_attrs =
-            attrs
-            |> Map.put(:status, live_status)
-            |> Map.put(:price_id, live_price_id)
-            |> Map.put(:current_period_end, live_current_period_end)
-            |> Map.put(:cancel_at_period_end, live_cancel_at_period_end)
-            |> then(fn a ->
-              if Ash.Resource.Info.attribute(subscription_resource, :cancel_at) != nil do
-                Map.put(a, :cancel_at, live_cancel_at)
-              else
-                a
-              end
-            end)
-            |> then(fn a ->
-              if Ash.Resource.Info.attribute(subscription_resource, :trial_ends_at) != nil do
-                Map.put(a, :trial_ends_at, live_trial_ends_at)
-              else
-                a
-              end
-            end)
+          has_reconciled_at? =
+            Ash.Resource.Info.attribute(subscription_resource, :last_reconciled_at) != nil
 
-          update_subscription_safely(
-            subscription_resource,
-            existing,
-            reconciled_attrs,
-            event_dt,
-            ash_opts
-          )
+          checkpoint_result =
+            if has_reconciled_at? and
+                 (match?(%DateTime{}, Map.get(existing, :last_reconciled_at)) or
+                    match?(%DateTime{}, Keyword.get(opts, :reconciled_at))) do
+              fetch_reconciliation_checkpoint(subscription_resource, existing, opts)
+            else
+              {:ok, nil}
+            end
+
+          with {:ok, checkpoint_dt} <- checkpoint_result do
+            reconciled_attrs =
+              attrs
+              |> Map.put(:status, live_status)
+              |> Map.put(:price_id, live_price_id)
+              |> Map.put(:current_period_end, live_current_period_end)
+              |> Map.put(:cancel_at_period_end, live_cancel_at_period_end)
+              |> then(fn a ->
+                if Ash.Resource.Info.attribute(subscription_resource, :cancel_at) != nil do
+                  Map.put(a, :cancel_at, live_cancel_at)
+                else
+                  a
+                end
+              end)
+              |> then(fn a ->
+                if Ash.Resource.Info.attribute(subscription_resource, :trial_ends_at) != nil do
+                  Map.put(a, :trial_ends_at, live_trial_ends_at)
+                else
+                  a
+                end
+              end)
+              |> then(fn a ->
+                if match?(%DateTime{}, checkpoint_dt) do
+                  Map.put(a, :last_reconciled_at, checkpoint_dt)
+                else
+                  a
+                end
+              end)
+
+            update_subscription_safely(
+              subscription_resource,
+              existing,
+              reconciled_attrs,
+              event_dt,
+              ash_opts
+            )
+          end
         end
 
       {:error, reconcile_reason} ->
@@ -525,6 +602,9 @@ defmodule AshBilling.WebhookSync do
     has_timestamp? =
       Ash.Resource.Info.attribute(subscription_resource, :last_event_created_at) != nil
 
+    has_reconciled_at? =
+      Ash.Resource.Info.attribute(subscription_resource, :last_reconciled_at) != nil
+
     update_action = primary_update_action(subscription_resource)
 
     if update_action do
@@ -547,6 +627,18 @@ defmodule AshBilling.WebhookSync do
         end
 
       query =
+        case {has_reconciled_at?, Map.get(attrs, :last_reconciled_at)} do
+          {true, %DateTime{} = reconciled_dt} ->
+            Ash.Query.filter(
+              query,
+              is_nil(last_reconciled_at) or last_reconciled_at <= ^reconciled_dt
+            )
+
+          _ ->
+            query
+        end
+
+      query =
         if terminal_status?(attrs[:status]) do
           query
         else
@@ -558,7 +650,8 @@ defmodule AshBilling.WebhookSync do
               :current_period_end,
               :cancel_at_period_end,
               :cancel_at,
-              :last_event_created_at
+              :last_event_created_at,
+              :last_reconciled_at
             ],
             query,
             fn field, query ->
@@ -875,6 +968,93 @@ defmodule AshBilling.WebhookSync do
     end
   end
 
+  @financial_sync_fields [
+    :status,
+    :price_id,
+    :trial_ends_at,
+    :current_period_end,
+    :cancel_at_period_end,
+    :cancel_at
+  ]
+
+  defp has_reconciled_checkpoint?(existing) do
+    match?(%DateTime{}, Map.get(existing, :last_reconciled_at))
+  end
+
+  defp should_reset_event_cursor?(nil, _reconciled_at, _opts), do: false
+
+  defp should_reset_event_cursor?(existing, %DateTime{} = reconciled_at, opts) do
+    case Map.get(existing, :last_event_created_at) do
+      %DateTime{} = existing_event_dt ->
+        Keyword.get(opts, :reset_event_cursor?, false) == true or
+          DateTime.compare(existing_event_dt, reconciled_at) == :gt
+
+      _ ->
+        false
+    end
+  end
+
+  defp should_reset_event_cursor?(_existing, _reconciled_at, _opts), do: false
+
+  defp critical_financial_diff?(existing, attrs) do
+    Enum.any?(@financial_sync_fields, fn field ->
+      Map.has_key?(existing, field) and Map.has_key?(attrs, field) and
+        not same_value?(Map.get(existing, field), Map.get(attrs, field))
+    end)
+  end
+
+  @doc false
+  def fetch_reconciliation_checkpoint(subscription_resource, existing \\ nil, opts \\ []) do
+    case Keyword.get(opts, :reconciliation_checkpoint) do
+      %DateTime{} = override_dt ->
+        {:ok, max_reconciled_datetime(existing, override_dt)}
+
+      _ ->
+        with {:ok, clock_dt} <- fetch_shared_clock_timestamp(subscription_resource) do
+          {:ok, max_reconciled_datetime(existing, clock_dt)}
+        end
+    end
+  end
+
+  defp fetch_shared_clock_timestamp(subscription_resource) do
+    if Code.ensure_loaded?(AshPostgres.DataLayer) and
+         Ash.DataLayer.data_layer(subscription_resource) == AshPostgres.DataLayer do
+      repo = apply(AshPostgres.DataLayer.Info, :repo, [subscription_resource, :mutate])
+
+      case apply(repo, :query, ["SELECT timezone('UTC', clock_timestamp())", []]) do
+        {:ok, %{rows: [[%NaiveDateTime{} = ndt]]}} ->
+          {:ok, DateTime.from_naive!(ndt, "Etc/UTC")}
+
+        {:ok, %{rows: [[%DateTime{} = dt]]}} ->
+          {:ok, dt}
+
+        {:ok, unexpected} ->
+          {:error, {:invalid_clock_timestamp, unexpected}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:ok, DateTime.utc_now()}
+    end
+  catch
+    :error, %{__struct__: module} = error
+    when module in [Postgrex.Error, DBConnection.ConnectionError] ->
+      {:error, error}
+  end
+
+  defp max_reconciled_datetime(existing, candidate_dt) do
+    case existing && Map.get(existing, :last_reconciled_at) do
+      %DateTime{} = existing_dt ->
+        if DateTime.compare(existing_dt, candidate_dt) == :gt,
+          do: existing_dt,
+          else: candidate_dt
+
+      _ ->
+        candidate_dt
+    end
+  end
+
   defp conflicting_status_transition?(current_status, new_status) do
     current_status in [:past_due, "past_due", :unpaid, "unpaid"] and
       new_status in [:active, "active", :trialing, "trialing"]
@@ -884,20 +1064,7 @@ defmodule AshBilling.WebhookSync do
     case {Map.get(existing, :last_event_created_at), incoming_dt} do
       {%DateTime{} = recorded_dt, %DateTime{} = inc_dt} ->
         DateTime.compare(recorded_dt, inc_dt) == :eq and
-          Enum.any?(
-            [
-              :status,
-              :price_id,
-              :trial_ends_at,
-              :current_period_end,
-              :cancel_at_period_end,
-              :cancel_at
-            ],
-            fn field ->
-              Map.has_key?(existing, field) and Map.has_key?(attrs, field) and
-                not same_value?(Map.get(existing, field), Map.get(attrs, field))
-            end
-          )
+          critical_financial_diff?(existing, attrs)
 
       _ ->
         false

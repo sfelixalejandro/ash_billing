@@ -8,11 +8,11 @@ The `AshBilling` project takes the security of financial transactions, customer 
 
 Only the latest minor/patch releases receive security updates.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.5.x   | Yes                |
-| 0.4.x   | Security fixes only|
-| < 0.4.0 | No                 |
+| Version | Supported           |
+| ------- | ------------------- |
+| 0.6.x   | Yes                 |
+| 0.5.x   | Security fixes only |
+| < 0.5.0 | No                  |
 
 ---
 

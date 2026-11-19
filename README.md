@@ -68,11 +68,12 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 
 ## Installation
 
-Version **0.5.3** (part of the 0.5.x release line) includes production hardening,
-subscription quantity isolation, URL sanitization, reconciliation locking fixes,
-and webhook consistency improvements.
-Read [Upgrading to 0.5](documentation/topics/upgrading-to-0.5.md) before updating
-from 0.4.x. For older upgrades, also see
+Version **0.6.0** adds durable PostgreSQL reconciliation checkpoints (`last_reconciled_at`),
+fail-safe live provider re-verification for post-reconciliation financial changes, and
+automatic healing of ahead `0.5.x` synthetic event cursors.
+Read [Upgrading to 0.6](documentation/topics/upgrading-to-0.6.md) before updating from `0.5.x`
+(requires adding the nullable `last_reconciled_at` column). For earlier upgrades, see
+[Upgrading to 0.5](documentation/topics/upgrading-to-0.5.md) and
 [Upgrading to 0.4](documentation/topics/upgrading-to-0.4.md).
 
 `ash_billing` is available on [Hex.pm](https://hex.pm/packages/ash_billing).
@@ -90,7 +91,7 @@ Alternatively, you can install it manually by adding `ash_billing` to your `mix.
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.5.3"}
+    {:ash_billing, "~> 0.6.0"}
   ]
 end
 ```
@@ -233,7 +234,9 @@ AshBilling.subscribed?(user, "price_pro_monthly")
 ```
 
 > [!NOTE]
-> **Provider Quantity Isolation**: `AshBilling.Providers.Stripe` guarantees price isolation by sending only the subscription item ID and updated quantity, omitting the price from the payload. For custom providers lacking `@callback update_quantity/3`, `AshBilling` falls back to `swap_plan/3`. If a caller supplies a stale `:price_id` to a legacy fallback provider, `swap_plan/3` will execute with that stale price. To guarantee price safety, custom providers must implement `update_quantity/3`.
+> **Provider Quantity Isolation & Persistence Scope**: `AshBilling.Providers.Stripe` guarantees price isolation by sending only the subscription item ID and updated quantity, omitting the price from the payload. For custom providers lacking `@callback update_quantity/3`, `AshBilling` falls back to `swap_plan/3`. If a caller supplies a stale `:price_id` to a legacy fallback provider, `swap_plan/3` will execute with that stale price. To guarantee price safety, custom providers must implement `update_quantity/3`.
+>
+> **Important:** Subscription `quantity` can be modified remotely through the Stripe API (`update_quantity/3`, `swap_plan/3`, and `create_checkout_session/2`), **but `quantity` is not yet part of the synchronized attributes stored in PostgreSQL on `AshBilling.Subscription`** (`status`, `price_id`, `current_period_end`, `trial_ends_at`, `cancel_at_period_end`, `cancel_at`, `last_event_created_at`, `last_reconciled_at`). Applications requiring local seat-count persistence must track it in their own webhook handler or read it from Stripe.
 
 ### Resume a Canceled Subscription
 ```elixir

@@ -67,10 +67,16 @@ curl http://127.0.0.1:4089/state
 curl -X POST http://127.0.0.1:4089/control/swap_twenty
 curl -X POST http://127.0.0.1:4089/control/quantity_ten
 curl -X POST http://127.0.0.1:4089/control/swap_ten
+curl -X POST http://127.0.0.1:4089/control/missed_webhook_reconcile
+curl -X POST http://127.0.0.1:4089/control/delayed_old_event_after_reconcile
 curl -X POST http://127.0.0.1:4089/control/schedule_cancel
 curl -X POST http://127.0.0.1:4089/control/resume
 curl -X POST http://127.0.0.1:4089/control/cancel_now
 ```
+
+For automated headless Test Mode runs where interactive browser completion of `checkout.stripe.com` is not available, `POST /control/api_subscribe` attaches Stripe's official test payment method (`pm_card_visa`) to the test Customer created by `/control/setup` and creates an active test Subscription so live signed webhooks flow through `stripe listen` (Checkout Session creation is still verified in `/control/setup`, while interactive browser Checkout completion remains a separate manual browser step).
+
+`missed_webhook_reconcile` temporarily rejects incoming webhooks at the local ingress (HTTP 503), swaps the subscription plan directly on Stripe Test Mode, confirms PostgreSQL remains stale, and executes `AshBilling.reconcile_subscription/2` against live Stripe to persist both the authoritative plan and `last_reconciled_at` without fabricating `last_event_created_at`. `delayed_old_event_after_reconcile` then locally re-signs a captured earlier real Stripe subscription payload carrying the stale price with a fresh `event_id` and verifies that `WebhookSync` re-queries live Stripe Test Mode and preserves the reconciled plan.
 
 Run these sequentially. Each mutation reads the subscription back from Stripe and
 waits up to 15 seconds for a processed webhook snapshot, matching PostgreSQL state

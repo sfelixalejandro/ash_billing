@@ -371,6 +371,13 @@ defmodule AshBilling do
     * `:actor` - Optional system actor to run actions on behalf of.
     * `:authorize?` - Whether to perform authorization checks. Defaults to `false`.
     * `:provider` - Billing provider module (defaults to configured provider).
+    * `:reset_event_cursor?` - When `true`, clears `last_event_created_at` to `nil` atomically while persisting `last_reconciled_at`. Useful when upgrading from `0.5.x` in environments where both application and PostgreSQL clocks may have been ahead of Stripe. Even when omitted (`false`), any existing `last_event_created_at` strictly greater than PostgreSQL's `clock_timestamp()` is automatically cleared to `nil` so subsequent real webhooks are not dropped.
+    * `:req_opts` - Optional `Req` HTTP client options forwarded to the provider (recommended: bounded timeouts and `retry: false` while inside the PostgreSQL `FOR UPDATE` transaction).
+
+  Note: `AshBilling.Subscription` synchronizes `status`, `price_id`, `current_period_end`,
+  `trial_ends_at`, `cancel_at_period_end`, `cancel_at`, `last_event_created_at`, and
+  `last_reconciled_at`. Item `quantity` can be mutated remotely via Stripe APIs such as
+  `update_quantity/3`, but is not yet a persisted attribute in PostgreSQL.
 
   ## Example
 
@@ -425,29 +432,36 @@ defmodule AshBilling do
             [customer_resource, subscription_resource],
             lock_key,
             fn ->
-              with :ok <-
+              with {:ok, locked_sub} <-
                      lock_customer_then_subscription(
                        customer_resource,
                        subscription_resource,
                        sub_id,
                        opts
                      ),
-                   {:ok, live_sub} <- get_subscription(subscription_or_id, opts) do
+                   {:ok, live_sub} <- get_subscription(subscription_or_id, opts),
+                   {:ok, checkpoint_dt} <-
+                     WebhookSync.fetch_reconciliation_checkpoint(
+                       subscription_resource,
+                       locked_sub,
+                       opts
+                     ) do
                 event_type =
                   if live_sub["status"] in ["canceled", "incomplete_expired"],
                     do: "customer.subscription.deleted",
                     else: "customer.subscription.updated"
 
-                now = System.system_time(:second)
-
                 synthetic_event = %{
                   "id" => "reconcile_#{live_sub["id"]}_#{System.unique_integer([:positive])}",
                   "type" => event_type,
-                  "created" => now,
+                  "created" => nil,
                   "data" => %{"object" => live_sub}
                 }
 
-                WebhookSync.sync_event(synthetic_event, sync_opts)
+                WebhookSync.sync_event(
+                  synthetic_event,
+                  Keyword.put(sync_opts, :reconciled_at, checkpoint_dt)
+                )
               end
             end,
             rollback_on_error?: true
@@ -491,13 +505,13 @@ defmodule AshBilling do
              |> Ash.Query.filter(provider_subscription_id == ^sub_id)
              |> Ash.read_one(ash_opts),
            :ok <- maybe_lock_customer(existing_unlocked, rel_attr, customer_resource, ash_opts),
-           {:ok, _locked_sub} <-
+           {:ok, locked_sub} <-
              subscription_resource
              |> Ash.Query.new()
              |> Ash.Query.filter(provider_subscription_id == ^sub_id)
              |> AshBilling.ResourceLock.query()
              |> Ash.read_one(ash_opts) do
-        :ok
+        {:ok, locked_sub}
       else
         {:error, reason} -> {:error, reason}
       end
@@ -631,6 +645,12 @@ defmodule AshBilling do
     retrieves the active price via `get_subscription/2` before swapping, which carries a theoretical
     race window under concurrent plan modifications. Custom providers must implement
     `@callback update_quantity/3` to achieve the same price isolation and atomicity guarantees as Stripe.
+
+  * **Local Synchronization Scope**: `update_quantity/3` modifies the subscription item's
+    quantity directly in Stripe via the provider API, but `quantity` is **not yet** one of the
+    synchronized attributes persisted in PostgreSQL on `AshBilling.Subscription`. Applications
+    that need local seat/quantity tracking must read the live quantity from Stripe or persist
+    it inside a custom webhook handler.
 
   ## Options
 

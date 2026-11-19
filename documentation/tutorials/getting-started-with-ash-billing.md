@@ -25,7 +25,7 @@ Add `ash_billing` to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.5.3"}
+    {:ash_billing, "~> 0.6.0"}
   ]
 end
 ```
@@ -276,6 +276,12 @@ AshBilling.verify_configuration!(
   webhook_secret: System.get_env("STRIPE_WEBHOOK_SECRET")
 )
 ```
+
+## Upgrading to 0.6.0
+
+See [Upgrading to 0.6](../topics/upgrading-to-0.6.md) for the required PostgreSQL migration
+adding `last_reconciled_at`, recommended rollout order, `0.5.x` cursor healing, `quantity`
+persistence scope, and HTTP/PostgreSQL operational sizing.
 
 ## Version 0.5.0 behavior changes
 

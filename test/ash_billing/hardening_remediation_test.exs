@@ -709,7 +709,7 @@ defmodule AshBilling.HardeningRemediationTest do
       assert created.price_id == "price_enterprise"
     end
 
-    test "preserves v0.5.2 delayed-webhook protection without ETS across price upgrades and cancellations",
+    test "preserves delayed-webhook protection via durable last_reconciled_at across price upgrades and cancellations",
          %{subscription: sub} do
       assert :ets.whereis(:ash_billing_reconciliations) == :undefined
 
@@ -737,12 +737,13 @@ defmodule AshBilling.HardeningRemediationTest do
                )
 
       assert reconciled.price_id == "price_enterprise"
-      assert %DateTime{} = reconciled.last_event_created_at
-      assert DateTime.compare(reconciled.last_event_created_at, t2_delayed) == :gt
+      assert DateTime.compare(reconciled.last_event_created_at, t1) == :eq
+      assert %DateTime{} = reconciled.last_reconciled_at
+      assert DateTime.compare(reconciled.last_reconciled_at, t2_delayed) == :gt
 
-      # A delayed older webhook (t1 < t2_delayed < reconciled.last_event_created_at) must not downgrade state
+      # A delayed older webhook (t1 < t2_delayed <= last_reconciled_at + skew) re-verifies live state and does not downgrade
       delayed_webhook = %{
-        "id" => "evt_delayed_v053",
+        "id" => "evt_delayed_v060",
         "type" => "customer.subscription.updated",
         "created" => DateTime.to_unix(t2_delayed),
         "data" => %{
@@ -755,7 +756,12 @@ defmodule AshBilling.HardeningRemediationTest do
         }
       }
 
-      assert {:ok, after_delayed} = WebhookSync.sync_event(delayed_webhook, @sync_opts)
+      assert {:ok, after_delayed} =
+               WebhookSync.sync_event(
+                 delayed_webhook,
+                 @sync_opts ++ [provider: DriftProvider, mock_response: {:ok, remote_enterprise}]
+               )
+
       assert after_delayed.price_id == "price_enterprise"
 
       # Reconciling a terminal cancellation also blocks delayed non-terminal reactivation webhooks
@@ -777,7 +783,7 @@ defmodule AshBilling.HardeningRemediationTest do
       assert canceled_sub.status == :canceled
 
       delayed_reactivate = %{
-        "id" => "evt_delayed_reactivate_v053",
+        "id" => "evt_delayed_reactivate_v060",
         "type" => "customer.subscription.updated",
         "created" => System.system_time(:second) - 10,
         "data" => %{
@@ -794,7 +800,7 @@ defmodule AshBilling.HardeningRemediationTest do
       assert still_canceled.status == :canceled
       assert still_canceled.price_id == "price_enterprise"
 
-      # A genuinely newer non-terminal subscription webhook after reconciliation still applies normally
+      # A genuinely newer non-terminal subscription webhook beyond the uncertainty window applies directly
       {:ok, active_sub} =
         still_canceled
         |> Ash.Changeset.for_update(
@@ -804,7 +810,7 @@ defmodule AshBilling.HardeningRemediationTest do
         )
         |> Ash.update(@opts)
 
-      future_ts = System.system_time(:second) + 10
+      future_ts = System.system_time(:second) + 120
 
       newer_webhook = %{
         "id" => "evt_newer_v053",
@@ -820,7 +826,16 @@ defmodule AshBilling.HardeningRemediationTest do
         }
       }
 
-      assert {:ok, after_newer} = WebhookSync.sync_event(newer_webhook, @sync_opts)
+      assert {:ok, after_newer} =
+               WebhookSync.sync_event(
+                 newer_webhook,
+                 @sync_opts ++
+                   [
+                     provider: DriftProvider,
+                     mock_response: {:ok, newer_webhook["data"]["object"]}
+                   ]
+               )
+
       assert after_newer.id == active_sub.id
       assert after_newer.price_id == "price_ultimate"
     end
