@@ -428,45 +428,99 @@ defmodule AshBilling do
             end)
 
           lock_key = {customer_resource || subscription_resource, Keyword.get(opts, :tenant)}
+          provider = resolve_subscription_provider(subscription_or_id, opts)
 
-          AshBilling.ResourceLock.run(
-            [customer_resource, subscription_resource],
-            lock_key,
-            fn ->
-              with {:ok, locked_sub} <-
-                     lock_customer_then_subscription(
-                       customer_resource,
-                       subscription_resource,
-                       sub_id,
-                       opts
-                     ),
-                   {:ok, live_sub} <- get_subscription(subscription_or_id, opts),
-                   {:ok, checkpoint_dt} <-
-                     WebhookSync.fetch_reconciliation_checkpoint(
-                       subscription_resource,
-                       locked_sub,
-                       opts
-                     ) do
-                event_type =
-                  if live_sub["status"] in ["canceled", "incomplete_expired"],
-                    do: "customer.subscription.deleted",
-                    else: "customer.subscription.updated"
+          :telemetry.span([:ash_billing, :reconcile], %{provider: provider, mode: :live}, fn ->
+            {result, pre_snapshot} =
+              case AshBilling.ResourceLock.run(
+                     [customer_resource, subscription_resource],
+                     lock_key,
+                     fn ->
+                       with {:ok, locked_sub} <-
+                              lock_customer_then_subscription(
+                                customer_resource,
+                                subscription_resource,
+                                sub_id,
+                                opts
+                              ),
+                            {:ok, live_sub} <- get_subscription(subscription_or_id, opts),
+                            {:ok, checkpoint_dt} <-
+                              WebhookSync.fetch_reconciliation_checkpoint(
+                                subscription_resource,
+                                locked_sub,
+                                opts
+                              ) do
+                         event_type =
+                           if live_sub["status"] in ["canceled", "incomplete_expired"],
+                             do: "customer.subscription.deleted",
+                             else: "customer.subscription.updated"
 
-                synthetic_event = %{
-                  "id" => "reconcile_#{live_sub["id"]}_#{System.unique_integer([:positive])}",
-                  "type" => event_type,
-                  "created" => nil,
-                  "data" => %{"object" => live_sub}
-                }
+                         synthetic_event = %{
+                           "id" =>
+                             "reconcile_#{live_sub["id"]}_#{System.unique_integer([:positive])}",
+                           "type" => event_type,
+                           "created" => nil,
+                           "data" => %{"object" => live_sub}
+                         }
 
-                WebhookSync.sync_event(
-                  synthetic_event,
-                  Keyword.put(sync_opts, :reconciled_at, checkpoint_dt)
-                )
+                         sync_res =
+                           WebhookSync.sync_event(
+                             synthetic_event,
+                             Keyword.put(sync_opts, :reconciled_at, checkpoint_dt)
+                           )
+
+                         case sync_res do
+                           {:ok, _} = ok -> {:ok, {ok, locked_sub}}
+                           {:error, _} = err -> err
+                         end
+                       end
+                     end,
+                     rollback_on_error?: true
+                   ) do
+                {:ok, {sync_ok, locked_sub}} -> {sync_ok, locked_sub}
+                {:error, _} = err -> {err, nil}
               end
-            end,
-            rollback_on_error?: true
-          )
+
+            stop_meta =
+              case {result, pre_snapshot} do
+                {{:ok, updated}, %{} = before} when is_struct(updated) ->
+                  changed =
+                    WebhookSync.diff_financial_fields(before, updated)
+                    |> Map.keys()
+                    |> Enum.sort()
+
+                  %{
+                    provider: provider,
+                    mode: :live,
+                    status: :ok,
+                    drift_detected: changed != [],
+                    changed_fields: changed,
+                    error_category: nil
+                  }
+
+                {{:ok, _}, _} ->
+                  %{
+                    provider: provider,
+                    mode: :live,
+                    status: :ok,
+                    drift_detected: false,
+                    changed_fields: [],
+                    error_category: nil
+                  }
+
+                {{:error, reason}, _} ->
+                  %{
+                    provider: provider,
+                    mode: :live,
+                    status: :error,
+                    drift_detected: false,
+                    changed_fields: [],
+                    error_category: classify_reconcile_error(reason)
+                  }
+              end
+
+            {result, stop_meta}
+          end)
         end
 
       _ ->
@@ -921,40 +975,56 @@ defmodule AshBilling do
   end
 
   @doc """
-  Performs partial structural configuration diagnostics.
+  Performs structural (and optionally PostgreSQL / provider) configuration diagnostics.
 
-  Absent credentials remain accepted for compatibility. This does not establish
-  production readiness, contact Stripe, or verify migrations, database access,
-  authorization, persistence actions, or account/tenant routing.
+  Preserves backwards compatibility with earlier releases: returns
+  `{:ok, %{status: :valid, production_ready: boolean(), warnings: [...], summary: ..., checks: ...}}`
+  when no failure checks occur, or `{:error, [reasons]}` when one or more checks fail.
 
-  Verifies that billing customer resources, subscription resources, and API credentials
-  are properly configured and compliant with AshBilling requirements.
-
-  Returns `{:ok, %{status: :valid}}` or `{:error, [reasons]}`.
+  Absent credentials remain accepted for compatibility. Notice that `status: :valid`
+  indicates structural/requested checks did not fail and does **not** imply
+  `production_ready: true` (check `production_ready` or run `AshBilling.Diagnostics.run/1` /
+  `mix ash_billing.doctor` for full production readiness evaluation).
 
   ## Options
 
     * `:customer_resource` - The Ash resource representing billing customers.
     * `:subscription_resource` - The Ash resource representing subscriptions.
-    * `:api_key` - Stripe API key to validate format (defaults to application env).
-    * `:webhook_secret` - Stripe webhook secret to validate format (defaults to application env).
+    * `:deduplication_resource` / `:webhook_event_resource` - Optional Ash webhook event resource.
+    * `:deduplication_strategy` - `:resource` or `:memory`.
+    * `:api_key` - Stripe API key to validate format (never echoed; defaults to application env).
+    * `:webhook_secret` - Stripe webhook secret to validate format (never echoed; defaults to application env).
+    * `:expected_livemode` - Optional boolean (`true` / `false`) for Stripe livemode binding.
+    * `:stripe_account` - Optional Stripe Connect account ID.
+    * `:req_opts` - Optional `Req` HTTP timeout/retry options to verify.
+    * `:check_database?` - When `true`, performs read-only PostgreSQL connectivity, column, and index verification. Defaults to `false`.
+    * `:check_provider?` - When `true`, performs an optional read-only provider probe. Defaults to `false`.
   """
   @spec check_configuration(keyword()) :: {:ok, map()} | {:error, [String.t()]}
   def check_configuration(opts \\ []) do
-    customer_res = Keyword.get(opts, :customer_resource)
-    sub_res = Keyword.get(opts, :subscription_resource)
+    report = AshBilling.Diagnostics.run(opts)
 
-    errors =
-      []
-      |> check_customer_resource(customer_res)
-      |> check_subscription_resource(sub_res)
-      |> check_api_key(opts)
-      |> check_webhook_secret(opts)
+    failures =
+      report.checks
+      |> Enum.filter(&(&1.status == :fail))
+      |> Enum.map(& &1.message)
 
-    if errors == [] do
-      {:ok, %{status: :valid}}
+    warnings =
+      report.checks
+      |> Enum.filter(&(&1.status == :warn))
+      |> Enum.map(& &1.message)
+
+    if failures == [] do
+      {:ok,
+       %{
+         status: :valid,
+         production_ready: report.production_ready,
+         warnings: warnings,
+         summary: report.summary,
+         checks: report.checks
+       }}
     else
-      {:error, Enum.reverse(errors)}
+      {:error, failures}
     end
   end
 
@@ -975,110 +1045,16 @@ defmodule AshBilling do
     end
   end
 
-  defp check_customer_resource(errors, nil), do: errors
+  defp classify_reconcile_error({:transaction_failed, _}), do: :postgres_error
+  defp classify_reconcile_error({:reconciliation_failed, _}), do: :provider_error
+  defp classify_reconcile_error(:unsupported_subscription_items), do: :unsupported_items
+  defp classify_reconcile_error(:invalid_quantity), do: :invalid_quantity
 
-  defp check_customer_resource(errors, res) do
-    if is_atom(res) and Spark.Dsl.is?(res, Ash.Resource) do
-      attr = ResourceInfo.customer_id_attribute(res)
+  defp classify_reconcile_error(%{status: status}) when is_integer(status),
+    do: :provider_http_error
 
-      errors =
-        if Ash.Resource.Info.attribute(res, attr) do
-          errors
-        else
-          ["Customer resource #{inspect(res)} is missing attribute #{inspect(attr)}" | errors]
-        end
-
-      if Ash.Resource.Info.relationship(res, :subscriptions) do
-        errors
-      else
-        ["Customer resource #{inspect(res)} is missing :subscriptions relationship" | errors]
-      end
-    else
-      ["Customer resource #{inspect(res)} is not a valid Ash.Resource" | errors]
-    end
-  end
-
-  defp check_subscription_resource(errors, nil), do: errors
-
-  defp check_subscription_resource(errors, res) do
-    if is_atom(res) and Spark.Dsl.is?(res, Ash.Resource) do
-      required_attrs = [:provider_subscription_id, :status, :price_id]
-
-      missing_attrs =
-        Enum.reject(required_attrs, fn a -> Ash.Resource.Info.attribute(res, a) != nil end)
-
-      errors =
-        if missing_attrs == [] do
-          errors
-        else
-          [
-            "Subscription resource #{inspect(res)} is missing required attributes: #{inspect(missing_attrs)}"
-            | errors
-          ]
-        end
-
-      if Ash.Resource.Info.calculation(res, :active?) do
-        errors
-      else
-        ["Subscription resource #{inspect(res)} is missing :active? calculation" | errors]
-      end
-    else
-      ["Subscription resource #{inspect(res)} is not a valid Ash.Resource" | errors]
-    end
-  end
-
-  defp check_api_key(errors, opts) do
-    key =
-      Keyword.get(
-        opts,
-        :api_key,
-        Application.get_env(:ash_billing, :stripe_api_key) ||
-          System.get_env("STRIPE_SECRET_KEY")
-      )
-
-    case key do
-      nil ->
-        errors
-
-      k when is_binary(k) ->
-        if String.starts_with?(k, "sk_") or String.starts_with?(k, "rk_") do
-          errors
-        else
-          [
-            "Stripe API key does not start with standard prefix 'sk_' or 'rk_'"
-            | errors
-          ]
-        end
-
-      _ ->
-        errors
-    end
-  end
-
-  defp check_webhook_secret(errors, opts) do
-    secret =
-      Keyword.get(
-        opts,
-        :webhook_secret,
-        Application.get_env(:ash_billing, :stripe_webhook_secret) ||
-          System.get_env("STRIPE_WEBHOOK_SECRET")
-      )
-
-    case secret do
-      nil ->
-        errors
-
-      s when is_binary(s) ->
-        if String.starts_with?(s, "whsec_") do
-          errors
-        else
-          ["Stripe webhook secret does not start with standard prefix 'whsec_'" | errors]
-        end
-
-      _ ->
-        errors
-    end
-  end
+  defp classify_reconcile_error(:timeout), do: :provider_timeout
+  defp classify_reconcile_error(_), do: :reconcile_error
 
   defp customer_tenant(%resource{} = record, opts) do
     tenant =

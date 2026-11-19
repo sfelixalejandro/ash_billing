@@ -32,8 +32,21 @@ defmodule AshBilling.ResourceLock do
   catch
     :error, %{__struct__: module} = error
     when module in [Postgrex.Error, DBConnection.ConnectionError] ->
+      :telemetry.execute(
+        [:ash_billing, :postgres, :contention],
+        %{count: 1},
+        %{operation: :transaction_lock, reason: classify_pg_error(error)}
+      )
+
       {:error, {:transaction_failed, error}}
   end
+
+  defp classify_pg_error(%{postgres: %{code: :lock_not_available}}), do: :lock_not_available
+  defp classify_pg_error(%{postgres: %{code: :query_canceled}}), do: :lock_timeout
+  defp classify_pg_error(%{postgres: %{code: :deadlock_detected}}), do: :deadlock
+  defp classify_pg_error(%{postgres: %{code: :serialization_failure}}), do: :serialization_failure
+  defp classify_pg_error(%{__struct__: DBConnection.ConnectionError}), do: :connection_error
+  defp classify_pg_error(_), do: :database_error
 
   # HTTP adapters cannot defer a sent response to a caller-owned transaction.
   def http_boundary(resources) do

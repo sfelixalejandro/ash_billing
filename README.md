@@ -360,6 +360,13 @@ config :ash_billing,
 | `[:ash_billing, :portal, :start \| :stop \| :exception]` | Emitted during Billing Portal session creation in `AshBilling.create_portal_session/2`. | `:system_time` / `:duration` | `:provider`, `:customer`, `:status`, `:url` |
 | `[:ash_billing, :swap_plan, :start \| :stop \| :exception]` | Emitted during plan swaps in `AshBilling.swap_plan/3`. | `:system_time` / `:duration` | `:provider`, `:subscription_id`, `:new_price_id`, `:status` |
 | `[:ash_billing, :update_quantity, :start \| :stop \| :exception]` | Emitted during quantity/seat updates in `AshBilling.update_quantity/3`. | `:system_time` / `:duration` | `:provider`, `:subscription_id`, `:quantity`, `:status` |
+| `[:ash_billing, :reconcile, :start \| :stop \| :exception]` | Emitted once per logical `AshBilling.reconcile_subscription/2` call. | `:system_time` / `:duration` | `:provider`, `:mode`, `:status`, `:drift_detected`, `:changed_fields`, `:error_category` |
+| `[:ash_billing, :reverify, :start \| :stop \| :exception]` | Emitted once per live provider `GET` re-verification inside `AshBilling.WebhookSync`. | `:system_time` / `:duration` | `:provider`, `:status`, `:drift_detected`, `:changed_fields`, `:error_category` |
+| `[:ash_billing, :deduplication, :acquire \| :complete \| :release]` | Emitted once per logical deduplication lease operation. | `:count`, `:duration` (`:acquire`) | `:strategy`, `:outcome` / `:status`, `:error_category` |
+| `[:ash_billing, :postgres, :contention]` | Emitted when PostgreSQL lock/connection contention aborts a billing transaction. | `:count` | `:operation`, `:reason` |
+| `[:ash_billing, :reconciler, :batch]` | Emitted once per `AshBilling.Reconciler.run/1` batch (`mix ash_billing.reconcile`). | `:duration`, `:total`, `:drifted`, `:reconciled`, `:unchanged`, `:skipped`, `:failed` | `:mode` |
+
+See [Diagnostics, Recovery CLI & Observability](documentation/topics/observability-and-diagnostics.md) for `mix ash_billing.doctor`, `mix ash_billing.reconcile`, and a `Telemetry.Metrics` dashboard example.
 
 ---
 

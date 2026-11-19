@@ -56,45 +56,72 @@ defmodule AshBilling.Deduplication do
   def acquire(nil, _opts), do: {:ok, :acquired}
 
   def acquire(event_id, opts) when is_binary(event_id) do
-    case resolve_strategy(opts) do
-      :resource ->
-        case resolve_resource(opts) do
-          nil ->
-            {:error, :deduplication_resource_not_configured}
+    start_time = System.monotonic_time()
 
-          resource ->
-            opts = normalize_tenant(resource, opts)
+    {strategy, result} =
+      try do
+        strategy = resolve_strategy(opts)
 
-            if postgres?(resource) do
-              postgres_event(resource, event_id, opts, fn record ->
-                if is_nil(record) do
-                  acquire_resource(resource, event_id, opts)
-                else
-                  reclaim_atomic_resource_lease(
-                    resource,
-                    event_id,
-                    event_options(opts),
-                    DateTime.utc_now(),
-                    Keyword.get(opts, :lease_ttl_seconds, 60),
-                    generate_lease_token()
-                  )
-                end
+        res =
+          case strategy do
+            :resource ->
+              case resolve_resource(opts) do
+                nil ->
+                  {:error, :deduplication_resource_not_configured}
+
+                resource ->
+                  opts = normalize_tenant(resource, opts)
+
+                  if postgres?(resource) do
+                    postgres_event(resource, event_id, opts, fn record ->
+                      if is_nil(record) do
+                        acquire_resource(resource, event_id, opts)
+                      else
+                        reclaim_atomic_resource_lease(
+                          resource,
+                          event_id,
+                          event_options(opts),
+                          DateTime.utc_now(),
+                          Keyword.get(opts, :lease_ttl_seconds, 60),
+                          generate_lease_token()
+                        )
+                      end
+                    end)
+                  else
+                    local_execution_lock(resource_key(resource, event_id, opts), fn ->
+                      acquire_resource(resource, event_id, opts)
+                    end)
+                  end
+              end
+
+            :memory ->
+              local_execution_lock(resource_key(:memory, event_id, opts), fn ->
+                acquire_memory(memory_key(event_id, opts))
               end)
-            else
-              local_execution_lock(resource_key(resource, event_id, opts), fn ->
-                acquire_resource(resource, event_id, opts)
-              end)
-            end
-        end
+          end
 
-      :memory ->
-        local_execution_lock(resource_key(:memory, event_id, opts), fn ->
-          acquire_memory(memory_key(event_id, opts))
-        end)
-    end
-  rescue
-    e -> {:error, e}
+        {strategy, res}
+      rescue
+        e -> {:unknown, {:error, e}}
+      end
+
+    duration = System.monotonic_time() - start_time
+    {outcome, error_category} = classify_acquire_outcome(result)
+
+    :telemetry.execute(
+      [:ash_billing, :deduplication, :acquire],
+      %{count: 1, duration: duration},
+      %{strategy: strategy, outcome: outcome, error_category: error_category}
+    )
+
+    result
   end
+
+  defp classify_acquire_outcome({:ok, _}), do: {:acquired, nil}
+  defp classify_acquire_outcome({:error, :already_processed}), do: {:duplicate, nil}
+  defp classify_acquire_outcome({:error, :already_processing}), do: {:already_processing, nil}
+  defp classify_acquire_outcome({:error, {:transaction_failed, _}}), do: {:error, :postgres_error}
+  defp classify_acquire_outcome({:error, _}), do: {:error, :deduplication_error}
 
   @doc """
   Runs webhook work while holding the event's execution fence.
@@ -428,33 +455,49 @@ defmodule AshBilling.Deduplication do
   def complete(nil, _opts), do: :ok
 
   def complete(event_id, opts) when is_binary(event_id) do
-    case resolve_strategy(opts) do
-      :resource ->
-        case resolve_resource(opts) do
-          nil ->
-            {:error, :deduplication_resource_not_configured}
+    {strategy, result} =
+      try do
+        strategy = resolve_strategy(opts)
 
-          resource ->
-            opts = normalize_tenant(resource, opts)
+        res =
+          case strategy do
+            :resource ->
+              case resolve_resource(opts) do
+                nil ->
+                  {:error, :deduplication_resource_not_configured}
 
-            if postgres?(resource) do
-              postgres_event(resource, event_id, opts, fn _ ->
-                complete_resource(resource, event_id, opts)
+                resource ->
+                  opts = normalize_tenant(resource, opts)
+
+                  if postgres?(resource) do
+                    postgres_event(resource, event_id, opts, fn _ ->
+                      complete_resource(resource, event_id, opts)
+                    end)
+                  else
+                    local_execution_lock(resource_key(resource, event_id, opts), fn ->
+                      complete_resource(resource, event_id, opts)
+                    end)
+                  end
+              end
+
+            :memory ->
+              local_execution_lock(resource_key(:memory, event_id, opts), fn ->
+                complete_memory(memory_key(event_id, opts), opts)
               end)
-            else
-              local_execution_lock(resource_key(resource, event_id, opts), fn ->
-                complete_resource(resource, event_id, opts)
-              end)
-            end
-        end
+          end
 
-      :memory ->
-        local_execution_lock(resource_key(:memory, event_id, opts), fn ->
-          complete_memory(memory_key(event_id, opts), opts)
-        end)
-    end
-  rescue
-    e -> {:error, e}
+        {strategy, res}
+      rescue
+        e -> {:unknown, {:error, e}}
+      end
+
+    :telemetry.execute(
+      [:ash_billing, :deduplication, :complete],
+      %{count: 1},
+      %{strategy: strategy, status: if(result == :ok, do: :ok, else: :error)}
+    )
+
+    result
   end
 
   defp complete_resource(resource, event_id, opts) do
@@ -562,33 +605,49 @@ defmodule AshBilling.Deduplication do
   def release(nil, _opts), do: :ok
 
   def release(event_id, opts) when is_binary(event_id) do
-    case resolve_strategy(opts) do
-      :resource ->
-        case resolve_resource(opts) do
-          nil ->
-            {:error, :deduplication_resource_not_configured}
+    {strategy, result} =
+      try do
+        strategy = resolve_strategy(opts)
 
-          resource ->
-            opts = normalize_tenant(resource, opts)
+        res =
+          case strategy do
+            :resource ->
+              case resolve_resource(opts) do
+                nil ->
+                  {:error, :deduplication_resource_not_configured}
 
-            if postgres?(resource) do
-              postgres_event(resource, event_id, opts, fn _ ->
-                release_resource(resource, event_id, opts)
+                resource ->
+                  opts = normalize_tenant(resource, opts)
+
+                  if postgres?(resource) do
+                    postgres_event(resource, event_id, opts, fn _ ->
+                      release_resource(resource, event_id, opts)
+                    end)
+                  else
+                    local_execution_lock(resource_key(resource, event_id, opts), fn ->
+                      release_resource(resource, event_id, opts)
+                    end)
+                  end
+              end
+
+            :memory ->
+              local_execution_lock(resource_key(:memory, event_id, opts), fn ->
+                delete_memory(memory_key(event_id, opts), opts)
               end)
-            else
-              local_execution_lock(resource_key(resource, event_id, opts), fn ->
-                release_resource(resource, event_id, opts)
-              end)
-            end
-        end
+          end
 
-      :memory ->
-        local_execution_lock(resource_key(:memory, event_id, opts), fn ->
-          delete_memory(memory_key(event_id, opts), opts)
-        end)
-    end
-  rescue
-    e -> {:error, e}
+        {strategy, res}
+      rescue
+        e -> {:unknown, {:error, e}}
+      end
+
+    :telemetry.execute(
+      [:ash_billing, :deduplication, :release],
+      %{count: 1},
+      %{strategy: strategy, status: if(result == :ok, do: :ok, else: :error)}
+    )
+
+    result
   end
 
   defp release_resource(resource, event_id, opts) do

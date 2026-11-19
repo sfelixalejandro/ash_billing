@@ -519,6 +519,65 @@ defmodule AshBilling.WebhookSync do
        ) do
     provider = Keyword.get(opts, :provider, SubscriptionInfo.provider(subscription_resource))
 
+    :telemetry.span([:ash_billing, :reverify], %{provider: provider}, fn ->
+      result =
+        do_reconcile_subscription_with_provider(
+          provider,
+          subscription_resource,
+          existing,
+          sub_id,
+          attrs,
+          event_dt,
+          opts,
+          ash_opts
+        )
+
+      stop_meta =
+        case result do
+          {:ok, updated} when is_struct(updated) ->
+            changed = diff_financial_fields(existing, updated) |> Map.keys() |> Enum.sort()
+
+            %{
+              provider: provider,
+              status: :ok,
+              drift_detected: changed != [],
+              changed_fields: changed,
+              error_category: nil
+            }
+
+          {:ok, _} ->
+            %{
+              provider: provider,
+              status: :ok,
+              drift_detected: false,
+              changed_fields: [],
+              error_category: nil
+            }
+
+          {:error, reason} ->
+            %{
+              provider: provider,
+              status: :error,
+              drift_detected: false,
+              changed_fields: [],
+              error_category: classify_telemetry_error(reason)
+            }
+        end
+
+      {result, stop_meta}
+    end)
+  end
+
+  defp do_reconcile_subscription_with_provider(
+         provider,
+         subscription_resource,
+         existing,
+         sub_id,
+         attrs,
+         event_dt,
+         opts,
+         ash_opts
+       ) do
     case provider.get_subscription(sub_id, opts) do
       {:ok, live_sub} when is_map(live_sub) ->
         with :ok <- validate_subscription_items(live_sub),
@@ -1049,6 +1108,61 @@ defmodule AshBilling.WebhookSync do
         not same_value?(Map.get(existing, field), Map.get(attrs, field))
     end)
   end
+
+  @doc false
+  def extract_live_snapshot(live_sub) when is_map(live_sub) do
+    with :ok <- validate_subscription_items(live_sub),
+         {:ok, quantity} <- extract_quantity(live_sub) do
+      price_id =
+        if multiple_subscription_items?(live_sub), do: nil, else: extract_price_id(live_sub)
+
+      item_id =
+        if multiple_subscription_items?(live_sub),
+          do: nil,
+          else: extract_subscription_item_id(live_sub)
+
+      {:ok,
+       %{
+         status: normalize_status(live_sub["status"]),
+         price_id: price_id,
+         quantity: quantity,
+         provider_subscription_item_id: item_id,
+         current_period_end: extract_current_period_end(live_sub),
+         trial_ends_at: extract_trial_ends_at(live_sub),
+         cancel_at_period_end: Map.get(live_sub, "cancel_at_period_end", false),
+         cancel_at: extract_cancel_at(live_sub)
+       }}
+    end
+  end
+
+  @doc false
+  def diff_financial_fields(nil, _target), do: %{}
+  def diff_financial_fields(_existing, nil), do: %{}
+
+  def diff_financial_fields(existing, target) when is_map(existing) and is_map(target) do
+    Enum.reduce(@financial_sync_fields, %{}, fn field, acc ->
+      if Map.has_key?(existing, field) and Map.has_key?(target, field) do
+        local_val = Map.get(existing, field)
+        remote_val = Map.get(target, field)
+
+        if same_value?(local_val, remote_val) do
+          acc
+        else
+          Map.put(acc, field, %{local: local_val, remote: remote_val})
+        end
+      else
+        acc
+      end
+    end)
+  end
+
+  defp classify_telemetry_error({:reconciliation_failed, _}), do: :provider_error
+  defp classify_telemetry_error(:reconciliation_failed), do: :provider_error
+  defp classify_telemetry_error(:unsupported_subscription_items), do: :unsupported_items
+  defp classify_telemetry_error(:invalid_quantity), do: :invalid_quantity
+  defp classify_telemetry_error({:transaction_failed, _}), do: :postgres_error
+  defp classify_telemetry_error(:subscription_changed_concurrently), do: :concurrency_conflict
+  defp classify_telemetry_error(_), do: :sync_error
 
   @doc false
   def fetch_reconciliation_checkpoint(subscription_resource, existing \\ nil, opts \\ []) do
