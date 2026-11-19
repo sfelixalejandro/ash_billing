@@ -25,7 +25,15 @@ def change do
 end
 ```
 
-Deploy the migration **before** rolling out `0.6.0` application nodes so `SELECT` and `UPDATE` queries against the subscription resource succeed across all workers. Existing rows remain valid with `last_reconciled_at = NULL` (no backfill required).
+Deploy the migration **before** rolling out `0.6.0` application nodes so `SELECT` and `UPDATE` queries against the subscription resource succeed across all workers. Existing rows remain valid with `last_reconciled_at = NULL` (no SQL backfill should be performed).
+
+### 2. Recommended deployment order
+
+Follow this sequence when upgrading an existing `0.5.x` deployment to `0.6.0`:
+
+1. **Apply the PostgreSQL migration first:** Add the nullable `last_reconciled_at` column while leaving existing rows at `last_reconciled_at = NULL`.
+2. **Roll out the `0.6.0` application nodes:** Deploy the upgraded application with bounded `req_opts` configured on `AshBilling.Plug` and reconciliation workers (see the operational evaluation section below).
+3. **Reconcile legacy subscriptions against the real provider:** For subscriptions that may have been reconciled under `0.5.x` (or could have drifted), run `AshBilling.reconcile_subscription/2` in a rate-limited background sweep (for example, an Oban queue with bounded concurrency) so each subscription is verified against live Stripe state before `last_reconciled_at` is persisted.
 
 ## Behavioral Changes
 
@@ -44,25 +52,27 @@ Because `0.5.2` and `0.5.3` wrote `System.system_time(:second)` into `last_event
 
 `0.6.0` addresses this in two compatible ways without changing the schema further:
 
-1. **Automatic healing during `reconcile_subscription/2`**: Whenever `reconcile_subscription/2` finds an existing `last_event_created_at` strictly greater than PostgreSQL's UTC `clock_timestamp()` (`existing.last_event_created_at > checkpoint_dt`), it logs a warning and atomically clears `last_event_created_at` to `NULL` in the exact same `UPDATE` that sets `last_reconciled_at = checkpoint_dt`. Delayed webhooks arriving afterward are still verified against Stripe live state because `last_reconciled_at` is set, while legitimate real webhooks are no longer dropped.
-2. **Explicit cursor reset for shared App + PostgreSQL clock skew (`reset_event_cursor?: true`)**: If both your `0.5.x` application nodes and PostgreSQL server ran with clocks ahead of Stripe (so a synthetic `last_event_created_at` could be `<= clock_timestamp()` yet still ahead of Stripe's clock), pass `reset_event_cursor?: true` during your post-upgrade reconciliation sweep:
+1. **Automatic healing during `reconcile_subscription/2`**: Whenever `reconcile_subscription/2` fetches live state from the provider and finds an existing `last_event_created_at` strictly greater than PostgreSQL's UTC `clock_timestamp()` (`existing.last_event_created_at > checkpoint_dt`), it logs a warning and atomically clears `last_event_created_at` to `NULL` in the exact same `UPDATE` that persists the verified provider state and sets `last_reconciled_at = checkpoint_dt`. Delayed webhooks arriving afterward are still verified against Stripe live state because `last_reconciled_at` is set, while legitimate real webhooks are no longer dropped.
+2. **Controlled cursor reset for shared App + PostgreSQL clock skew (`reset_event_cursor?: true`)**: If both your `0.5.x` application nodes and PostgreSQL server ran with clocks ahead of Stripe (so a synthetic `last_event_created_at` could be `<= clock_timestamp()` yet still ahead of Stripe's clock), reconcile affected subscriptions against the live provider with `reset_event_cursor?: true` during step 3 of the upgrade rollout (with bounded concurrency and `req_opts`):
 
 ```elixir
 {:ok, sub} =
   AshBilling.reconcile_subscription(subscription,
     domain: MyApp.Billing,
-    reset_event_cursor?: true
+    reset_event_cursor?: true,
+    req_opts: [
+      connect_options: [timeout: 3_000],
+      receive_timeout: 5_000,
+      retry: false
+    ]
   )
 ```
 
-> **Migration Safety Warning:** If you run an optional SQL cleanup during migration (for example, clearing future-dated cursors from `0.5.x`), **never** set `last_event_created_at = NULL` while leaving `last_reconciled_at = NULL`, as doing so removes out-of-order protection until the next webhook or reconciliation. Always set `last_reconciled_at` atomically alongside any cursor reset:
+> **Do not backfill `last_reconciled_at` or clear `last_event_created_at` via raw SQL:**
 >
-> ```sql
-> UPDATE subscriptions
-> SET last_event_created_at = NULL,
->     last_reconciled_at = COALESCE(last_reconciled_at, timezone('UTC', clock_timestamp()))
-> WHERE last_event_created_at > timezone('UTC', clock_timestamp());
-> ```
+> - **Never** run an `UPDATE` that sets `last_reconciled_at` (for example, to `clock_timestamp()`) without first fetching and persisting authoritative live state from Stripe. Doing so creates a **false reconciliation checkpoint** on unverified local data.
+> - **Never** clear `last_event_created_at = NULL` directly in SQL outside `AshBilling.reconcile_subscription/2`, as doing so removes out-of-order timestamp protection before a real provider reconciliation has occurred.
+> - Always heal legacy `0.5.x` rows through `AshBilling.reconcile_subscription/2` against the live provider (and use `reset_event_cursor?: true` only for targeted post-upgrade sweeps where shared clock skew is suspected).
 
 ### 3. Fail-safe re-verification of financial changes after reconciliation
 
