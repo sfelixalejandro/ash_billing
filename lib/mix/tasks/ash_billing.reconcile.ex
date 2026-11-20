@@ -43,13 +43,15 @@ defmodule Mix.Tasks.AshBilling.Reconcile do
     * `--execute` - Perform transactional reconciliation writes (requires `--confirm` or interactive confirmation).
     * `--confirm` - Explicit confirmation for `--execute` in non-interactive environments.
     * `--system` - Run with `authorize?: false` for trusted CLI system maintenance (without `--system`, Ash authorization remains enabled).
-    * `--tenant` - Scope reads and writes to a specific tenant.
-    * `--stripe-account` - Scope provider requests to a Stripe Connect account ID.
+    * `--tenant` - Scope reads and writes to a specific tenant (required on multitenant resources).
+    * `--stripe-account` - Scope provider requests (and database filtering) to a Stripe Connect account ID.
+    * `--stripe-account-attribute` - Subscription attribute storing the Stripe Connect account ID (auto-detected if `:stripe_account_id` or `:stripe_account` exists).
+    * `--stripe-account-scope` - Pass `tenant` for bulk Connect runs on multitenant resources with 1:1 tenant-to-account mapping and no per-row Connect column.
     * `--reset-event-cursor` - Pass `reset_event_cursor?: true` during `--execute`.
-    * `--page-size` - Pagination batch size (`1..500`, default `50`).
+    * `--page-size` - Keyset pagination batch size (`1..500`, default `50`).
     * `--limit` - Maximum subscriptions to process.
-    * `--concurrency` - Max concurrent workers (`1..10`, default `2`).
-    * `--rate-limit-ms` - Milliseconds to pause before each provider request (default `0`).
+    * `--concurrency` - Max concurrent workers per batch (`1..10`, default `2`).
+    * `--rate-limit-ms` - Global minimum interval in milliseconds between provider requests across all workers (default `0`).
     * `--format` - `text` (default) or `json`.
     * `--json` - Shorthand for `--format json`.
     * `--no-start` - Do not start the application before running.
@@ -75,6 +77,8 @@ defmodule Mix.Tasks.AshBilling.Reconcile do
     system: :boolean,
     tenant: :string,
     stripe_account: :string,
+    stripe_account_attribute: :string,
+    stripe_account_scope: :string,
     reset_event_cursor: :boolean,
     page_size: :integer,
     limit: :integer,
@@ -168,9 +172,16 @@ defmodule Mix.Tasks.AshBilling.Reconcile do
         Application.get_env(:ash_billing, :customer_resource)
 
     statuses =
-      case Keyword.get(parsed, :status) do
-        nil -> nil
-        str -> str |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
+      case Keyword.fetch(parsed, :status) do
+        :error ->
+          nil
+
+        {:ok, str} ->
+          if String.trim(str) == "" do
+            []
+          else
+            str |> String.split(",") |> Enum.map(&String.trim/1)
+          end
       end
 
     [
@@ -193,6 +204,8 @@ defmodule Mix.Tasks.AshBilling.Reconcile do
     |> maybe_put(:statuses, statuses)
     |> maybe_put(:tenant, Keyword.get(parsed, :tenant))
     |> maybe_put(:stripe_account, Keyword.get(parsed, :stripe_account))
+    |> maybe_put(:stripe_account_attribute, Keyword.get(parsed, :stripe_account_attribute))
+    |> maybe_put(:stripe_account_scope, Keyword.get(parsed, :stripe_account_scope))
     |> maybe_put(:limit, Keyword.get(parsed, :limit))
   end
 

@@ -364,7 +364,7 @@ config :ash_billing,
 | `[:ash_billing, :reverify, :start \| :stop \| :exception]` | Emitted once per live provider `GET` re-verification inside `AshBilling.WebhookSync`. | `:system_time` / `:duration` | `:provider`, `:status`, `:drift_detected`, `:changed_fields`, `:error_category` |
 | `[:ash_billing, :deduplication, :acquire \| :complete \| :release]` | Emitted once per logical deduplication lease operation. | `:count`, `:duration` (`:acquire`) | `:strategy`, `:outcome` / `:status`, `:error_category` |
 | `[:ash_billing, :postgres, :contention]` | Emitted when PostgreSQL lock/connection contention aborts a billing transaction. | `:count` | `:operation`, `:reason` |
-| `[:ash_billing, :reconciler, :batch]` | Emitted once per `AshBilling.Reconciler.run/1` batch (`mix ash_billing.reconcile`). | `:duration`, `:total`, `:drifted`, `:reconciled`, `:unchanged`, `:skipped`, `:failed` | `:mode` |
+| `[:ash_billing, :reconciler, :batch]` | Emitted once per `AshBilling.Reconciler.run/1` batch (`mix ash_billing.reconcile`). | `:duration`, `:total`, `:drifted`, `:reconciled`, `:unchanged`, `:skipped`, `:failed`, `:pages` | `:mode` |
 
 See [Diagnostics, Recovery CLI & Observability](documentation/topics/observability-and-diagnostics.md) for `mix ash_billing.doctor`, `mix ash_billing.reconcile`, and a `Telemetry.Metrics` dashboard example.
 

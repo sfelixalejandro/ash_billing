@@ -51,9 +51,12 @@ mix ash_billing.doctor \
 
 - **Read-only by default (`--dry-run`)**: Reports per-subscription field diffs (`status`, `price_id`, `quantity`, `provider_subscription_item_id`, `current_period_end`, `trial_ends_at`, `cancel_at_period_end`, `cancel_at`) without touching PostgreSQL.
 - **Explicit confirmation for writes**: Writing requires `--execute` plus `--confirm` (or interactive prompt approval).
-- **Mandatory selection filter**: Refuses to run without a single target (`--subscription-id` or `--id`) or an explicit bulk filter (`--older-than-hours`, `--status`, `--missing-quantity`, or `--all`).
-- **Authorization & isolation**: Preserves Ash authorization by default (pass `--system` only for trusted CLI maintenance) and enforces `--tenant` and `--stripe-account` isolation.
-- **Bounded throughput**: Supports `--page-size`, `--limit`, `--concurrency` (`1..10`, default `2`), `--rate-limit-ms`, and bounded HTTP timeouts (`connect_options: [timeout: 3_000], receive_timeout: 5_000, retry: false`).
+- **Fail-closed selection filters**: Refuses to run without a valid target (`--subscription-id` or `--id`) or explicit bulk filter (`--older-than-hours`, `--status`, `--missing-quantity`, or `--all`). Invalid filters (`--older-than-hours 0`, negative hours, empty/unknown statuses, `--missing-quantity` on a resource lacking `:quantity`) fail before executing any database query or provider HTTP call — never degrading into an unfiltered scan.
+- **Authorization, multitenant & Stripe Connect isolation**:
+  - Preserves Ash authorization by default (pass `--system` only for trusted CLI maintenance).
+  - Multitenant resources require `--tenant`; non-multitenant resources reject `--tenant` rather than silently ignoring it.
+  - Passing `--stripe-account` never assumes Stripe headers filter PostgreSQL rows: if the subscription resource defines `:stripe_account_id` or `:stripe_account` (or `--stripe-account-attribute`), PostgreSQL queries are automatically scoped to that account (and `IS NULL` for platform runs). Bulk Connect sweeps without a per-row Connect column fail closed unless a multitenant resource explicitly declares 1:1 tenant-to-account binding with `--stripe-account-scope tenant`.
+- **Keyset batch streaming & global rate limiting**: Streams one keyset-paginated batch (`ORDER BY pk ASC`, `pk > cursor`, no `OFFSET`) at a time to bound memory and prevent omissions/duplicates during live updates, with bounded worker concurrency (`1..10`, default `2`), a global cross-worker rate limiter (`--rate-limit-ms`), and bounded HTTP timeouts (`connect_options: [timeout: 3_000], receive_timeout: 5_000, retry: false`).
 
 ```bash
 # 1. Dry-run drift check for a single subscription
@@ -99,7 +102,7 @@ All new observability events avoid high-cardinality identifiers (`customer_id`, 
 | `[:ash_billing, :deduplication, :complete]` | `:count` | `:strategy`, `:status` (`:ok \| :error`) | Emitted once per `AshBilling.Deduplication.complete/2`. |
 | `[:ash_billing, :deduplication, :release]` | `:count` | `:strategy`, `:status` (`:ok \| :error`) | Emitted once per `AshBilling.Deduplication.release/2`. |
 | `[:ash_billing, :postgres, :contention]` | `:count` | `:operation`, `:reason` (`:lock_timeout \| :lock_not_available \| :deadlock \| :serialization_failure \| :connection_error \| :database_error`) | Emitted when PostgreSQL lock or connection contention aborts a billing transaction. |
-| `[:ash_billing, :reconciler, :batch]` | `:duration`, `:total`, `:drifted`, `:reconciled`, `:unchanged`, `:skipped`, `:failed` | `:mode` (`:dry_run \| :execute`) | Emitted once per `AshBilling.Reconciler.run/1` batch. |
+| `[:ash_billing, :reconciler, :batch]` | `:duration`, `:total`, `:drifted`, `:reconciled`, `:unchanged`, `:skipped`, `:failed`, `:pages` | `:mode` (`:dry_run \| :execute`) | Emitted once per `AshBilling.Reconciler.run/1` batch. |
 
 Existing spans (`[:ash_billing, :webhook, ...]`, `[:ash_billing, :sync, ...]`, `[:ash_billing, :checkout, ...]`, `[:ash_billing, :portal, ...]`, `[:ash_billing, :swap_plan, ...]`, `[:ash_billing, :update_quantity, ...]`) remain unchanged.
 
