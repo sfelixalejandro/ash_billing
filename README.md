@@ -370,6 +370,12 @@ See [Diagnostics, Recovery CLI & Observability](documentation/topics/observabili
 
 ---
 
+## Runnable SaaS Reference Application
+
+A complete runnable **Phoenix + Ash + AshPostgres** SaaS reference application lives in `examples/saas_example` (with Docker Compose for PostgreSQL 16, migrations, demo seeds, Stripe Test Mode configuration, `Subscribed` & `HasPrice` policies, per-seat `quantity` enforcement, signed webhooks with PostgreSQL deduplication, `mix ash_billing.doctor` / `mix ash_billing.reconcile`, and automated tests). See [`examples/saas_example/README.md`](https://github.com/sfelixalejandro/ash_billing/tree/main/examples/saas_example) to run it locally.
+
+---
+
 ## Supported Stripe API Baseline
 
 `ash_billing` processes Stripe snapshot billing events using v1 resource shapes. Check your endpoint API version against the customer, subscription, price and timestamp fields your integration uses. Thin events and non-nil v2 `context` envelopes are not supported; they are rejected rather than recorded as processed.

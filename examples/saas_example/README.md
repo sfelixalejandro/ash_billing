@@ -1,230 +1,157 @@
-# SaaS Reference Implementation with AshBilling
+# AshBilling Runnable SaaS Reference Application (`examples/saas_example`)
 
-This reference implementation demonstrates an end-to-end SaaS subscription lifecycle using `ash_billing` with Phoenix and PostgreSQL.
-
----
-
-## 1. Resource Definitions
-
-### 1.1 Customer (`MyApp.Accounts.User`)
-
-```elixir
-defmodule MyApp.Accounts.User do
-  use Ash.Resource,
-    domain: MyApp.Accounts,
-    data_layer: AshPostgres.DataLayer,
-    extensions: [AshBilling.Resource]
-
-  postgres do
-    table "users"
-    repo MyApp.Repo
-  end
-
-  attributes do
-    uuid_primary_key :id
-    attribute :email, :string, allow_nil?: false, public?: true
-    attribute :name, :string, public?: true
-  end
-
-  relationships do
-    has_many :subscriptions, MyApp.Billing.Subscription, destination_attribute: :user_id
-  end
-
-  actions do
-    default_accept :*
-    defaults [:read, :create, :update]
-  end
-
-  billing do
-    customer_id_attribute :stripe_customer_id
-    provider AshBilling.Providers.Stripe
-  end
-end
-```
-
-### 1.2 Subscription (`MyApp.Billing.Subscription`)
-
-```elixir
-defmodule MyApp.Billing.Subscription do
-  use Ash.Resource,
-    domain: MyApp.Billing,
-    data_layer: AshPostgres.DataLayer,
-    extensions: [AshBilling.Subscription]
-
-  postgres do
-    table "subscriptions"
-    repo MyApp.Repo
-  end
-
-  attributes do
-    uuid_primary_key :id
-    attribute :user_id, :uuid, allow_nil?: false, public?: true
-  end
-
-  relationships do
-    belongs_to :user, MyApp.Accounts.User
-  end
-
-  actions do
-    default_accept :*
-    defaults [:read, :create, :update, :destroy]
-  end
-
-  billing_subscription do
-    customer_relationship :user
-    provider AshBilling.Providers.Stripe
-  end
-end
-```
-
-### 1.3 Persistent Deduplication Event (`MyApp.Billing.WebhookEvent`)
-
-```elixir
-defmodule MyApp.Billing.WebhookEvent do
-  use Ash.Resource,
-    domain: MyApp.Billing,
-    data_layer: AshPostgres.DataLayer,
-    extensions: [AshBilling.WebhookEvent]
-
-  postgres do
-    table "webhook_events"
-    repo MyApp.Repo
-  end
-
-  actions do
-    default_accept :*
-    defaults [:read, :create, :update, :destroy]
-  end
-end
-```
-
-Register the resources in their domains and generate and apply the PostgreSQL migrations with `mix ash.codegen create_billing_tables` and `mix ash.migrate`. Subscription IDs are unique per resource and tenant; separate provider/account/environment namespaces accordingly. Resolve existing duplicates before migrating the unique index.
+A complete, runnable **Phoenix + Ash + AshPostgres + AshBilling (0.7.0-dev)** SaaS application demonstrating end-to-end subscription billing, per-seat quantity enforcement, Ash policy authorization (`Subscribed` & `HasPrice`), HMAC-verified webhooks with PostgreSQL deduplication, authoritative reconciliation, and operational CLIs (`mix ash_billing.doctor` & `mix ash_billing.reconcile`).
 
 ---
 
-## 2. Webhook Router Mounting (`MyAppWeb.Router`)
+## Features Included
 
-Mount `AshBilling.Plug` in your Phoenix router. In multi-node production clusters, configure the `:resource` deduplication strategy backed by your PostgreSQL `WebhookEvent` table:
-
-```elixir
-defmodule MyAppWeb.Router do
-  use MyAppWeb, :router
-
-  pipeline :api do
-    plug :accepts, ["json"]
-  end
-
-  scope "/webhooks" do
-    forward "/stripe", AshBilling.Plug,
-      provider: AshBilling.Providers.Stripe,
-      webhook_secret: {System, :get_env, ["STRIPE_WEBHOOK_SECRET"]},
-      customer_resource: MyApp.Accounts.User,
-      subscription_resource: MyApp.Billing.Subscription,
-      domain: MyApp.Billing,
-      deduplicate?: true,
-      deduplication_strategy: :resource,
-      deduplication_resource: MyApp.Billing.WebhookEvent,
-      return_500_on_sync_error: true
-  end
-end
-```
-
-> **Note**: To ensure Stripe payload signatures can be verified, configure Phoenix's `Plug.Parsers` to preserve the raw body on webhook paths:
->
-> ```elixir
-> plug Plug.Parsers,
->   parsers: [:urlencoded, :multipart, :json],
->   pass: ["*/*"],
->   body_reader: {AshBilling.Plug, :read_body, []},
->   json_decoder: Phoenix.json_library()
-> ```
+- **Authentication & Actor Freshness (`SaasExample.Accounts`):**
+  - Public registration (`Accounts.register_user/1` / `POST /register`) always assigns `role: :member` and ignores any caller-supplied role; administrative provisioning is isolated to `Accounts.create_admin_user/1` (and Ash `:create_admin` policy).
+  - PBKDF2-SHA256 password hashing (native OTP `:crypto.pbkdf2_hmac` + `Plug.Crypto.secure_compare`), CSRF protection, session renewal, and fresh actor + `:subscriptions` reloading on every HTTP request (`SaasExampleWeb.Plugs.AuthPlug`).
+- **Stripe Billing Lifecycle (`SaasExample.Billing`):**
+  - Server-controlled plan catalog (`SaasExample.Billing.Catalog`: `starter`, `pro`, `enterprise`) — never trusts arbitrary browser-supplied `price_id`.
+  - Stripe Customer persistence prior to Checkout (`AshBilling.create_customer/2` with `persist: true`).
+  - Stripe Checkout (`AshBilling.create_checkout_session/2`) and Billing Portal (`AshBilling.create_portal_session/2`).
+  - Plan Swaps (`AshBilling.swap_plan/3`) preserving contracted seat quantities.
+  - Per-seat Quantity Updates (`AshBilling.update_quantity/3`) with optimistic `:price_id` assertion, canonical `Customer (users) -> Subscription (subscriptions)` `FOR UPDATE` locking serialized with seat assignments (preventing concurrent downsize/assign races without deadlocking webhooks or reconciliation), bounded HTTP timeouts (`connect_timeout <= 3_000ms`, `receive_timeout <= 5_000ms`, `retry: false`), and immediate atomic local persistence before lock release.
+    - **Pool sizing trade-off:** holding a `FOR UPDATE` row lock across a bounded Stripe HTTP call binds one `SaasExample.Repo` connection per concurrent seat-quantity mutation for up to ~8s worst case (`retry: false`); size `POOL_SIZE` accordingly in deployments with high concurrent billing mutations.
+  - Cancellation at period end (`AshBilling.cancel_subscription/2`) and Resume (`AshBilling.resume_subscription/2`).
+  - Authoritative Reconciliation (`AshBilling.reconcile_subscription/2`) with `0.6.0` `last_reconciled_at` checkpoints and `0.7.0` `quantity` / `provider_subscription_item_id` sync.
+- **Security & Demo Environment Guards (`SaasExample.Security`, `SaasExample.DemoSeeds`):**
+  - `config/config.exs` contains no hardcoded `secret_key_base`; `:prod` requires a cryptographically random `SECRET_KEY_BASE` (`>= 64` bytes, rejecting dev/placeholder values) at both `config/runtime.exs` and application startup.
+  - Demo seeds with well-known passwords (`password1234`) are strictly blocked in `:prod` and non-dev environments (`SaasExample.DemoSeeds.run!/1`).
+- **Authorization Policies & Transactional Seat Limits (`SaasExample.Workspace`):**
+  - `SaasExample.Workspace.Seat`: protected by `AshBilling.Checks.Subscribed` + ownership, with PostgreSQL `FOR UPDATE` row-locked seat enforcement against `subscription.quantity` (fails closed when `quantity` is `nil`, `0`, or full).
+  - `SaasExample.Workspace.Report`: protected by `AshBilling.Checks.Subscribed` (`:read`, `:create_for_owner`) and `AshBilling.Checks.HasPrice` (`:export_analytics` for Pro/Enterprise; `:enterprise_audit` for Enterprise only) combined with strict owner isolation.
+- **Signed Webhooks & PostgreSQL Deduplication (`/webhooks/stripe`):**
+  - Raw body capture via `Plug.Parsers` `body_reader: {AshBilling.Plug, :read_body, []}`.
+  - HMAC signature verification, `expected_livemode: false` guard, persistent PostgreSQL deduplication via `SaasExample.Billing.WebhookEvent`, bounded HTTP timeouts (`retry: false`), and fail-closed HTTP `500` on sync or Stripe re-verification outages.
+- **Operational CLIs & Telemetry:**
+  - Pre-configured for `mix ash_billing.doctor` and `mix ash_billing.reconcile`.
+  - Low-cardinality `Telemetry.Metrics` definitions in `SaasExampleWeb.Telemetry`.
 
 ---
 
-## 3. Checkout and Billing Portal Sessions
+## Quick Start (Docker Compose + PostgreSQL 16)
 
-### 3.1 Initiating Subscription Checkout
+### 1. Start PostgreSQL 16
 
-```elixir
-defmodule MyAppWeb.BillingController do
-  use MyAppWeb, :controller
+```bash
+cd examples/saas_example
+docker compose up -d postgres
+```
 
-  def subscribe(conn, %{"price_id" => price_id}) do
-    user = conn.assigns.current_user
+### 2. Configure Stripe Test Mode environment
 
-    billing_opts = [actor: user, authorize?: true]
+```bash
+cp .env.example .env
+# Edit .env with your Stripe Test Mode keys (sk_test_... and whsec_...)
+# Never use sk_live_ keys in local development (runtime.exs refuses sk_live_ by default)
+set -a && source .env && set +a
+```
 
-    with {:ok, _id} <- AshBilling.create_customer(user, [persist: true] ++ billing_opts),
-         {:ok, user} <- Ash.get(MyApp.Accounts.User, user.id, billing_opts),
-         {:ok, session} <- AshBilling.create_checkout_session(user,
-      mode: "subscription",
-      line_items: [%{price: price_id, quantity: 1}],
-      success_url: url(~p"/dashboard?billing=success"),
-      cancel_url: url(~p"/pricing?billing=canceled")
-    ) do
-      redirect(conn, external: session.url)
-    else
-      {:error, _reason} ->
-        conn
-        |> put_flash(:error, "Failed to initiate checkout.")
-        |> redirect(to: ~p"/pricing")
-    end
-  end
+### 3. Install dependencies, run migrations, and load demo data
 
-  def portal(conn, _params) do
-    user = conn.assigns.current_user
+```bash
+mix deps.get
+mix ecto.setup
+```
 
-    case AshBilling.create_portal_session(user, return_url: url(~p"/settings/billing")) do
-      {:ok, session} ->
-        redirect(conn, external: session.url)
+`mix ecto.setup` creates the PostgreSQL database, applies the `0.6.0` + `0.7.0` schema migration (`priv/repo/migrations/20261119000001_create_saas_billing_schema.exs`), and seeds four demo accounts (password for all: `password1234`):
 
-      {:error, reason} ->
-        conn
-        |> put_flash(:error, "Failed to open billing portal.")
-        |> redirect(to: ~p"/dashboard")
-    end
-  end
-end
+| Email | Plan | Seats (used / contracted) | Notes |
+| --- | --- | --- | --- |
+| `free@example.com` | None | `0 / 0` | Denied by `Subscribed` |
+| `starter@example.com` | Starter | `1 / 2` | Allowed by `Subscribed`; denied Pro/Enterprise `HasPrice` |
+| `pro@example.com` | Pro | `2 / 5` | Allowed Pro Export `HasPrice`; denied Enterprise Audit |
+| `enterprise@example.com` | Enterprise | `2 / 20` | Allowed all actions (`admin` role) |
+
+### 4. Run the Phoenix server
+
+```bash
+mix phx.server
+# Open http://localhost:4000
+# Health check: curl http://localhost:4000/health
+```
+
+### 5. Forward Stripe Test Mode webhooks locally (optional, requires Stripe CLI)
+
+```bash
+stripe listen --forward-to http://localhost:4000/webhooks/stripe
+# Copy the printed whsec_... into STRIPE_WEBHOOK_SECRET in .env and restart mix phx.server
 ```
 
 ---
 
-## 4. Policy-Protected Resources
+## Diagnostics & Reconciliation CLI Examples
 
-Protect domain resources based on subscription status using native Ash policies:
+### Run `mix ash_billing.doctor` (read-only)
 
-```elixir
-defmodule MyApp.Analytics.Report do
-  use Ash.Resource,
-    domain: MyApp.Analytics,
-    data_layer: AshPostgres.DataLayer,
-    authorizers: [Ash.Policy.Authorizer]
+```bash
+# Text report (structural + PostgreSQL schema/migration/index checks)
+mix billing.doctor
 
-  attributes do
-    uuid_primary_key :id
-    attribute :title, :string, public?: true
-    attribute :data, :map, public?: true
-  end
+# Machine-readable JSON report (CI/deployment gate)
+mix ash_billing.doctor \
+  --customer-resource SaasExample.Accounts.User \
+  --subscription-resource SaasExample.Billing.Subscription \
+  --deduplication-resource SaasExample.Billing.WebhookEvent \
+  --expected-livemode false \
+  --json
 
-  policies do
-    # Only users with an active or trialing subscription can read analytics
-    policy action_type(:read) do
-      authorize_if AshBilling.Checks.Subscribed
-    end
-
-    # Only users on the Pro annual plan can export reports
-    policy action(:export) do
-      authorize_if {AshBilling.Checks.HasPrice, price: "price_pro_annual"}
-    end
-  end
-end
+# Include optional read-only Stripe connectivity check (requires valid STRIPE_API_KEY)
+mix ash_billing.doctor \
+  --customer-resource SaasExample.Accounts.User \
+  --subscription-resource SaasExample.Billing.Subscription \
+  --deduplication-resource SaasExample.Billing.WebhookEvent \
+  --expected-livemode false \
+  --check-provider \
+  --strict
 ```
 
-## Version 0.5.0 integration contract
+### Run `mix ash_billing.reconcile`
 
-The recurring flow persists a Customer before offering Checkout. Resolve price IDs
-from a server-controlled catalog and carry the same trusted tenant/account options
-through creation, reload and Checkout. One recurring line is supported. Handle
-`{:persistence_failed, customer_id, reason}` by reconciling that identity before retry.
-See [the 0.5 upgrade guide](../../documentation/topics/upgrading-to-0.5.md)
-for quantity preservation, SQL rollback, handler returns and actor freshness.
+```bash
+# 1. Dry-run (default, read-only): inspect drift for stale subscriptions (>24h)
+mix billing.reconcile.dry_run
+
+# 2. Dry-run single subscription in JSON format
+mix ash_billing.reconcile \
+  --domain SaasExample.Billing \
+  --subscription-resource SaasExample.Billing.Subscription \
+  --customer-resource SaasExample.Accounts.User \
+  --subscription-id sub_demo_pro \
+  --system \
+  --json
+
+# 3. Execute confirmed reconciliation for subscriptions missing quantity
+mix ash_billing.reconcile \
+  --domain SaasExample.Billing \
+  --subscription-resource SaasExample.Billing.Subscription \
+  --customer-resource SaasExample.Accounts.User \
+  --missing-quantity \
+  --concurrency 2 \
+  --rate-limit-ms 100 \
+  --system \
+  --execute \
+  --confirm
+```
+
+---
+
+## Running the Automated Test Suite
+
+Tests run against real PostgreSQL 16 (with `Req.Test` stubbing Stripe HTTP calls and real HMAC signatures on `/webhooks/stripe` — zero Stripe credentials required):
+
+```bash
+cd examples/saas_example
+mix test
+```
+
+Covered suites:
+- `test/saas_example/auth_and_isolation_test.exs` — Auth lifecycle, session handling, `/health`, cross-user isolation on subscriptions, seats, reports, and HTTP endpoints.
+- `test/saas_example/billing_lifecycle_test.exs` — Checkout, Customer persistence, signed webhook sync, Billing Portal, Plan Swap, Quantity Update, Cancel/Resume, and Reconcile.
+- `test/saas_example/policies_and_seats_test.exs` — `Subscribed` & `HasPrice` enforcement across Free/Starter/Pro/Enterprise/Canceled, seat limits (`nil`/`0`/full), downsize protection, and concurrent PostgreSQL `FOR UPDATE` race safety.
+- `test/saas_example/webhooks_and_resilience_test.exs` — HMAC verification, `expected_livemode` guard, PostgreSQL deduplication, Stripe `503` outage fail-closed HTTP `500` + lease release/retry, and PostgreSQL lock contention rollback safety.
+- `test/saas_example/doctor_and_reconcile_cli_test.exs` — Real `mix ash_billing.doctor` (`production_ready: true`, zero secret leaks) and `mix ash_billing.reconcile` (`--dry-run`, fail-closed invalid filters, confirmed `--execute`).
