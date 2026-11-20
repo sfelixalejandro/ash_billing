@@ -37,6 +37,9 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 ## Topics
 
 - [Webhooks & Operational Resilience](documentation/topics/webhooks-and-resilience.md)
+- [Diagnostics, Recovery CLI & Observability](documentation/topics/observability-and-diagnostics.md)
+- [Upgrading to 0.7](documentation/topics/upgrading-to-0.7.md)
+- [Stripe Test Mode Validation](documentation/topics/stripe-test-mode.md)
 
 ## Reference
 
@@ -62,6 +65,8 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 - **Secure Webhook Plug**: Phoenix/Plug endpoint with constant-time HMAC-SHA256 signature verification and replay attack protection.
 - **Automatic Retries via HTTP 500 Protocol**: Responds with HTTP 500 when database synchronization fails, triggering Stripe's automated exponential retry backoff.
 - **Modular Provider Architecture**: Built with an extensible `AshBilling.Provider` behaviour, ready for Stripe, Paddle, LemonSqueezy, and more.
+- **Durable Reconciliation & Quantity Sync**: PostgreSQL-backed `last_reconciled_at` checkpoints, fail-closed `quantity` / `provider_subscription_item_id` synchronization, and live provider re-verification against delayed webhooks.
+- **Diagnostics, Recovery CLI & Reference SaaS**: Built-in `mix ash_billing.doctor`, `mix ash_billing.reconcile`, low-cardinality `:telemetry` metrics, and a runnable Phoenix + AshPostgres SaaS example (`examples/saas_example`).
 - **100% Testable**: Zero external HTTP calls needed during test suites thanks to plug-based stubs and polymorphic extractors.
 
 ---
