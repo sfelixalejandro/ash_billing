@@ -45,7 +45,13 @@ defmodule SaasExampleWeb.ConnCase do
       role: :member
     }
 
-    {:ok, user} = SaasExample.Accounts.register_user(Map.merge(defaults, attrs))
+    merged = Map.merge(defaults, attrs)
+
+    {:ok, user} =
+      case Map.get(merged, :role, :member) do
+        :admin -> SaasExample.Accounts.create_admin_user(merged)
+        _ -> SaasExample.Accounts.register_user(merged)
+      end
 
     user =
       case Map.get(attrs, :stripe_customer_id) do

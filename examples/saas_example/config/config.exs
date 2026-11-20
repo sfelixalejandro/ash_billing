@@ -4,6 +4,7 @@ config :ash,
   default_string_length_count: :codepoints
 
 config :saas_example,
+  env: config_env(),
   ecto_repos: [SaasExample.Repo],
   ash_domains: [
     SaasExample.Accounts,
@@ -22,9 +23,7 @@ config :saas_example, SaasExampleWeb.Endpoint,
   render_errors: [
     formats: [html: SaasExampleWeb.ErrorHTML, json: SaasExampleWeb.ErrorJSON],
     layout: false
-  ],
-  secret_key_base:
-    "dev_only_secret_key_base_override_via_SECRET_KEY_BASE_in_production_1234567890abcdef"
+  ]
 
 config :ash_billing,
   provider: AshBilling.Providers.Stripe,

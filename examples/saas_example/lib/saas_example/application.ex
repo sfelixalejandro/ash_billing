@@ -4,6 +4,8 @@ defmodule SaasExample.Application do
 
   @impl true
   def start(_type, _args) do
+    SaasExample.Security.verify_runtime_config!()
+
     children = [
       SaasExample.Repo,
       SaasExampleWeb.Telemetry,

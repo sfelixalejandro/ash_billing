@@ -7,8 +7,32 @@ if config_env() != :test do
       pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10")
   end
 
-  if secret_key_base = System.get_env("SECRET_KEY_BASE") do
+  if config_env() == :prod do
+    secret_key_base =
+      System.get_env("SECRET_KEY_BASE") ||
+        raise """
+        environment variable SECRET_KEY_BASE is missing.
+        You can generate one by calling: mix phx.gen.secret
+        """
+
+    downcased = String.downcase(secret_key_base)
+
+    if byte_size(secret_key_base) < 64 or
+         Enum.any?(
+           ["dev_only", "test_only", "replace_with", "changeme", "placeholder"],
+           &String.contains?(downcased, &1)
+         ) do
+      raise """
+      Refusing to start saas_example in :prod with a weak, dev, or placeholder SECRET_KEY_BASE.
+      Generate a cryptographically random >= 64-byte secret with `mix phx.gen.secret`.
+      """
+    end
+
     config :saas_example, SaasExampleWeb.Endpoint, secret_key_base: secret_key_base
+  else
+    if secret_key_base = System.get_env("SECRET_KEY_BASE") do
+      config :saas_example, SaasExampleWeb.Endpoint, secret_key_base: secret_key_base
+    end
   end
 
   if api_key = System.get_env("STRIPE_API_KEY") do

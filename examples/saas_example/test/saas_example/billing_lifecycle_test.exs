@@ -57,13 +57,19 @@ defmodule SaasExample.BillingLifecycleTest do
           Req.Test.json(conn, payload)
 
         {"POST", "/v1/subscriptions/sub_life_1"} ->
+          posted_qty =
+            case Regex.run(~r/quantity%5D=(\d+)/, body) do
+              [_, n] -> String.to_integer(n)
+              _ -> 3
+            end
+
           Req.Test.json(
             conn,
             stripe_subscription_payload(
               "sub_life_1",
               "cus_life_1",
               Catalog.price_id!(:pro),
-              3,
+              posted_qty,
               item_id: "si_life_1"
             )
           )

@@ -13,12 +13,28 @@ defmodule SaasExample.Accounts do
     resource SaasExample.Accounts.User
   end
 
+  @doc """
+  Public user registration. Always assigns `role: :member` and ignores any
+  caller-supplied `:role` / `"role"` field to prevent privilege escalation.
+  """
   @spec register_user(map()) :: {:ok, User.t()} | {:error, term()}
   def register_user(attrs) when is_map(attrs) do
+    create_account(attrs, :create)
+  end
+
+  @doc """
+  Administrative user provisioning for trusted seeds or system tooling.
+  Must NEVER be wired to public registration endpoints.
+  """
+  @spec create_admin_user(map()) :: {:ok, User.t()} | {:error, term()}
+  def create_admin_user(attrs) when is_map(attrs) do
+    create_account(attrs, :create_admin)
+  end
+
+  defp create_account(attrs, action) do
     email = attrs |> get_param(:email) |> normalize_string()
     name = attrs |> get_param(:name) |> normalize_string()
     password = get_param(attrs, :password)
-    role = Map.get(attrs, :role, :member)
 
     cond do
       email == "" or not String.contains?(email, "@") ->
@@ -32,11 +48,10 @@ defmodule SaasExample.Accounts do
 
       true ->
         User
-        |> Ash.Changeset.for_create(:create, %{
+        |> Ash.Changeset.for_create(action, %{
           email: email,
           name: name,
-          hashed_password: Password.hash(password),
-          role: role
+          hashed_password: Password.hash(password)
         })
         |> Ash.create(domain: __MODULE__, authorize?: false)
     end

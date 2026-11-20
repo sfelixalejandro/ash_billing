@@ -7,15 +7,20 @@ A complete, runnable **Phoenix + Ash + AshPostgres + AshBilling (0.7.0-dev)** Sa
 ## Features Included
 
 - **Authentication & Actor Freshness (`SaasExample.Accounts`):**
-  - Registration, login, logout, PBKDF2-SHA256 password hashing (native OTP `:crypto.pbkdf2_hmac` + `Plug.Crypto.secure_compare`), CSRF protection, session renewal, and fresh actor + `:subscriptions` reloading on every HTTP request (`SaasExampleWeb.Plugs.AuthPlug`).
+  - Public registration (`Accounts.register_user/1` / `POST /register`) always assigns `role: :member` and ignores any caller-supplied role; administrative provisioning is isolated to `Accounts.create_admin_user/1` (and Ash `:create_admin` policy).
+  - PBKDF2-SHA256 password hashing (native OTP `:crypto.pbkdf2_hmac` + `Plug.Crypto.secure_compare`), CSRF protection, session renewal, and fresh actor + `:subscriptions` reloading on every HTTP request (`SaasExampleWeb.Plugs.AuthPlug`).
 - **Stripe Billing Lifecycle (`SaasExample.Billing`):**
   - Server-controlled plan catalog (`SaasExample.Billing.Catalog`: `starter`, `pro`, `enterprise`) — never trusts arbitrary browser-supplied `price_id`.
   - Stripe Customer persistence prior to Checkout (`AshBilling.create_customer/2` with `persist: true`).
   - Stripe Checkout (`AshBilling.create_checkout_session/2`) and Billing Portal (`AshBilling.create_portal_session/2`).
   - Plan Swaps (`AshBilling.swap_plan/3`) preserving contracted seat quantities.
-  - Per-seat Quantity Updates (`AshBilling.update_quantity/3`) with optimistic `:price_id` assertion and downsize protection (refuses lowering `quantity` below currently active workspace seats).
+  - Per-seat Quantity Updates (`AshBilling.update_quantity/3`) with optimistic `:price_id` assertion, canonical `Customer (users) -> Subscription (subscriptions)` `FOR UPDATE` locking serialized with seat assignments (preventing concurrent downsize/assign races without deadlocking webhooks or reconciliation), bounded HTTP timeouts (`connect_timeout <= 3_000ms`, `receive_timeout <= 5_000ms`, `retry: false`), and immediate atomic local persistence before lock release.
+    - **Pool sizing trade-off:** holding a `FOR UPDATE` row lock across a bounded Stripe HTTP call binds one `SaasExample.Repo` connection per concurrent seat-quantity mutation for up to ~8s worst case (`retry: false`); size `POOL_SIZE` accordingly in deployments with high concurrent billing mutations.
   - Cancellation at period end (`AshBilling.cancel_subscription/2`) and Resume (`AshBilling.resume_subscription/2`).
   - Authoritative Reconciliation (`AshBilling.reconcile_subscription/2`) with `0.6.0` `last_reconciled_at` checkpoints and `0.7.0` `quantity` / `provider_subscription_item_id` sync.
+- **Security & Demo Environment Guards (`SaasExample.Security`, `SaasExample.DemoSeeds`):**
+  - `config/config.exs` contains no hardcoded `secret_key_base`; `:prod` requires a cryptographically random `SECRET_KEY_BASE` (`>= 64` bytes, rejecting dev/placeholder values) at both `config/runtime.exs` and application startup.
+  - Demo seeds with well-known passwords (`password1234`) are strictly blocked in `:prod` and non-dev environments (`SaasExample.DemoSeeds.run!/1`).
 - **Authorization Policies & Transactional Seat Limits (`SaasExample.Workspace`):**
   - `SaasExample.Workspace.Seat`: protected by `AshBilling.Checks.Subscribed` + ownership, with PostgreSQL `FOR UPDATE` row-locked seat enforcement against `subscription.quantity` (fails closed when `quantity` is `nil`, `0`, or full).
   - `SaasExample.Workspace.Report`: protected by `AshBilling.Checks.Subscribed` (`:read`, `:create_for_owner`) and `AshBilling.Checks.HasPrice` (`:export_analytics` for Pro/Enterprise; `:enterprise_audit` for Enterprise only) combined with strict owner isolation.

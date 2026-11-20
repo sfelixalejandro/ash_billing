@@ -12,6 +12,8 @@ config :saas_example, SaasExample.Repo,
 
 config :saas_example, SaasExampleWeb.Endpoint,
   http: [ip: {127, 0, 0, 1}, port: String.to_integer(System.get_env("PORT") || "4000")],
+  secret_key_base:
+    "dev_only_secret_key_base_never_valid_in_prod_0123456789abcdefghijklmnopqrstuvwxyz",
   check_origin: false,
   code_reloader: false,
   debug_errors: true

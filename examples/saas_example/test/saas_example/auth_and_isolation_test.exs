@@ -128,4 +128,141 @@ defmodule SaasExample.AuthAndIsolationTest do
     assert is_nil(reloaded_report.audited_at)
     assert is_nil(reloaded_report.exported_at)
   end
+
+  test "prevents privilege escalation on public registration while keeping administrative creation separate" do
+    # 1. Direct Accounts.register_user/1 ignores atom and string :role inputs
+    assert {:ok, atom_attempt} =
+             Accounts.register_user(%{
+               email: "escalate_atom@example.com",
+               name: "Atom Attacker",
+               password: "password1234",
+               role: :admin
+             })
+
+    assert atom_attempt.role == :member
+
+    assert {:ok, str_attempt} =
+             Accounts.register_user(%{
+               "email" => "escalate_str@example.com",
+               "name" => "String Attacker",
+               "password" => "password1234",
+               "role" => "admin"
+             })
+
+    assert str_attempt.role == :member
+
+    # 2. HTTP POST /register with role=admin always creates :member
+    reg_conn =
+      post(build_conn(), "/register", %{
+        "name" => "HTTP Attacker",
+        "email" => "escalate_http@example.com",
+        "password" => "password1234",
+        "role" => "admin"
+      })
+
+    assert redirected_to(reg_conn) == "/dashboard"
+    user_id = get_session(reg_conn, :user_id)
+    {:ok, registered} = Accounts.load_fresh_actor(user_id)
+    assert registered.role == :member
+
+    # 3. Direct Ash :create_admin action is forbidden for regular member actors
+    assert {:error, %Ash.Error.Forbidden{}} =
+             SaasExample.Accounts.User
+             |> Ash.Changeset.for_create(:create_admin, %{
+               email: "forged_admin@example.com",
+               name: "Forged",
+               hashed_password: SaasExample.Accounts.Password.hash("password1234")
+             })
+             |> Ash.create(domain: Accounts, actor: registered, authorize?: true)
+
+    # 4. Separate administrative provisioning creates :admin
+    assert {:ok, admin} =
+             Accounts.create_admin_user(%{
+               email: "real_admin@example.com",
+               name: "Real Admin",
+               password: "strongpassword99"
+             })
+
+    assert admin.role == :admin
+  end
+
+  test "enforces secure runtime configuration and blocks demo seeds outside local dev/demo environments" do
+    alias SaasExample.{DemoSeeds, Security}
+
+    valid_prod_secret = String.duplicate("a1b2c3d4", 10)
+
+    # Production rejects missing, short, or dev/placeholder secret_key_base
+    assert_raise RuntimeError, ~r/strong SECRET_KEY_BASE/, fn ->
+      Security.verify_runtime_config!(env: :prod, secret_key_base: nil, api_key: "sk_test_123")
+    end
+
+    assert_raise RuntimeError, ~r/strong SECRET_KEY_BASE/, fn ->
+      Security.verify_runtime_config!(
+        env: :prod,
+        secret_key_base: "too_short",
+        api_key: "sk_test_123"
+      )
+    end
+
+    assert_raise RuntimeError, ~r/development or placeholder SECRET_KEY_BASE/, fn ->
+      Security.verify_runtime_config!(
+        env: :prod,
+        secret_key_base:
+          "dev_only_secret_key_base_never_valid_in_prod_0123456789abcdefghijklmnopqrstuvwxyz",
+        api_key: "sk_test_123"
+      )
+    end
+
+    assert_raise RuntimeError, ~r/development or placeholder SECRET_KEY_BASE/, fn ->
+      Security.verify_runtime_config!(
+        env: :prod,
+        secret_key_base:
+          "replace_with_real_secret_key_base_0123456789abcdefghijklmnopqrstuvwxyz0123456789",
+        api_key: "sk_test_123"
+      )
+    end
+
+    # Live Stripe key is rejected unless explicitly opted in
+    assert_raise RuntimeError, ~r/live Stripe API key/, fn ->
+      Security.verify_runtime_config!(
+        env: :prod,
+        secret_key_base: valid_prod_secret,
+        api_key: "sk_live_not_allowed_by_default",
+        allow_stripe_live_mode?: false
+      )
+    end
+
+    # Valid production config passes
+    assert :ok =
+             Security.verify_runtime_config!(
+               env: :prod,
+               secret_key_base: valid_prod_secret,
+               api_key: "sk_test_safe_key",
+               allow_stripe_live_mode?: false
+             )
+
+    # Demo seeds refuse to run in :prod (even if allow_demo_seeds?: true) and in :staging without opt-in
+    assert_raise RuntimeError, ~r/Refusing to seed demo accounts.*:prod/, fn ->
+      DemoSeeds.run!(env: :prod, allow_demo_seeds?: true)
+    end
+
+    assert_raise RuntimeError, ~r/Refusing to seed demo accounts.*:staging/, fn ->
+      DemoSeeds.run!(env: :staging, allow_demo_seeds?: false)
+    end
+
+    # Zero demo users created after blocked seed attempts
+    assert {:ok, []} = Ash.read(SaasExample.Accounts.User, domain: Accounts, authorize?: false)
+
+    # Demo seeds run cleanly and idempotently in :dev
+    assert :ok = DemoSeeds.run!(env: :dev)
+    assert :ok = DemoSeeds.run!(env: :dev)
+
+    {:ok, users} = Ash.read(SaasExample.Accounts.User, domain: Accounts, authorize?: false)
+    roles_by_email = Map.new(users, &{to_string(&1.email), &1.role})
+
+    assert roles_by_email["free@example.com"] == :member
+    assert roles_by_email["starter@example.com"] == :member
+    assert roles_by_email["pro@example.com"] == :member
+    assert roles_by_email["enterprise@example.com"] == :admin
+  end
 end

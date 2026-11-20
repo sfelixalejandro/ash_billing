@@ -48,7 +48,13 @@ defmodule SaasExample.Accounts.User do
 
     create :create do
       primary? true
-      accept [:email, :name, :hashed_password, :role]
+      accept [:email, :name, :hashed_password]
+      change set_attribute(:role, :member)
+    end
+
+    create :create_admin do
+      accept [:email, :name, :hashed_password]
+      change set_attribute(:role, :admin)
     end
 
     update :update do
@@ -58,8 +64,12 @@ defmodule SaasExample.Accounts.User do
   end
 
   policies do
-    policy action_type(:create) do
+    policy action(:create) do
       authorize_if always()
+    end
+
+    policy action(:create_admin) do
+      authorize_if actor_attribute_equals(:role, :admin)
     end
 
     policy action_type(:read) do

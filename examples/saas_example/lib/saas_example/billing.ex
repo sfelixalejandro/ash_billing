@@ -11,7 +11,10 @@ defmodule SaasExample.Billing do
   alias SaasExample.Accounts
   alias SaasExample.Accounts.User
   alias SaasExample.Billing.{Catalog, Subscription}
-  alias SaasExample.Workspace
+  alias SaasExample.{Repo, Workspace}
+
+  @max_locked_connect_timeout_ms 3_000
+  @max_locked_receive_timeout_ms 5_000
 
   resources do
     resource SaasExample.Billing.Subscription
@@ -135,22 +138,65 @@ defmodule SaasExample.Billing do
   @doc """
   Updates contracted seat quantity for an owned subscription.
 
-  Refuses to lower `quantity` below currently active workspace seats before calling
-  Stripe, and supplies the current `price_id` as an optimistic assertion to prevent
-  accidental plan drift.
+  ## Concurrency & Lock Protocol
+
+  Participates in the same canonical PostgreSQL lock order used by
+  `SaasExample.Workspace.assign_seat/3`, `AshBilling.WebhookSync`, and
+  `AshBilling.reconcile_subscription/2`:
+
+      1. `SELECT id FROM users WHERE id = $1 FOR UPDATE` (owner/customer row)
+      2. `SELECT id FROM subscriptions WHERE id = $1 AND user_id = $2 FOR UPDATE`
+
+  This strict `Customer -> Subscription` hierarchy prevents deadlocks with
+  concurrent webhooks/reconciliation while serializing seat downsizing against
+  concurrent seat assignments. Inside the transaction:
+
+    * Verifies `new_quantity >= active_seat_count(user)` before calling Stripe.
+    * Invokes `AshBilling.update_quantity/3` with `retry: false` and bounded
+      timeouts (`connect_timeout <= 3_000ms`, `receive_timeout <= 5_000ms`) plus
+      an optimistic `:price_id` assertion.
+    * Atomically persists the updated `quantity` (and `provider_subscription_item_id`)
+      to PostgreSQL before committing so any waiting `assign_seat` transaction
+      observes the new seat cap immediately upon lock release.
+
+  > #### PostgreSQL Pool Sizing Note
+  > Because the `FOR UPDATE` lock is held across the bounded Stripe HTTP call,
+  > each concurrent seat-quantity mutation occupies one Ecto pool connection for
+  > up to `connect_timeout + receive_timeout` (~8s worst case with `retry: false`).
+  > Size `SaasExample.Repo` `pool_size` accordingly and never enable HTTP retries
+  > inside locked billing transactions.
   """
   @spec update_quantity(User.t(), String.t(), pos_integer(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def update_quantity(%User{} = user, subscription_id, new_quantity, opts \\ []) do
     with :ok <- validate_positive_quantity(new_quantity),
-         {:ok, sub} <- get_user_subscription(user, subscription_id),
-         :ok <- ensure_quantity_covers_active_seats(user, new_quantity) do
-      qty_opts =
-        provider_opts(opts)
-        |> maybe_put(:subscription_item_id, sub.provider_subscription_item_id)
-        |> maybe_put(:price_id, sub.price_id)
+         {:ok, _owned_sub} <- get_user_subscription(user, subscription_id) do
+      case Repo.transaction(fn ->
+             # Canonical lock order: Customer (users) -> Subscription (subscriptions)
+             Repo.query!("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+               Ecto.UUID.dump!(user.id)
+             ])
 
-      AshBilling.update_quantity(sub, new_quantity, qty_opts)
+             Repo.query!(
+               "SELECT id FROM subscriptions WHERE id = $1 AND user_id = $2 FOR UPDATE",
+               [Ecto.UUID.dump!(subscription_id), Ecto.UUID.dump!(user.id)]
+             )
+
+             with {:ok, fresh_sub} <- get_user_subscription(user, subscription_id),
+                  :ok <- ensure_quantity_covers_active_seats(user, new_quantity),
+                  qty_opts = build_locked_quantity_opts(fresh_sub, opts),
+                  {:ok, remote_sub} <-
+                    AshBilling.update_quantity(fresh_sub, new_quantity, qty_opts),
+                  {:ok, _updated_sub} <-
+                    persist_updated_quantity(user, fresh_sub, remote_sub, new_quantity) do
+               remote_sub
+             else
+               {:error, reason} -> Repo.rollback(reason)
+             end
+           end) do
+        {:ok, remote_sub} -> {:ok, remote_sub}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 
@@ -231,6 +277,79 @@ defmodule SaasExample.Billing do
       :ok
     end
   end
+
+  defp build_locked_quantity_opts(sub, opts) do
+    base = provider_opts(opts)
+
+    bounded_req_opts =
+      base
+      |> Keyword.get(:req_opts, [])
+      |> Keyword.put(:retry, false)
+      |> Keyword.update(
+        :receive_timeout,
+        @max_locked_receive_timeout_ms,
+        &Kernel.min(&1, @max_locked_receive_timeout_ms)
+      )
+      |> Keyword.update(
+        :connect_options,
+        [timeout: @max_locked_connect_timeout_ms],
+        fn connect_opts ->
+          Keyword.update(
+            connect_opts,
+            :timeout,
+            @max_locked_connect_timeout_ms,
+            &Kernel.min(&1, @max_locked_connect_timeout_ms)
+          )
+        end
+      )
+
+    base
+    |> Keyword.put(:req_opts, bounded_req_opts)
+    |> maybe_put(:subscription_item_id, sub.provider_subscription_item_id)
+    |> maybe_put(:price_id, sub.price_id)
+  end
+
+  defp persist_updated_quantity(user, sub, remote_sub, requested_quantity) do
+    with {:ok, persisted_qty, item_id} <-
+           extract_persisted_quantity(remote_sub, requested_quantity),
+         :ok <- ensure_quantity_covers_active_seats(user, persisted_qty) do
+      changes =
+        %{quantity: persisted_qty}
+        |> then(fn map ->
+          if is_binary(item_id) and item_id != "" do
+            Map.put(map, :provider_subscription_item_id, item_id)
+          else
+            map
+          end
+        end)
+
+      sub
+      |> Ash.Changeset.for_update(:update, %{})
+      |> Ash.Changeset.force_change_attributes(changes)
+      |> Ash.update(domain: __MODULE__, authorize?: false)
+    end
+  end
+
+  defp extract_persisted_quantity(remote_sub, requested_quantity) when is_map(remote_sub) do
+    if Map.has_key?(remote_sub, "items") do
+      case AshBilling.WebhookSync.extract_live_snapshot(remote_sub) do
+        {:ok, %{quantity: qty, provider_subscription_item_id: item_id}}
+        when is_integer(qty) and qty >= 0 ->
+          {:ok, qty, item_id}
+
+        {:ok, _snapshot} ->
+          {:ok, requested_quantity, nil}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:ok, requested_quantity, nil}
+    end
+  end
+
+  defp extract_persisted_quantity(_remote_sub, requested_quantity),
+    do: {:ok, requested_quantity, nil}
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, _key, ""), do: opts

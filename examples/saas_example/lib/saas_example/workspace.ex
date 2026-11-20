@@ -40,21 +40,29 @@ defmodule SaasExample.Workspace do
 
   @doc """
   Assigns a new workspace seat inside a PostgreSQL transaction serialized by a
-  `FOR UPDATE` lock on the owner's row, preventing concurrent requests from
-  exceeding `subscription.quantity`.
+  `FOR UPDATE` lock on the owner's row, preventing concurrent requests (including
+  concurrent `SaasExample.Billing.update_quantity/4` reductions) from exceeding
+  `subscription.quantity`.
   """
-  @spec assign_seat(User.t(), String.t()) :: {:ok, Seat.t()} | {:error, term()}
-  def assign_seat(%User{id: owner_id}, member_email) when is_binary(member_email) do
+  @spec assign_seat(User.t(), String.t(), keyword()) :: {:ok, Seat.t()} | {:error, term()}
+  def assign_seat(actor, member_email, opts \\ [])
+
+  def assign_seat(%User{id: owner_id}, member_email, opts) when is_binary(member_email) do
     email = String.trim(member_email)
 
     if email == "" or not String.contains?(email, "@") do
       {:error, :invalid_member_email}
     else
       case Repo.transaction(fn ->
-             # Canonical row lock on the owner prevents concurrent seat over-allocation
+             # Canonical row lock on the owner (users) matches Billing.update_quantity/4,
+             # AshBilling.WebhookSync, and AshBilling.reconcile_subscription/2
              Repo.query!("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
                Ecto.UUID.dump!(owner_id)
              ])
+
+             if on_locked = Keyword.get(opts, :on_locked) do
+               on_locked.()
+             end
 
              with {:ok, fresh_actor} <- Accounts.load_fresh_actor(owner_id),
                   :ok <- verify_seat_capacity(fresh_actor),
@@ -75,7 +83,7 @@ defmodule SaasExample.Workspace do
     end
   end
 
-  def assign_seat(_, _), do: {:error, :invalid_member_email}
+  def assign_seat(_, _, _), do: {:error, :invalid_member_email}
 
   @doc """
   Revokes an owned active seat, immediately freeing capacity.

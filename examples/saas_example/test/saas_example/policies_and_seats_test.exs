@@ -171,4 +171,200 @@ defmodule SaasExample.PoliciesAndSeatsTest do
     {:ok, nil_user} = Accounts.load_fresh_actor(nil_user.id)
     assert {:error, :no_contracted_seats} = Workspace.assign_seat(nil_user, "x@nil.example")
   end
+
+  test "deterministically serializes concurrent quantity downsize (2 -> 1) against seat assignment in BOTH lock orders" do
+    # -------------------------------------------------------------------------
+    # Interleaving A: update_quantity(2 -> 1) acquires lock first; assign_seat waits
+    # -------------------------------------------------------------------------
+    user_a = create_user!(%{email: "race_a@example.com", stripe_customer_id: "cus_race_a"})
+
+    sub_a =
+      create_subscription!(user_a, %{
+        provider_subscription_id: "sub_race_a",
+        price_id: Catalog.price_id!(:pro),
+        quantity: 2,
+        provider_subscription_item_id: "si_race_a"
+      })
+
+    {:ok, user_a} = Accounts.load_fresh_actor(user_a.id)
+    assert {:ok, _seat1} = Workspace.assign_seat(user_a, "existing_a@team.example")
+    assert Workspace.active_seat_count(user_a) == 1
+
+    {:ok, stripe_state_a} = Agent.start_link(fn -> %{quantity: 2, updates: 0} end)
+    test_pid = self()
+
+    configure_stripe_stub(:stripe_race_a, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      case {conn.method, conn.request_path} do
+        {"GET", "/v1/subscriptions/sub_race_a"} ->
+          qty = Agent.get(stripe_state_a, & &1.quantity)
+
+          Req.Test.json(
+            conn,
+            stripe_subscription_payload(
+              "sub_race_a",
+              "cus_race_a",
+              Catalog.price_id!(:pro),
+              qty,
+              item_id: "si_race_a"
+            )
+          )
+
+        {"POST", "/v1/subscriptions/sub_race_a"} ->
+          # Pause deterministically while update_quantity holds users + subscriptions FOR UPDATE locks
+          send(test_pid, {:stripe_update_entered, self()})
+
+          receive do
+            :release_stripe_update -> :ok
+          after
+            5_000 -> flunk("Timed out waiting to release Stripe stub")
+          end
+
+          [_, qty_str] = Regex.run(~r/quantity%5D=(\d+)/, body)
+          new_qty = String.to_integer(qty_str)
+
+          Agent.update(stripe_state_a, fn st ->
+            %{st | quantity: new_qty, updates: st.updates + 1}
+          end)
+
+          Req.Test.json(
+            conn,
+            stripe_subscription_payload(
+              "sub_race_a",
+              "cus_race_a",
+              Catalog.price_id!(:pro),
+              new_qty,
+              item_id: "si_race_a"
+            )
+          )
+      end
+    end)
+
+    qty_task_a =
+      Task.async(fn ->
+        Billing.update_quantity(user_a, sub_a.id, 1)
+      end)
+
+    assert_receive {:stripe_update_entered, stripe_stub_pid}, 5_000
+
+    # Launch racing seat assignment while update_quantity holds the PostgreSQL FOR UPDATE lock
+    seat_task_a =
+      Task.async(fn ->
+        Workspace.assign_seat(user_a, "racing_seat2_a@team.example")
+      end)
+
+    # Deterministically verify via PostgreSQL pg_stat_activity that seat_task_a is blocked on the row lock
+    wait_for_pg_lock_wait!()
+
+    # Release Stripe HTTP call so update_quantity finishes and commits quantity = 1
+    send(stripe_stub_pid, :release_stripe_update)
+
+    assert {:ok, _remote_sub} = Task.await(qty_task_a, 5_000)
+    assert {:error, {:seat_limit_reached, 1, 1}} = Task.await(seat_task_a, 5_000)
+
+    # Verify final invariant in BOTH simulated Stripe and PostgreSQL: active_seats (1) <= quantity (1)
+    assert Agent.get(stripe_state_a, & &1) == %{quantity: 1, updates: 1}
+
+    reloaded_sub_a =
+      Ash.get!(SaasExample.Billing.Subscription, sub_a.id, domain: Billing, authorize?: false)
+
+    assert reloaded_sub_a.quantity == 1
+    assert Workspace.active_seat_count(user_a) == 1
+
+    # -------------------------------------------------------------------------
+    # Interleaving B: assign_seat acquires lock first; update_quantity(2 -> 1) waits
+    # -------------------------------------------------------------------------
+    user_b = create_user!(%{email: "race_b@example.com", stripe_customer_id: "cus_race_b"})
+
+    sub_b =
+      create_subscription!(user_b, %{
+        provider_subscription_id: "sub_race_b",
+        price_id: Catalog.price_id!(:pro),
+        quantity: 2,
+        provider_subscription_item_id: "si_race_b"
+      })
+
+    {:ok, user_b} = Accounts.load_fresh_actor(user_b.id)
+    assert {:ok, _seat1} = Workspace.assign_seat(user_b, "existing_b@team.example")
+    assert Workspace.active_seat_count(user_b) == 1
+
+    {:ok, stripe_state_b} = Agent.start_link(fn -> %{quantity: 2, updates: 0} end)
+
+    configure_stripe_stub(:stripe_race_b, fn conn ->
+      Agent.update(stripe_state_b, fn st -> %{st | updates: st.updates + 1} end)
+
+      conn
+      |> Plug.Conn.put_status(500)
+      |> Req.Test.json(%{"error" => %{"message" => "Stripe should not be called"}})
+    end)
+
+    seat_task_b =
+      Task.async(fn ->
+        Workspace.assign_seat(user_b, "racing_seat2_b@team.example",
+          on_locked: fn ->
+            send(test_pid, {:seat_lock_acquired, self()})
+
+            receive do
+              :release_seat_lock -> :ok
+            after
+              5_000 -> flunk("Timed out waiting to release seat lock")
+            end
+          end
+        )
+      end)
+
+    assert_receive {:seat_lock_acquired, seat_worker_pid}, 5_000
+
+    # Launch racing quantity downsize while assign_seat holds the PostgreSQL FOR UPDATE lock
+    qty_task_b =
+      Task.async(fn ->
+        Billing.update_quantity(user_b, sub_b.id, 1)
+      end)
+
+    # Deterministically verify via PostgreSQL pg_stat_activity that qty_task_b is blocked on the row lock
+    wait_for_pg_lock_wait!()
+
+    # Release assign_seat so seat #2 commits first (active_seats becomes 2)
+    send(seat_worker_pid, :release_seat_lock)
+
+    assert {:ok, _seat2} = Task.await(seat_task_b, 5_000)
+    assert {:error, {:seats_exceed_new_quantity, 2}} = Task.await(qty_task_b, 5_000)
+
+    # Verify final invariant in BOTH simulated Stripe (0 calls!) and PostgreSQL: active_seats (2) <= quantity (2)
+    assert Agent.get(stripe_state_b, & &1) == %{quantity: 2, updates: 0}
+
+    reloaded_sub_b =
+      Ash.get!(SaasExample.Billing.Subscription, sub_b.id, domain: Billing, authorize?: false)
+
+    assert reloaded_sub_b.quantity == 2
+    assert Workspace.active_seat_count(user_b) == 2
+  end
+
+  defp wait_for_pg_lock_wait!(deadline_ms \\ System.monotonic_time(:millisecond) + 5_000) do
+    %{rows: [[waiting_count]]} =
+      Ecto.Adapters.SQL.query!(
+        SaasExample.Repo,
+        """
+        SELECT count(*)
+        FROM pg_stat_activity
+        WHERE datname = current_database()
+          AND pid <> pg_backend_pid()
+          AND wait_event_type = 'Lock'
+        """,
+        []
+      )
+
+    cond do
+      waiting_count >= 1 ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline_ms ->
+        flunk("Timed out waiting for PostgreSQL FOR UPDATE lock contention in pg_stat_activity")
+
+      true ->
+        :erlang.yield()
+        wait_for_pg_lock_wait!(deadline_ms)
+    end
+  end
 end
