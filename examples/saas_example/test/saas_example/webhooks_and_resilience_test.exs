@@ -200,4 +200,111 @@ defmodule SaasExample.WebhooksAndResilienceTest do
     assert reloaded.price_id == Catalog.price_id!(:pro)
     assert reloaded.quantity == 4
   end
+
+  test "recovers consistency via reconciliation when Stripe confirms quantity change but PostgreSQL fails before commit" do
+    user = create_user!(%{email: "partial_fail@example.com", stripe_customer_id: "cus_pf_1"})
+
+    sub =
+      create_subscription!(user, %{
+        provider_subscription_id: "sub_pf_1",
+        price_id: Catalog.price_id!(:pro),
+        quantity: 2,
+        provider_subscription_item_id: "si_pf_1",
+        last_reconciled_at: nil
+      })
+
+    {:ok, user} = Accounts.load_fresh_actor(user.id)
+
+    {:ok, stripe_state} =
+      Agent.start_link(fn -> %{quantity: 2, get_count: 0, post_count: 0} end)
+
+    configure_stripe_stub(:stripe_partial_failure, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      case {conn.method, conn.request_path} do
+        {"GET", "/v1/subscriptions/sub_pf_1"} ->
+          qty =
+            Agent.get_and_update(stripe_state, fn st ->
+              {st.quantity, %{st | get_count: st.get_count + 1}}
+            end)
+
+          Req.Test.json(
+            conn,
+            stripe_subscription_payload(
+              "sub_pf_1",
+              "cus_pf_1",
+              Catalog.price_id!(:pro),
+              qty,
+              item_id: "si_pf_1"
+            )
+          )
+
+        {"POST", "/v1/subscriptions/sub_pf_1"} ->
+          [_, qty_str] = Regex.run(~r/quantity%5D=(\d+)/, body)
+          new_qty = String.to_integer(qty_str)
+
+          Agent.update(stripe_state, fn st ->
+            %{st | quantity: new_qty, post_count: st.post_count + 1}
+          end)
+
+          Req.Test.json(
+            conn,
+            stripe_subscription_payload(
+              "sub_pf_1",
+              "cus_pf_1",
+              Catalog.price_id!(:pro),
+              new_qty,
+              item_id: "si_pf_1"
+            )
+          )
+      end
+    end)
+
+    # 1. Stripe confirms quantity 2 -> 5 (GET + POST = 2 HTTP calls), then PostgreSQL fails before commit
+    assert {:error, :simulated_postgres_commit_failure} =
+             Billing.update_quantity(user, sub.id, 5,
+               on_before_commit: fn -> {:error, :simulated_postgres_commit_failure} end
+             )
+
+    # Verify Stripe confirmed quantity=5 (exact 1 GET + 1 POST), while PostgreSQL rolled back cleanly to 2
+    assert Agent.get(stripe_state, & &1) == %{quantity: 5, get_count: 1, post_count: 1}
+    rolled_back = Ash.get!(Subscription, sub.id, domain: Billing, authorize?: false)
+    assert rolled_back.quantity == 2
+    assert is_nil(rolled_back.last_reconciled_at)
+
+    # 2. Subsequent reconciliation recovers PostgreSQL to quantity=5 via read-only GET (0 duplicate POSTs!)
+    assert {:ok, reconciled} = Billing.reconcile_user_subscription(user, sub.id)
+    assert reconciled.quantity == 5
+    assert reconciled.provider_subscription_item_id == "si_pf_1"
+    assert %DateTime{} = reconciled.last_reconciled_at
+    assert Agent.get(stripe_state, & &1) == %{quantity: 5, get_count: 2, post_count: 1}
+
+    # 3. Repeated reconciliation & delayed webhook are strictly idempotent (zero duplicate/invented mutations)
+    assert {:ok, reconciled_again} = Billing.reconcile_user_subscription(user, sub.id)
+    assert reconciled_again.quantity == 5
+    assert Agent.get(stripe_state, & &1).post_count == 1
+
+    delayed_webhook = %{
+      "id" => "evt_pf_delayed_1",
+      "type" => "customer.subscription.updated",
+      "livemode" => false,
+      "created" => System.system_time(:second),
+      "data" => %{
+        "object" =>
+          stripe_subscription_payload(
+            "sub_pf_1",
+            "cus_pf_1",
+            Catalog.price_id!(:pro),
+            5,
+            item_id: "si_pf_1"
+          )
+      }
+    }
+
+    assert post_signed_webhook(build_conn(), delayed_webhook).status == 200
+
+    final_sub = Ash.get!(Subscription, sub.id, domain: Billing, authorize?: false)
+    assert final_sub.quantity == 5
+    assert Agent.get(stripe_state, & &1).post_count == 1
+  end
 end

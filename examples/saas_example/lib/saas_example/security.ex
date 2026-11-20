@@ -35,7 +35,8 @@ defmodule SaasExample.Security do
 
     api_key =
       Keyword.get_lazy(opts, :api_key, fn ->
-        Application.get_env(:ash_billing, :api_key)
+        Application.get_env(:ash_billing, :stripe_api_key) ||
+          Application.get_env(:ash_billing, :api_key)
       end)
 
     allow_live? =

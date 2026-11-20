@@ -1,6 +1,6 @@
 # AshBilling Runnable SaaS Reference Application (`examples/saas_example`)
 
-A complete, runnable **Phoenix + Ash + AshPostgres + AshBilling (0.7.0-dev)** SaaS application demonstrating end-to-end subscription billing, per-seat quantity enforcement, Ash policy authorization (`Subscribed` & `HasPrice`), HMAC-verified webhooks with PostgreSQL deduplication, authoritative reconciliation, and operational CLIs (`mix ash_billing.doctor` & `mix ash_billing.reconcile`).
+A complete, runnable **Phoenix + Ash + AshPostgres + AshBilling (0.7.0)** SaaS application demonstrating end-to-end subscription billing, per-seat quantity enforcement, Ash policy authorization (`Subscribed` & `HasPrice`), HMAC-verified webhooks with PostgreSQL deduplication, authoritative reconciliation, and operational CLIs (`mix ash_billing.doctor` & `mix ash_billing.reconcile`).
 
 ---
 
@@ -15,7 +15,7 @@ A complete, runnable **Phoenix + Ash + AshPostgres + AshBilling (0.7.0-dev)** Sa
   - Stripe Checkout (`AshBilling.create_checkout_session/2`) and Billing Portal (`AshBilling.create_portal_session/2`).
   - Plan Swaps (`AshBilling.swap_plan/3`) preserving contracted seat quantities.
   - Per-seat Quantity Updates (`AshBilling.update_quantity/3`) with optimistic `:price_id` assertion, canonical `Customer (users) -> Subscription (subscriptions)` `FOR UPDATE` locking serialized with seat assignments (preventing concurrent downsize/assign races without deadlocking webhooks or reconciliation), bounded HTTP timeouts (`connect_timeout <= 3_000ms`, `receive_timeout <= 5_000ms`, `retry: false`), and immediate atomic local persistence before lock release.
-    - **Pool sizing trade-off:** holding a `FOR UPDATE` row lock across a bounded Stripe HTTP call binds one `SaasExample.Repo` connection per concurrent seat-quantity mutation for up to ~8s worst case (`retry: false`); size `POOL_SIZE` accordingly in deployments with high concurrent billing mutations.
+    - **Lock hold & pool sizing trade-off:** because `:price_id` optimistic verification triggers **2 sequential Stripe HTTP calls** (`GET /v1/subscriptions/{id}` + `POST /v1/subscriptions/{id}`), each concurrent seat-quantity mutation holds its `FOR UPDATE` lock and one `SaasExample.Repo` pool connection for **up to 16 seconds worst case** (`2 × (3s connect + 5s receive)` with `retry: false`; `Repo.transaction` uses `timeout: 20_000` so Ecto does not abort mid-flight before the 16s HTTP ceiling). If PostgreSQL rolls back after Stripe confirms the `POST`, `reconcile_user_subscription/3` (or the Stripe webhook) recovers local consistency via read-only `GET` without duplicating financial mutations. Size `POOL_SIZE` accordingly in deployments with high concurrent billing mutations.
   - Cancellation at period end (`AshBilling.cancel_subscription/2`) and Resume (`AshBilling.resume_subscription/2`).
   - Authoritative Reconciliation (`AshBilling.reconcile_subscription/2`) with `0.6.0` `last_reconciled_at` checkpoints and `0.7.0` `quantity` / `provider_subscription_item_id` sync.
 - **Security & Demo Environment Guards (`SaasExample.Security`, `SaasExample.DemoSeeds`):**

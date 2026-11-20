@@ -17,7 +17,9 @@ defmodule SaasExampleWeb.Plugs.StripeWebhookPlug do
     runtime_opts =
       [
         provider: Application.get_env(:ash_billing, :provider, AshBilling.Providers.Stripe),
-        api_key: Application.get_env(:ash_billing, :api_key),
+        api_key:
+          Application.get_env(:ash_billing, :stripe_api_key) ||
+            Application.get_env(:ash_billing, :api_key),
         webhook_secret: Application.get_env(:ash_billing, :webhook_secret),
         expected_livemode: Application.get_env(:ash_billing, :expected_livemode, false),
         req_opts: Application.get_env(:ash_billing, :req_opts, []),

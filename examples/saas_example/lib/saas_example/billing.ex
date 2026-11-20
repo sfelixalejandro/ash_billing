@@ -34,7 +34,9 @@ defmodule SaasExample.Billing do
 
     base = [
       provider: Application.get_env(:ash_billing, :provider, AshBilling.Providers.Stripe),
-      api_key: Application.get_env(:ash_billing, :api_key),
+      api_key:
+        Application.get_env(:ash_billing, :stripe_api_key) ||
+          Application.get_env(:ash_billing, :api_key),
       req_opts: req_opts
     ]
 
@@ -159,41 +161,57 @@ defmodule SaasExample.Billing do
       to PostgreSQL before committing so any waiting `assign_seat` transaction
       observes the new seat cap immediately upon lock release.
 
-  > #### PostgreSQL Pool Sizing Note
-  > Because the `FOR UPDATE` lock is held across the bounded Stripe HTTP call,
-  > each concurrent seat-quantity mutation occupies one Ecto pool connection for
-  > up to `connect_timeout + receive_timeout` (~8s worst case with `retry: false`).
-  > Size `SaasExample.Repo` `pool_size` accordingly and never enable HTTP retries
-  > inside locked billing transactions.
+  > #### Lock Hold Ceiling & PostgreSQL Pool Sizing Note
+  > Because `:price_id` is passed as an optimistic price assertion,
+  > `AshBilling.update_quantity/3` performs **2 sequential Stripe HTTP calls**
+  > (`GET /v1/subscriptions/{id}` + `POST /v1/subscriptions/{id}`) while holding
+  > the `FOR UPDATE` locks. With `connect_timeout <= 3_000ms`,
+  > `receive_timeout <= 5_000ms`, and `retry: false`, the combined worst-case
+  > lock hold time is **up to 16 seconds** (`2 × 8s`), which exceeds Ecto's
+  > default `15_000ms` transaction timeout; this transaction therefore sets
+  > `timeout: 20_000`. Size `SaasExample.Repo` `pool_size` accordingly and never
+  > enable HTTP retries inside locked billing transactions.
+  >
+  > If Stripe confirms the `POST` mutation and PostgreSQL fails before commit,
+  > the local transaction rolls back cleanly and subsequent reconciliation
+  > (`reconcile_user_subscription/3` or Stripe's signed webhook) converges
+  > PostgreSQL via read-only `GET` without duplicating financial changes.
   """
   @spec update_quantity(User.t(), String.t(), pos_integer(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def update_quantity(%User{} = user, subscription_id, new_quantity, opts \\ []) do
     with :ok <- validate_positive_quantity(new_quantity),
          {:ok, _owned_sub} <- get_user_subscription(user, subscription_id) do
-      case Repo.transaction(fn ->
-             # Canonical lock order: Customer (users) -> Subscription (subscriptions)
-             Repo.query!("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
-               Ecto.UUID.dump!(user.id)
-             ])
+      on_before_commit = Keyword.get(opts, :on_before_commit)
+      provider_call_opts = Keyword.delete(opts, :on_before_commit)
 
-             Repo.query!(
-               "SELECT id FROM subscriptions WHERE id = $1 AND user_id = $2 FOR UPDATE",
-               [Ecto.UUID.dump!(subscription_id), Ecto.UUID.dump!(user.id)]
-             )
+      case Repo.transaction(
+             fn ->
+               # Canonical lock order: Customer (users) -> Subscription (subscriptions)
+               Repo.query!("SELECT id FROM users WHERE id = $1 FOR UPDATE", [
+                 Ecto.UUID.dump!(user.id)
+               ])
 
-             with {:ok, fresh_sub} <- get_user_subscription(user, subscription_id),
-                  :ok <- ensure_quantity_covers_active_seats(user, new_quantity),
-                  qty_opts = build_locked_quantity_opts(fresh_sub, opts),
-                  {:ok, remote_sub} <-
-                    AshBilling.update_quantity(fresh_sub, new_quantity, qty_opts),
-                  {:ok, _updated_sub} <-
-                    persist_updated_quantity(user, fresh_sub, remote_sub, new_quantity) do
-               remote_sub
-             else
-               {:error, reason} -> Repo.rollback(reason)
-             end
-           end) do
+               Repo.query!(
+                 "SELECT id FROM subscriptions WHERE id = $1 AND user_id = $2 FOR UPDATE",
+                 [Ecto.UUID.dump!(subscription_id), Ecto.UUID.dump!(user.id)]
+               )
+
+               with {:ok, fresh_sub} <- get_user_subscription(user, subscription_id),
+                    :ok <- ensure_quantity_covers_active_seats(user, new_quantity),
+                    qty_opts = build_locked_quantity_opts(fresh_sub, provider_call_opts),
+                    {:ok, remote_sub} <-
+                      AshBilling.update_quantity(fresh_sub, new_quantity, qty_opts),
+                    {:ok, _updated_sub} <-
+                      persist_updated_quantity(user, fresh_sub, remote_sub, new_quantity),
+                    :ok <- run_before_commit_hook(on_before_commit) do
+                 remote_sub
+               else
+                 {:error, reason} -> Repo.rollback(reason)
+               end
+             end,
+             timeout: 20_000
+           ) do
         {:ok, remote_sub} -> {:ok, remote_sub}
         {:error, reason} -> {:error, reason}
       end
@@ -350,6 +368,9 @@ defmodule SaasExample.Billing do
 
   defp extract_persisted_quantity(_remote_sub, requested_quantity),
     do: {:ok, requested_quantity, nil}
+
+  defp run_before_commit_hook(nil), do: :ok
+  defp run_before_commit_hook(fun) when is_function(fun, 0), do: fun.()
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, _key, ""), do: opts

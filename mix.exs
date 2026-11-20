@@ -1,7 +1,7 @@
 defmodule AshBilling.MixProject do
   use Mix.Project
 
-  @version "0.7.0-dev"
+  @version "0.7.0"
   @description "Declarative billing, subscriptions, and payment providers for the Ash Framework."
   @source_url "https://github.com/sfelixalejandro/ash_billing"
 
@@ -149,7 +149,9 @@ defmodule AshBilling.MixProject do
           AshBilling.WebhookEvent
         ],
         "Mix Tasks": [
-          Mix.Tasks.AshBilling.Install
+          Mix.Tasks.AshBilling.Install,
+          Mix.Tasks.AshBilling.Doctor,
+          Mix.Tasks.AshBilling.Reconcile
         ]
       ]
     ]

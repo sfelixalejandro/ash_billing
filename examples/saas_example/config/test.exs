@@ -16,7 +16,7 @@ config :saas_example, SaasExampleWeb.Endpoint,
   server: false
 
 config :ash_billing,
-  api_key: "sk_test_saas_example_test_key",
+  stripe_api_key: "sk_test_saas_example_test_key",
   webhook_secret: "whsec_saas_example_test_secret",
   expected_livemode: false,
   req_opts: [

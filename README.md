@@ -68,12 +68,15 @@ Inspired by Laravel Cashier and Rails Pay, `ash_billing` offers a unified, decla
 
 ## Installation
 
-Version **0.6.0** adds durable PostgreSQL reconciliation checkpoints (`last_reconciled_at`),
-fail-safe live provider re-verification for post-reconciliation financial changes, and
-automatic healing of ahead `0.5.x` synthetic event cursors.
-Read [Upgrading to 0.6](documentation/topics/upgrading-to-0.6.md) before updating from `0.5.x`
-(requires adding the nullable `last_reconciled_at` column). For earlier upgrades, see
-[Upgrading to 0.5](documentation/topics/upgrading-to-0.5.md) and
+Version **0.7.0** adds PostgreSQL persistence and synchronization for subscription `quantity`
+and `provider_subscription_item_id`, layered diagnostics (`AshBilling.Diagnostics` &
+`mix ash_billing.doctor`), a safe drift-inspection and reconciliation CLI (`AshBilling.Reconciler`
+& `mix ash_billing.reconcile`), low-cardinality observability telemetry, and a runnable
+Phoenix + Ash + AshPostgres SaaS reference application (`examples/saas_example`).
+Read [Upgrading to 0.7](documentation/topics/upgrading-to-0.7.md) before updating from `0.6.0`
+(requires adding nullable `quantity` and `provider_subscription_item_id` columns). For earlier
+upgrades, see [Upgrading to 0.6](documentation/topics/upgrading-to-0.6.md),
+[Upgrading to 0.5](documentation/topics/upgrading-to-0.5.md), and
 [Upgrading to 0.4](documentation/topics/upgrading-to-0.4.md).
 
 `ash_billing` is available on [Hex.pm](https://hex.pm/packages/ash_billing).
@@ -91,7 +94,7 @@ Alternatively, you can install it manually by adding `ash_billing` to your `mix.
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.6.0"}
+    {:ash_billing, "~> 0.7.0"}
   ]
 end
 ```

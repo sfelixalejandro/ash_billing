@@ -25,7 +25,7 @@ Add `ash_billing` to your `mix.exs`:
 ```elixir
 def deps do
   [
-    {:ash_billing, "~> 0.6.0"}
+    {:ash_billing, "~> 0.7.0"}
   ]
 end
 ```
@@ -276,6 +276,14 @@ AshBilling.verify_configuration!(
   webhook_secret: System.get_env("STRIPE_WEBHOOK_SECRET")
 )
 ```
+
+## Upgrading to 0.7.0
+
+See [Upgrading to 0.7](../topics/upgrading-to-0.7.md) for the required PostgreSQL migration
+adding `quantity` and `provider_subscription_item_id`, fail-closed quantity validation rules,
+partial-failure reconciliation recovery, and locked HTTP timeout ceilings, and
+[Diagnostics, Recovery CLI & Observability](../topics/observability-and-diagnostics.md) for
+`mix ash_billing.doctor`, `mix ash_billing.reconcile`, and Telemetry metrics.
 
 ## Upgrading to 0.6.0
 
