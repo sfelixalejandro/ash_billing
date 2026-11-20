@@ -35,7 +35,7 @@ if config_env() != :test do
     end
   end
 
-  if api_key = System.get_env("STRIPE_API_KEY") do
+  if api_key = System.get_env("STRIPE_SECRET_KEY") || System.get_env("STRIPE_API_KEY") do
     if String.starts_with?(api_key, "sk_live_") and
          System.get_env("ALLOW_STRIPE_LIVE_MODE") != "true" do
       raise """
@@ -44,7 +44,7 @@ if config_env() != :test do
       """
     end
 
-    config :ash_billing, :api_key, api_key
+    config :ash_billing, :stripe_api_key, api_key
   end
 
   if webhook_secret = System.get_env("STRIPE_WEBHOOK_SECRET") do

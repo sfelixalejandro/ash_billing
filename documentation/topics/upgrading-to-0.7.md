@@ -76,3 +76,55 @@ Both `quantity` and `provider_subscription_item_id` are automatically excluded f
 - **Normal flow (eventual consistency):** Stripe emits a signed `customer.subscription.updated` webhook, which `AshBilling.Plug` / `AshBilling.WebhookSync` processes transactionally to update PostgreSQL `quantity` and `price_id`.
 - **When explicit reconciliation is required:** If your application needs immediate read-after-write convergence in PostgreSQL (for example, before allowing a newly purchased seat to be assigned) or when webhooks are delayed/dropped, call `AshBilling.reconcile_subscription/2` explicitly after the provider mutation.
 - **Custom providers without `@callback update_quantity/3`:** Legacy fallback to `swap_plan/3` remains unchanged for backwards compatibility; implement `@callback update_quantity/3` in custom providers to avoid price-clobbering risks if a stale `:price_id` is passed.
+
+### 4. Partial Failure Recovery (Stripe Confirmed, PostgreSQL Failed Before Commit)
+
+When an application wraps `AshBilling.update_quantity/3` and a local PostgreSQL write inside the same transaction (as demonstrated in `examples/saas_example` to serialize seat downsizing against concurrent seat assignments), a PostgreSQL failure or rollback **after** Stripe has already returned HTTP `200` leaves an intentional temporary divergence:
+
+- **Stripe** holds the confirmed new quantity (authoritative source of truth).
+- **PostgreSQL** rolled back cleanly to the pre-mutation snapshot without partial writes or corruption.
+
+**Recovery protocol (no duplicate mutations):**
+
+1. **Do NOT blindly repeat the outbound Stripe `POST`** without an idempotency key or prior state check.
+2. Either let Stripe's signed `customer.subscription.updated` webhook converge PostgreSQL automatically, or run `AshBilling.reconcile_subscription/2` (or `mix ash_billing.reconcile --execute --confirm`).
+3. Reconciliation executes a read-only `GET /v1/subscriptions/{id}` against Stripe under canonical `Customer -> Subscription` `FOR UPDATE` locks and commits the authoritative `quantity`, `provider_subscription_item_id`, and `last_reconciled_at` atomically. Subsequent reconciliations or delayed webhooks are strictly idempotent and never invent or duplicate financial mutations.
+
+### 5. Locked `update_quantity/3` HTTP Requests & Maximum Lock Hold Time
+
+When calling `AshBilling.update_quantity/3` while holding a PostgreSQL `FOR UPDATE` lock (for example, to serialize seat downsizing against seat assignment), count **all** sequential HTTP requests executed by `update_quantity/3`:
+
+| Call pattern | Outbound Stripe HTTP calls | Worst-case HTTP hold (`connect: 3s, receive: 5s, retry: false`) |
+| --- | --- | --- |
+| With `:price_id` optimistic assertion (or without `:subscription_item_id`) | **2 sequential requests:** `GET /v1/subscriptions/{id}` + `POST /v1/subscriptions/{id}` | **Up to 16 seconds** (`2 × (3s + 5s)`) |
+| With `:subscription_item_id` and **without** `:price_id` | **1 request:** `POST /v1/subscriptions/{id}` | **Up to 8 seconds** (`3s + 5s`) |
+
+Operational consequences for PostgreSQL:
+
+- **Transaction timeout alignment:** Ecto's default `Repo.transaction/2` timeout is `15_000ms` (15s), which is shorter than the **16s** combined worst-case timeout of 2 sequential HTTP requests (`GET` + `POST`). Set an explicit transaction timeout above the combined HTTP ceiling (e.g., `timeout: 20_000`) or tighten `receive_timeout` (e.g., `3_000ms`) so Ecto does not abort a transaction mid-flight while waiting on the second response.
+- **Connection pool sizing:** Always enforce `retry: false` inside locked transactions and size `Repo` `pool_size` so concurrent billing mutations cannot starve normal web/webhook traffic during Stripe latency spikes.
+
+### 6. Post-Upgrade Verification with CLI Tools
+
+After deploying `0.7.0`, verify schema migrations, unique indexes, `WebhookEvent` privacy, and bounded HTTP timeouts with:
+
+```bash
+mix ash_billing.doctor \
+  --customer-resource MyApp.Accounts.User \
+  --subscription-resource MyApp.Billing.Subscription \
+  --deduplication-resource MyApp.Billing.WebhookEvent \
+  --expected-livemode true \
+  --strict
+```
+
+To inspect `0.6.0` rows with `quantity IS NULL` safely before writing, run:
+
+```bash
+mix ash_billing.reconcile \
+  --domain MyApp.Billing \
+  --subscription-resource MyApp.Billing.Subscription \
+  --missing-quantity \
+  --system
+```
+
+See [Diagnostics, Recovery CLI & Observability](observability-and-diagnostics.md) for full CLI flags and `Telemetry.Metrics` dashboards.

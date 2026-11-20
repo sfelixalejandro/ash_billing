@@ -19,6 +19,9 @@ config :saas_example, SaasExampleWeb.Endpoint,
   debug_errors: true
 
 config :ash_billing,
-  api_key: System.get_env("STRIPE_API_KEY") || "sk_test_local_dev_placeholder",
+  stripe_api_key:
+    System.get_env("STRIPE_SECRET_KEY") ||
+      System.get_env("STRIPE_API_KEY") ||
+      "sk_test_local_dev_placeholder",
   webhook_secret: System.get_env("STRIPE_WEBHOOK_SECRET") || "whsec_local_dev_placeholder",
   expected_livemode: false
