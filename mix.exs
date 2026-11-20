@@ -107,6 +107,8 @@ defmodule AshBilling.MixProject do
          title: "Getting Started with AshBilling"},
         {"documentation/topics/webhooks-and-resilience.md",
          title: "Webhooks & Operational Resilience"},
+        {"documentation/topics/observability-and-diagnostics.md",
+         title: "Diagnostics, Recovery CLI & Observability"},
         {"documentation/dsls/DSL-AshBilling.Resource.md",
          search_data: Spark.Docs.search_data_for(AshBilling.Resource)},
         {"documentation/dsls/DSL-AshBilling.Subscription.md",
@@ -128,7 +130,9 @@ defmodule AshBilling.MixProject do
           AshBilling.Provider,
           AshBilling.Plug,
           AshBilling.WebhookSync,
-          AshBilling.Deduplication
+          AshBilling.Deduplication,
+          AshBilling.Diagnostics,
+          AshBilling.Reconciler
         ],
         "Policy Checks": [
           AshBilling.Checks.Subscribed,
