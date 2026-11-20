@@ -49,7 +49,9 @@ jobs:
       - name: Restore dependencies cache
         uses: actions/cache@v4
         with:
-          path: deps
+          path: |
+            deps
+            examples/saas_example/deps
           key: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('**/mix.lock') }}
           restore-keys: |
             ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
@@ -96,3 +98,26 @@ jobs:
       - name: Verify offline Stripe launcher safety
         if: matrix.elixir == '1.18'
         run: python3 -m unittest discover -s examples/stripe_test_mode -p 'test_*.py'
+
+      - name: Compile, migrate, doctor, and test runnable SaaS reference app
+        if: matrix.elixir == '1.18'
+        working-directory: examples/saas_example
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: saas_example_dev
+          POSTGRES_TEST_DB: saas_example_test
+        run: |
+          mix deps.get
+          mix format --check-formatted
+          mix compile --warnings-as-errors
+          mix ecto.setup
+          mix ash_billing.doctor \
+            --customer-resource SaasExample.Accounts.User \
+            --subscription-resource SaasExample.Billing.Subscription \
+            --deduplication-resource SaasExample.Billing.WebhookEvent \
+            --expected-livemode false \
+            --strict
+          mix test

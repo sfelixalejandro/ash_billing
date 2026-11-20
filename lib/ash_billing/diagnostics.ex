@@ -851,7 +851,10 @@ defmodule AshBilling.Diagnostics do
   end
 
   defp check_http_timeouts(acc, opts) do
-    req_opts = Keyword.get(opts, :req_opts) || Keyword.get(opts, :req_options)
+    req_opts =
+      Keyword.get(opts, :req_opts) ||
+        Keyword.get(opts, :req_options) ||
+        Application.get_env(:ash_billing, :req_opts)
 
     cond do
       is_nil(req_opts) or req_opts == [] ->
