@@ -6,13 +6,13 @@ The `AshBilling` project takes the security of financial transactions, customer 
 
 ## Supported Versions
 
-Only the latest minor/patch releases receive security updates.
+Active maintenance and security updates are provided for the latest minor release (`0.7.x`), with critical security fixes backported to the previous minor series (`0.6.x`). Earlier releases are no longer supported.
 
 | Version | Supported           |
 | ------- | ------------------- |
-| 0.6.x   | Yes                 |
-| 0.5.x   | Security fixes only |
-| < 0.5.0 | No                  |
+| 0.7.x   | Yes                 |
+| 0.6.x   | Security fixes only |
+| < 0.6.0 | No                  |
 
 ---
 
