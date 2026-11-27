@@ -87,12 +87,14 @@ Run `mix deps.get`, then follow the Quickstart below or [Getting Started with As
 
 ### Fastest Way to Evaluate: Runnable SaaS Reference App
 
-If you want a complete, compiling, tested Phoenix + Ash + AshPostgres application you can boot locally in minutes (with Docker Compose PostgreSQL 16, migrations, demo seeds, authentication, Checkout, Portal, plan swaps, seat enforcement, signed webhooks, `mix ash_billing.doctor`, and `mix ash_billing.reconcile`), start with [`examples/saas_example`](https://github.com/sfelixalejandro/ash_billing/tree/main/examples/saas_example):
+If you want a complete, compiling, tested Phoenix + Ash + AshPostgres application you can boot locally in minutes (with Docker Compose PostgreSQL 16, migrations, demo seeds, authentication, Checkout, Portal, plan swaps, seat enforcement, signed webhooks, `mix ash_billing.doctor`, and `mix ash_billing.reconcile`), clone the repository and start [`examples/saas_example`](https://github.com/sfelixalejandro/ash_billing/tree/main/examples/saas_example):
 
 ```bash
-cd examples/saas_example
+git clone https://github.com/sfelixalejandro/ash_billing.git
+cd ash_billing/examples/saas_example
 docker compose up -d postgres
 cp .env.example .env
+# Edit .env with your Stripe Test Mode keys (`sk_test_...` and `whsec_...` from `stripe listen`)
 set -a && source .env && set +a
 mix deps.get
 mix ecto.setup
@@ -100,11 +102,16 @@ mix billing.doctor
 mix phx.server
 ```
 
-### Minimal Integration Walkthrough (Phoenix + AshPostgres)
+### Conceptual Integration Walkthrough (Existing Phoenix + AshPostgres App)
 
-The snippets below outline the minimum wiring required in an **existing Phoenix + AshPostgres application** that already has `MyApp.Repo`, `MyAppWeb.Endpoint`, and `MyAppWeb.Router`. They are intentionally minimal—add your own authentication and Ash policies before exposing any actions to users.
+> **Scope & Prerequisites:** This walkthrough is a **conceptual integration guide** verified against Ash 3 / AshPostgres conventions and [`examples/saas_example`](https://github.com/sfelixalejandro/ash_billing/tree/main/examples/saas_example) (the standalone compiled and test-verified application in this repository is `examples/saas_example`). It assumes an existing Phoenix + AshPostgres app with:
+> - `MyApp.Repo` (`AshPostgres.Repo`), `MyAppWeb.Endpoint`, and `MyAppWeb.Router`.
+> - Ash domains `MyApp.Accounts` (registering `MyApp.Accounts.User`) and `MyApp.Billing` (registering `MyApp.Billing.Subscription` and `MyApp.Billing.WebhookEvent`).
+> - Your own authentication and Ash policies (`authorizers: [Ash.Policy.Authorizer]` + `policies do ... end`) added to `User` and `Subscription` before exposing actions to end users.
 
-#### 1. Configure Ash and Stripe Test Mode credentials
+#### 1. Configure Ash, Test Mode credentials, and `req_opts`
+
+> **Important (`v0.7.0` HTTP options behavior):** `config :ash_billing, req_opts: [...]` is inspected by `mix ash_billing.doctor`, **but `AshBilling.Providers.Stripe` does not automatically inherit global `Application.get_env(:ash_billing, :req_opts)` in `v0.7.0`**. Pass `:req_opts` explicitly on `AshBilling.Plug` and on each `AshBilling` provider call (e.g. Customer, Checkout, Portal, plan swaps, quantity updates, cancellations, and reconciliation) whenever explicit timeouts or `retry: false` are required—centralizing a helper such as [`SaasExample.Billing.provider_opts/1`](https://github.com/sfelixalejandro/ash_billing/blob/main/examples/saas_example/lib/saas_example/billing.ex#L27-L46) keeps call sites DRY.
 
 ```elixir
 # config/config.exs
@@ -120,7 +127,7 @@ config :ash_billing,
   subscription_resource: MyApp.Billing.Subscription,
   deduplication_strategy: :resource,
   deduplication_resource: MyApp.Billing.WebhookEvent,
-  # Checked by `mix ash_billing.doctor`; also pass explicitly to `AshBilling.Plug` and reconcile calls.
+  # Inspected by `mix ash_billing.doctor`; pass explicitly per call and on `AshBilling.Plug` in v0.7.0.
   req_opts: [
     connect_options: [timeout: 3_000],
     receive_timeout: 5_000,
@@ -130,7 +137,7 @@ config :ash_billing,
 
 ```elixir
 # config/runtime.exs
-# Use Stripe Test Mode credentials (sk_test_... and whsec_...) in development.
+# Use Stripe Test Mode credentials (`sk_test_...` and `whsec_...`) in development.
 config :ash_billing,
   stripe_api_key: System.get_env("STRIPE_SECRET_KEY"),
   stripe_webhook_secret: System.get_env("STRIPE_WEBHOOK_SECRET")
@@ -237,7 +244,7 @@ defmodule MyApp.Billing.WebhookEvent do
 end
 ```
 
-Register `MyApp.Accounts.User` in `MyApp.Accounts`, and `MyApp.Billing.Subscription` + `MyApp.Billing.WebhookEvent` in `MyApp.Billing`.
+Register `MyApp.Accounts.User` in `MyApp.Accounts`, and `MyApp.Billing.Subscription` + `MyApp.Billing.WebhookEvent` in `MyApp.Billing`. When enabling `authorizers: [Ash.Policy.Authorizer]`, ensure `User` includes update/read policies allowing the actor (or execute internal customer persistence with `authorize?: false`), and lock down `Subscription` mutations to admins/system contexts (see [`SaasExample.Accounts.User`](https://github.com/sfelixalejandro/ash_billing/blob/main/examples/saas_example/lib/saas_example/accounts/user.ex) and [`SaasExample.Billing.Subscription`](https://github.com/sfelixalejandro/ash_billing/blob/main/examples/saas_example/lib/saas_example/billing/subscription.ex)).
 
 #### 3. Generate and apply PostgreSQL migrations
 
@@ -246,7 +253,7 @@ mix ash.codegen create_billing_tables
 mix ash.migrate
 ```
 
-#### 4. Preserve raw webhook bytes and mount `AshBilling.Plug`
+#### 4. Preserve raw webhook bytes and mount `AshBilling.Plug` (Test Mode)
 
 Stripe HMAC verification requires the exact raw request body. Configure `body_reader` on `Plug.Parsers` in `endpoint.ex`:
 
@@ -262,7 +269,7 @@ plug Plug.Parsers,
 Mount `AshBilling.Plug` in your router with an explicit `:webhook_secret` (omitting `:webhook_secret` returns HTTP `500` `unconfigured_webhook_secret` fail-closed), `expected_livemode`, PostgreSQL deduplication, and bounded HTTP timeouts:
 
 ```elixir
-# lib/my_app_web/router.ex
+# lib/my_app_web/router.ex (development / Stripe Test Mode)
 scope "/webhooks" do
   forward "/stripe", AshBilling.Plug,
     provider: AshBilling.Providers.Stripe,
@@ -281,24 +288,26 @@ scope "/webhooks" do
 end
 ```
 
-> In production, bind `expected_livemode: true` (or load it from runtime configuration) so test-mode events cannot be accepted by a live endpoint.
+> **Production endpoint binding:** Set `expected_livemode: true` (literal boolean) in production so test-mode events cannot be accepted by a live endpoint. Because `AshBilling.Plug` reads `:expected_livemode` as a boolean rather than evaluating an MFA tuple, either split router configuration by environment or wrap `AshBilling.Plug` at runtime (see [`SaasExampleWeb.Plugs.StripeWebhookPlug`](https://github.com/sfelixalejandro/ash_billing/blob/main/examples/saas_example/lib/saas_example_web/plugs/stripe_webhook_plug.ex)).
 
-#### 5. Persist a Customer, start Checkout, and verify locally
+#### 5. Persist a Customer, start Checkout, and verify in Test Mode
 
-Recurring Checkout requires a persisted customer ID (`{:error, :no_customer_id}` is returned before calling Stripe if missing). Always resolve price IDs from a server-controlled catalog rather than trusting raw browser parameters:
+Recurring Checkout requires a persisted customer ID (`{:error, :no_customer_id}` is returned before calling Stripe if missing). Always resolve price IDs from a server-controlled catalog rather than trusting raw browser parameters, and pass `:req_opts` explicitly on each call when deterministic timeouts or `retry: false` are needed:
 
 ```elixir
 # Conceptual controller snippet: `user` is an authenticated, persisted User struct.
-billing_opts = [actor: user, authorize?: true]
+req_opts = Application.get_env(:ash_billing, :req_opts, connect_options: [timeout: 3_000], receive_timeout: 5_000, retry: false)
+billing_opts = [actor: user, authorize?: true, req_opts: req_opts]
 
 with {:ok, _customer_id} <- AshBilling.create_customer(user, [persist: true] ++ billing_opts),
-     {:ok, user} <- Ash.get(MyApp.Accounts.User, user.id, billing_opts),
+     {:ok, user} <- Ash.get(MyApp.Accounts.User, user.id, actor: user, authorize?: true),
      {:ok, session} <-
        AshBilling.create_checkout_session(user,
          mode: "subscription",
          line_items: [%{price: "price_pro_monthly", quantity: 1}],
          success_url: "http://localhost:4000/dashboard?billing=success",
-         cancel_url: "http://localhost:4000/pricing?billing=canceled"
+         cancel_url: "http://localhost:4000/pricing?billing=canceled",
+         req_opts: req_opts
        ) do
   # Redirect the browser to session.url
   {:ok, session.url}
@@ -308,15 +317,16 @@ end
 Forward Stripe Test Mode webhooks to your local endpoint and run the built-in configuration doctor:
 
 ```bash
-# Terminal 1: forward signed Stripe Test Mode webhooks
+# Terminal 1: forward signed Stripe Test Mode webhooks (updates whsec_... for STRIPE_WEBHOOK_SECRET)
 stripe listen --forward-to http://localhost:4000/webhooks/stripe
 
-# Terminal 2: verify resources, PostgreSQL migrations, indexes, and privacy boundaries (read-only)
+# Terminal 2: verify Test Mode resources, PostgreSQL migrations, indexes, and privacy boundaries (read-only)
 mix ash_billing.doctor \
   --customer-resource MyApp.Accounts.User \
   --subscription-resource MyApp.Billing.Subscription \
   --deduplication-resource MyApp.Billing.WebhookEvent \
-  --expected-livemode false
+  --expected-livemode false \
+  --strict
 ```
 
 ---
@@ -325,9 +335,17 @@ mix ash_billing.doctor \
 
 ### Billing Operations
 
+> Because `AshBilling.Providers.Stripe` only reads `:req_opts` from the per-call options in `v0.7.0` (not `Application.get_env(:ash_billing, :req_opts)`), pass `req_opts` explicitly—or merge it via a shared wrapper—for Checkout, Customer, Portal, plan swaps, quantity updates, cancellations, and reconciliation whenever you require explicit HTTP timeouts or `retry: false` (default `Req` settings are `receive_timeout: 15_000` and `:safe_transient` retries).
+
 ```elixir
+req_opts = [connect_options: [timeout: 3_000], receive_timeout: 5_000, retry: false]
+
 # Customer Billing Portal
-{:ok, portal} = AshBilling.create_portal_session(user, return_url: "https://myapp.com/settings")
+{:ok, portal} =
+  AshBilling.create_portal_session(user,
+    return_url: "https://myapp.com/settings",
+    req_opts: req_opts
+  )
 
 # Subscription status checks (reload `user` with `:subscriptions` at trusted request boundaries)
 AshBilling.subscribed?(user)
@@ -337,22 +355,26 @@ AshBilling.canceling?(subscription)
 # Swap plan (preserves current Stripe quantity)
 {:ok, _remote} =
   AshBilling.swap_plan(subscription, "price_enterprise_monthly",
-    proration_behavior: "create_prorations"
+    proration_behavior: "create_prorations",
+    req_opts: req_opts
   )
 
 # Update per-seat quantity (Stripe sends only item ID + quantity; optional :price_id assertion)
 {:ok, _remote} =
-  AshBilling.update_quantity(subscription, 10, price_id: "price_pro_monthly")
+  AshBilling.update_quantity(subscription, 10,
+    price_id: "price_pro_monthly",
+    req_opts: req_opts
+  )
 
 # Schedule cancel at period end / resume
-{:ok, _remote} = AshBilling.cancel_subscription(subscription, at_period_end: true)
-{:ok, _remote} = AshBilling.resume_subscription(subscription)
+{:ok, _remote} = AshBilling.cancel_subscription(subscription, at_period_end: true, req_opts: req_opts)
+{:ok, _remote} = AshBilling.resume_subscription(subscription, req_opts: req_opts)
 
 # Authoritative reconciliation (fetches live Stripe state and commits under PostgreSQL FOR UPDATE locks)
 {:ok, reconciled_sub} =
   AshBilling.reconcile_subscription(subscription,
     domain: MyApp.Billing,
-    req_opts: [connect_options: [timeout: 3_000], receive_timeout: 5_000, retry: false]
+    req_opts: req_opts
   )
 ```
 
@@ -379,13 +401,15 @@ end
 
 ### Operational CLIs (`doctor` & `reconcile`)
 
+#### Test Mode (`sk_test_...`, `whsec_...` from `stripe listen`, `expected_livemode: false`)
+
 ```bash
 # Read-only configuration & PostgreSQL schema audit (text or --json; add --check-provider for live GET /v1/balance)
 mix ash_billing.doctor \
   --customer-resource MyApp.Accounts.User \
   --subscription-resource MyApp.Billing.Subscription \
   --deduplication-resource MyApp.Billing.WebhookEvent \
-  --expected-livemode true \
+  --expected-livemode false \
   --strict
 
 # Read-only drift inspection (--dry-run is the default)
@@ -407,6 +431,24 @@ mix ash_billing.reconcile \
   --confirm
 ```
 
+#### Production Configuration & Verification (`sk_live_...`, Stripe Dashboard `whsec_...`, `expected_livemode: true`)
+
+In production deployments:
+
+- Configure live credentials (`STRIPE_SECRET_KEY=sk_live_...` or restricted `rk_live_...`) and the production Stripe Dashboard webhook endpoint secret (`STRIPE_WEBHOOK_SECRET=whsec_...`). Never enable `stripe listen` or `sk_test_` keys in production.
+- Bind `expected_livemode: true` on `AshBilling.Plug` (either in environment-specific router configuration or via a runtime wrapper Plug like [`SaasExampleWeb.Plugs.StripeWebhookPlug`](https://github.com/sfelixalejandro/ash_billing/blob/main/examples/saas_example/lib/saas_example_web/plugs/stripe_webhook_plug.ex)).
+- Run the release preflight check with `--expected-livemode true --check-provider --strict` so `doctor` verifies both PostgreSQL schema invariants and live-key alignment against Stripe `GET /v1/balance`:
+
+```bash
+mix ash_billing.doctor \
+  --customer-resource MyApp.Accounts.User \
+  --subscription-resource MyApp.Billing.Subscription \
+  --deduplication-resource MyApp.Billing.WebhookEvent \
+  --expected-livemode true \
+  --check-provider \
+  --strict
+```
+
 ---
 
 ## Security & Financial Consistency Model
@@ -418,7 +460,7 @@ AshBilling enforces strict local boundaries while remaining explicit about distr
 - **Single-item recurring scope:** Recurring Checkout and local subscription projection support **one** line item per subscription. Multi-item non-terminal updates fail closed (`:unsupported_subscription_items`) while retaining the last supported local snapshot; terminal events (`canceled`, `incomplete_expired`) still revoke access. One-time `mode: "payment"` Checkout supports multiple lines but does not include a fulfillment ledger.
 - **Fail-closed quantity semantics:** Legitimately absent or `null` quantities remain `nil` (never defaulted to `1`); explicit `0` persists as `0`; negative or non-integer values fail closed with `{:error, :invalid_quantity}` without erasing valid persisted state.
 - **Tenant & Stripe Connect isolation:** Bind one provider, Stripe account, and livemode per resource and tenant. `AshBilling.Reconciler` requires `--tenant` on multitenant resources and refuses unscoped bulk `--stripe-account` sweeps unless database-level isolation is provable (`--stripe-account-attribute` or explicit `--stripe-account-scope tenant` on 1:1 multitenant setups).
-- **Webhook deduplication & bounded timeouts:** The default `:memory` ETS deduplication strategy is suitable only for single-node development. Production clusters must use `AshBilling.WebhookEvent` on the shared PostgreSQL `Repo` with bounded `req_opts` (`retry: false`) so Stripe degradation does not starve PostgreSQL pools while holding `FOR UPDATE` locks.
+- **Webhook deduplication & bounded timeouts:** The default `:memory` ETS deduplication strategy is suitable only for single-node development. Production clusters must use `AshBilling.WebhookEvent` on the shared PostgreSQL `Repo` and pass bounded `req_opts` (`retry: false`) explicitly on `AshBilling.Plug` and outbound provider calls so Stripe degradation does not starve PostgreSQL pools while holding `FOR UPDATE` locks.
 - **Stripe API baseline & compliance boundary:** Supports Stripe v1 snapshot events (thin events and non-nil v2 `context` envelopes are rejected). Tax calculation, invoicing rules, currency conversion, and PCI-DSS boundaries remain the responsibility of the consuming application.
 
 See [Webhooks & Operational Resilience](documentation/topics/webhooks-and-resilience.md) for the complete Billing Invariants contract.
